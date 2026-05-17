@@ -6,7 +6,7 @@ use crate::core::render::{
     WindowParams,
 };
 use crate::core::smtc::SmtcListener;
-use crate::ui::expanded::main_view::{
+use crate::ui::expanded::music_view::{
     get_next_btn_rect, get_pause_btn_rect, get_prev_btn_rect, get_progress_bar_rect,
     set_progress_dragging, set_progress_hover, trigger_cover_flip, trigger_next_click,
     trigger_pause_click, trigger_prev_click,

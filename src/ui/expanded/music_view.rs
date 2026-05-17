@@ -137,7 +137,7 @@ pub fn draw_text_cached(params: DrawTextCachedParams<'_>) {
     FontManager::global().draw_text_cached(params);
 }
 
-pub struct DrawMainPageParams<'a> {
+pub struct DrawMusicPageParams<'a> {
     pub canvas: &'a Canvas,
     pub ox: f32,
     pub oy: f32,
@@ -204,8 +204,8 @@ pub fn get_media_palette(media: &MediaInfo) -> Vec<Color> {
     }
 }
 
-pub fn draw_main_page(params: DrawMainPageParams<'_>) {
-    let DrawMainPageParams {
+pub fn draw_music_page(params: DrawMusicPageParams<'_>) {
+    let DrawMusicPageParams {
         canvas,
         ox,
         oy,

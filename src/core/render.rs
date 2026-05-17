@@ -1,8 +1,8 @@
 use crate::core::config::{DockPosition, PADDING, TOP_OFFSET};
 use crate::core::smtc::MediaInfo;
-use crate::ui::expanded::main_view::{
-    draw_main_page, draw_text_cached, draw_visualizer, get_cached_media_image, get_media_palette,
-    DrawMainPageParams, DrawVisualizerParams,
+use crate::ui::expanded::music_view::{
+    draw_music_page, draw_text_cached, draw_visualizer, get_cached_media_image, get_media_palette,
+    DrawMusicPageParams, DrawVisualizerParams,
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
 use crate::utils::font::DrawTextCachedParams;
@@ -204,7 +204,7 @@ pub fn draw_island(surface: &mut Surface<Arc<Window>, Arc<Window>>, params: Draw
 
         canvas.save();
         canvas.translate((-page_shift, 0.0));
-        draw_main_page(DrawMainPageParams {
+        draw_music_page(DrawMusicPageParams {
             canvas,
             ox: offset_x,
             oy: offset_y,
