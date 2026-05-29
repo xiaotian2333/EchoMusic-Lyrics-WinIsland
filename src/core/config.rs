@@ -131,6 +131,20 @@ pub struct AppConfig {
     pub monitor_index: i32,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    #[serde(default = "default_settings_theme")]
+    pub settings_theme: String,
+    #[serde(default = "default_mini_cover_shape")]
+    pub mini_cover_shape: String,
+    #[serde(default = "default_expanded_cover_shape")]
+    pub expanded_cover_shape: String,
+    #[serde(default = "default_cover_rotate")]
+    pub cover_rotate: bool,
+    #[serde(default = "default_audio_gate")]
+    pub audio_gate: bool,
+    #[serde(default = "default_auto_gate")]
+    pub auto_gate: bool,
+    #[serde(default = "default_mini_controls")]
+    pub mini_controls: bool,
 }
 
 fn default_island_style() -> String {
@@ -213,6 +227,34 @@ fn default_font_size() -> f32 {
     0.0
 }
 
+fn default_settings_theme() -> String {
+    "system".to_string()
+}
+
+fn default_mini_cover_shape() -> String {
+    "square".to_string()
+}
+
+fn default_expanded_cover_shape() -> String {
+    "square".to_string()
+}
+
+fn default_cover_rotate() -> bool {
+    false
+}
+
+fn default_audio_gate() -> bool {
+    true
+}
+
+fn default_auto_gate() -> bool {
+    true
+}
+
+fn default_mini_controls() -> bool {
+    false
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +287,13 @@ impl Default for AppConfig {
             dock_position: DockPosition::TopCenter,
             monitor_index: 0,
             font_size: 0.0,
+            settings_theme: "system".to_string(),
+            mini_cover_shape: "square".to_string(),
+            expanded_cover_shape: "square".to_string(),
+            cover_rotate: false,
+            audio_gate: true,
+            auto_gate: true,
+            mini_controls: false,
         }
     }
 }

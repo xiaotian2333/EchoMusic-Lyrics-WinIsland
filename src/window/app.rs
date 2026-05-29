@@ -1,10 +1,7 @@
 use crate::core::audio::AudioProcessor;
 use crate::core::config::{AppConfig, PADDING, TOP_OFFSET, WINDOW_TITLE};
 use crate::core::persistence::load_config;
-use crate::core::render::{
-    DrawIslandParams, LayoutParams, LyricsParams, MediaParams, StyleParams, WindowParams,
-    draw_island,
-};
+use crate::core::render::{draw_island, get_mini_control_rects};
 use crate::core::smtc::SmtcListener;
 use crate::plugin::PluginManager;
 use crate::ui::expanded::music_view::{
@@ -12,10 +9,12 @@ use crate::ui::expanded::music_view::{
     set_progress_dragging, set_progress_hover, trigger_cover_flip, trigger_next_click,
     trigger_pause_click, trigger_prev_click,
 };
+use crate::utils::backdrop::{clear_mica_cache, disable_mica};
 use crate::utils::blur::calculate_blur_sigmas;
 use crate::utils::color::get_island_border_weights;
 use crate::utils::glass::set_glass_hwnd;
 use crate::utils::icon::get_app_icon;
+use crate::utils::liquid_glass::clear_liquid_glass_cache;
 use crate::utils::mouse::{
     get_global_cursor_pos, is_cursor_hidden, is_foreground_fullscreen, is_left_button_pressed,
     is_point_in_rect,
@@ -23,17 +22,18 @@ use crate::utils::mouse::{
 use crate::utils::physics::Spring;
 use crate::window::tray::{TrayAction, TrayManager};
 use softbuffer::{Context, Surface};
-use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SetWindowLongPtrW,
-    SetWindowPos, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_THICKFRAME,
+    FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, HWND_TOPMOST, PostMessageW,
+    SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    WDA_EXCLUDEFROMCAPTURE, WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
+    WS_THICKFRAME,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, w};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
@@ -44,6 +44,7 @@ use winit::window::{Window, WindowButtons, WindowId, WindowLevel};
 
 pub struct App {
     window: Option<Arc<Window>>,
+    context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     tray: Option<TrayManager>,
     smtc: SmtcListener,
@@ -65,7 +66,6 @@ pub struct App {
     frame_count: u64,
     last_media_title: String,
     last_media_playing: bool,
-    last_playing_time: Instant,
     current_lyric_text: String,
     old_lyric_text: String,
     lyric_transition: f32,
@@ -92,7 +92,6 @@ pub struct App {
     touch_id: Option<u64>,
     touch_pos: PhysicalPosition<f64>,
     plugin_mgr: PluginManager,
-    settings_process: RefCell<Option<std::process::Child>>,
 }
 
 impl Default for App {
@@ -100,6 +99,7 @@ impl Default for App {
         let config = load_config();
         Self {
             window: None,
+            context: None,
             surface: None,
             tray: None,
             config: config.clone(),
@@ -125,7 +125,6 @@ impl Default for App {
             frame_count: 0,
             last_media_title: String::new(),
             last_media_playing: false,
-            last_playing_time: Instant::now(),
             current_lyric_text: String::new(),
             old_lyric_text: String::new(),
             lyric_transition: 1.0,
@@ -152,7 +151,6 @@ impl Default for App {
             touch_id: None,
             touch_pos: PhysicalPosition::new(0.0, 0.0),
             plugin_mgr: PluginManager::default(),
-            settings_process: RefCell::new(None),
         }
     }
 }
@@ -168,14 +166,121 @@ struct IslandLayout {
 }
 
 impl App {
+    fn set_aumid() {
+        let aumid = "WinIsland.PluginManager";
+        let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: SetCurrentProcessExplicitAppUserModelID sets a process-wide string identifier.
+        // The wide string is valid and null-terminated. Called once during init before any windows.
+        unsafe {
+            let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR::from_raw(wide.as_ptr()));
+        }
+    }
+
+    fn show_toast(title: &str, message: &str) {
+        use windows::UI::Notifications::{
+            ToastNotification, ToastNotificationManager, ToastTemplateType,
+        };
+        use windows::core::HSTRING;
+        Self::set_aumid();
+        let tmpl =
+            match ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastText02) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("Toast template failed: {:?}", e);
+                    return;
+                }
+            };
+        if let Ok(nodes) = tmpl.SelectNodes(&HSTRING::from("//text")) {
+            if let Ok(node) = nodes.Item(0) {
+                let _ = node.SetInnerText(&HSTRING::from(title));
+            }
+            if let Ok(node) = nodes.Item(1) {
+                let _ = node.SetInnerText(&HSTRING::from(message));
+            }
+        }
+        let toast = match ToastNotification::CreateToastNotification(&tmpl) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("CreateToastNotification failed: {:?}", e);
+                return;
+            }
+        };
+        let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+            "WinIsland.PluginManager",
+        )) {
+            Ok(n) => n,
+            Err(e) => {
+                log::error!("CreateToastNotifier failed: {:?}", e);
+                return;
+            }
+        };
+        if let Err(e) = notifier.Show(&toast) {
+            log::error!("Toast Show failed: {:?}", e);
+        }
+    }
+
+    fn install_zip_drop(&mut self, path: &Path) {
+        match self.plugin_mgr.install_from_zip(path) {
+            Ok(manifest) => {
+                Self::show_toast(
+                    "Plugin Installed",
+                    &format!("{} loaded successfully!", manifest.name),
+                );
+                log::info!("Plugin '{}' installed via drop", manifest.name);
+            }
+            Err(e) => {
+                Self::show_toast("Plugin Error", &e);
+                log::error!("Failed to install plugin from drop: {}", e);
+            }
+        }
+    }
+
     fn get_target_monitor(
         window: &Window,
         monitor_index: i32,
     ) -> Option<winit::monitor::MonitorHandle> {
+        if monitor_index < 0 {
+            return window
+                .primary_monitor()
+                .or_else(|| window.current_monitor());
+        }
+        use windows::Win32::Graphics::Gdi::*;
+        let mut win32_names: Vec<String> = Vec::new();
+        // SAFETY: EnumDisplayDevicesW reads display device info. We provide a zeroed
+        // DISPLAY_DEVICEW with correct cb size. idx increments safely. No mutable global state.
+        unsafe {
+            let mut idx = 0u32;
+            loop {
+                let mut dd: DISPLAY_DEVICEW = std::mem::zeroed();
+                dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+                if EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
+                    if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0 {
+                        let name = String::from_utf16_lossy(&dd.DeviceName)
+                            .trim_end_matches('\0')
+                            .to_string();
+                        win32_names.push(name);
+                    }
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let target_name = win32_names.get(monitor_index as usize);
         let monitors: Vec<_> = window.available_monitors().collect();
+        if let Some(name) = target_name {
+            for mon in &monitors {
+                if let Some(mon_name) = mon.name()
+                    && (mon_name.contains(name.trim_start_matches("\\\\.\\"))
+                        || name.contains(&mon_name))
+                {
+                    return Some(mon.clone());
+                }
+            }
+        }
         let idx = monitor_index as usize;
         if idx < monitors.len() {
-            Some(monitors[idx].clone())
+            monitors.get(idx).cloned()
         } else {
             window
                 .primary_monitor()
@@ -188,6 +293,8 @@ impl App {
             && let RawWindowHandle::Win32(raw) = handle.as_raw()
         {
             let hwnd = HWND(raw.hwnd.get() as *mut core::ffi::c_void);
+            // SAFETY: SetWindowPos repositions the window. hwnd is valid from window_handle().
+            // SWP_NOACTIVATE prevents focus steal. Coordinates and sizes are within bounds.
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
@@ -321,10 +428,7 @@ impl App {
 
                 if view_val < 0.5 {
                     let media = self.smtc.get_info();
-                    let music_on = self.config.smtc_enabled
-                        && !media.title.is_empty()
-                        && (media.is_playing
-                            || self.last_playing_time.elapsed() < Duration::from_secs(5));
+                    let music_on = self.config.smtc_enabled && !media.title.is_empty();
 
                     let (bx, by, bw, bh) = get_pause_btn_rect(
                         offset_x as f32,
@@ -332,6 +436,7 @@ impl App {
                         w as f32,
                         h as f32,
                         self.config.global_scale,
+                        &self.config.expanded_cover_shape,
                     );
                     let cx = rel_x as f32 - (page_shift as f32);
                     let cy = rel_y as f32;
@@ -347,6 +452,7 @@ impl App {
                         w as f32,
                         h as f32,
                         self.config.global_scale,
+                        &self.config.expanded_cover_shape,
                     );
                     if music_on && cx >= px && cx <= px + pw && cy >= py && cy <= py + ph {
                         trigger_cover_flip();
@@ -361,6 +467,7 @@ impl App {
                         w as f32,
                         h as f32,
                         self.config.global_scale,
+                        &self.config.expanded_cover_shape,
                     );
                     if music_on && cx >= nx && cx <= nx + nw && cy >= ny && cy <= ny + nh {
                         trigger_cover_flip();
@@ -376,6 +483,7 @@ impl App {
                         &media,
                         music_on,
                         self.config.global_scale,
+                        &self.config.expanded_cover_shape,
                     ) && cx >= bar_left
                         && cx <= bar_right
                         && cy >= bar_top
@@ -398,7 +506,9 @@ impl App {
                     let gear_y = island_y + h - 28.0 * scale;
                     let dist_sq = (rel_x as f64 - gear_x).powi(2) + (rel_y as f64 - gear_y).powi(2);
                     if dist_sq <= (20.0 * scale).powi(2) {
-                        self.open_settings();
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                        }
                         return;
                     }
 
@@ -427,11 +537,65 @@ impl App {
                     self.expanded = false;
                     self.widget_view = false;
                 }
-            } else if is_hovering_visible || is_on_hidden_handle {
-                self.is_dragging = true;
-                self.drag_start_py = py;
-                self.drag_start_hide_val = self.spring_hide.value;
-                self.drag_has_moved = false;
+            } else {
+                let media = self.smtc.get_info();
+                let music_on = self.config.smtc_enabled && !media.title.is_empty();
+
+                if music_on && !media.is_playing && self.config.mini_controls {
+                    let w = self.spring_w.value;
+                    let h = self.spring_h.value;
+                    let (prev_rect, play_rect, next_rect) = get_mini_control_rects(
+                        offset_x as f32,
+                        current_island_y as f32,
+                        w,
+                        h,
+                        self.config.global_scale,
+                    );
+
+                    let cx = rel_x as f32;
+                    let cy = rel_y as f32;
+
+                    let mut hit_control = false;
+                    if let Some((px, py, pw, ph)) = prev_rect
+                        && cx >= px
+                        && cx <= px + pw
+                        && cy >= py
+                        && cy <= py + ph
+                    {
+                        self.smtc.request_prev();
+                        hit_control = true;
+                    }
+                    if !hit_control
+                        && let Some((px, py, pw, ph)) = play_rect
+                        && cx >= px
+                        && cx <= px + pw
+                        && cy >= py
+                        && cy <= py + ph
+                    {
+                        self.smtc.request_toggle_play();
+                        hit_control = true;
+                    }
+                    if !hit_control
+                        && let Some((px, py, pw, ph)) = next_rect
+                        && cx >= px
+                        && cx <= px + pw
+                        && cy >= py
+                        && cy <= py + ph
+                    {
+                        self.smtc.request_next();
+                        hit_control = true;
+                    }
+                    if hit_control {
+                        return;
+                    }
+                }
+
+                if is_hovering_visible || is_on_hidden_handle {
+                    self.is_dragging = true;
+                    self.drag_start_py = py;
+                    self.drag_start_hide_val = self.spring_hide.value;
+                    self.drag_has_moved = false;
+                }
             }
         } else if state == ElementState::Released {
             if self.seeking_progress {
@@ -464,106 +628,6 @@ impl App {
     }
 }
 
-impl App {
-    fn set_aumid() {
-        let aumid = "WinIsland.PluginManager";
-        let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: wide string is null-terminated, PCWSTR is valid, Win32 API
-        unsafe {
-            let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR::from_raw(wide.as_ptr()));
-        }
-    }
-
-    fn show_toast(title: &str, message: &str) {
-        use windows::UI::Notifications::{
-            ToastNotification, ToastNotificationManager, ToastTemplateType,
-        };
-        use windows::core::HSTRING;
-
-        Self::set_aumid();
-
-        let tmpl =
-            match ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastText02) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("Toast template failed: {:?}", e);
-                    return;
-                }
-            };
-
-        if let Ok(nodes) = tmpl.SelectNodes(&HSTRING::from("//text")) {
-            if let Ok(node) = nodes.Item(0) {
-                let _ = node.SetInnerText(&HSTRING::from(title));
-            }
-            if let Ok(node) = nodes.Item(1) {
-                let _ = node.SetInnerText(&HSTRING::from(message));
-            }
-        }
-
-        let toast = match ToastNotification::CreateToastNotification(&tmpl) {
-            Ok(t) => t,
-            Err(e) => {
-                log::error!("CreateToastNotification failed: {:?}", e);
-                return;
-            }
-        };
-
-        let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
-            "WinIsland.PluginManager",
-        )) {
-            Ok(n) => n,
-            Err(e) => {
-                log::error!("CreateToastNotifier failed: {:?}", e);
-                return;
-            }
-        };
-
-        if let Err(e) = notifier.Show(&toast) {
-            log::error!("Toast Show failed: {:?}", e);
-        }
-    }
-
-    fn open_settings(&self) {
-        let mut proc = self.settings_process.borrow_mut();
-        if let Some(ref mut child) = *proc {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    *proc = None;
-                }
-                Ok(None) => {
-                    crate::window::settings::bring_settings_to_front();
-                    return;
-                }
-                Err(_) => {
-                    *proc = None;
-                }
-            }
-        }
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--settings")
-            .spawn();
-        if let Ok(child) = result {
-            *proc = Some(child);
-        }
-    }
-
-    fn install_zip_drop(&mut self, path: &Path) {
-        match self.plugin_mgr.install_from_zip(path) {
-            Ok(manifest) => {
-                Self::show_toast(
-                    "Plugin Installed",
-                    &format!("{} loaded successfully!", manifest.name),
-                );
-                log::info!("Plugin '{}' installed via drop", manifest.name);
-            }
-            Err(e) => {
-                Self::show_toast("Plugin Error", &e);
-                log::error!("Failed to install plugin from drop: {}", e);
-            }
-        }
-    }
-}
-
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -577,6 +641,7 @@ impl ApplicationHandler for App {
                 .with_title(WINDOW_TITLE)
                 .with_inner_size(PhysicalSize::new(self.os_w, self.os_h))
                 .with_transparent(true)
+                .with_visible(false)
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_enabled_buttons(WindowButtons::empty())
@@ -589,6 +654,9 @@ impl ApplicationHandler for App {
                 && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
             {
                 let hwnd = HWND(win32_handle.hwnd.get() as _);
+                // SAFETY: GetWindowLongPtrW/SetWindowLongPtrW modify window style bits.
+                // hwnd is valid from window_handle(). We only add WS_EX_TOOLWINDOW and
+                // WS_EX_NOACTIVATE to hide from taskbar, and remove maximize/thickframe.
                 unsafe {
                     let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     SetWindowLongPtrW(
@@ -604,6 +672,14 @@ impl ApplicationHandler for App {
                     );
                 }
                 set_glass_hwnd(win32_handle.hwnd.get());
+
+                // SAFETY: SetWindowDisplayAffinity hides this window from GDI
+                // screen captures (BitBlt/StretchBlt). hwnd is valid from
+                // window_handle(). WDA_EXCLUDEFROMCAPTURE prevents self-capture
+                // artifacts in glass, mica, and liquid-glass backdrop modes.
+                unsafe {
+                    let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                }
             }
 
             self.window = Some(window.clone());
@@ -628,19 +704,30 @@ impl ApplicationHandler for App {
                 self.last_mon_pos = (mon_pos.x, mon_pos.y);
                 (self.win_x, self.win_y) = self.compute_window_position(mon_pos, mon_size);
                 window.set_outer_position(PhysicalPosition::new(self.win_x, self.win_y));
+                if self.config.island_style == "mica" {
+                    clear_mica_cache();
+                }
             }
             let context = Context::new(window.clone()).unwrap();
             let mut surface = Surface::new(&context, window.clone()).unwrap();
             surface
                 .resize(
-                    std::num::NonZeroU32::new(self.os_w).unwrap(),
-                    std::num::NonZeroU32::new(self.os_h).unwrap(),
+                    std::num::NonZeroU32::new(self.os_w.max(1)).unwrap(),
+                    std::num::NonZeroU32::new(self.os_h.max(1)).unwrap(),
                 )
                 .unwrap();
+            if let Ok(mut buf) = surface.buffer_mut() {
+                for p in buf.iter_mut() {
+                    *p = 0;
+                }
+                let _ = buf.present();
+            }
+            self.context = Some(context);
             self.surface = Some(surface);
             let is_light = window.theme() == Some(winit::window::Theme::Light);
             self.tray = Some(TrayManager::new(is_light));
             Self::enforce_topmost(&window, self.win_x, self.win_y, self.os_w, self.os_h);
+            window.set_visible(true);
             window.request_redraw();
         }
     }
@@ -654,6 +741,7 @@ impl ApplicationHandler for App {
                     if let Some(tray) = self.tray.as_mut() {
                         tray.update_theme(is_light);
                     }
+                    clear_liquid_glass_cache();
                 }
                 WindowEvent::Resized(_) if win.is_maximized() => {
                     win.set_maximized(false);
@@ -698,6 +786,8 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::RedrawRequested => {
                     if let Some(surface) = self.surface.as_mut() {
+                        let dt =
+                            (self.last_frame_time.elapsed().as_secs_f32() * 60.0).clamp(0.1, 3.0);
                         let sigmas = if self.config.motion_blur {
                             calculate_blur_sigmas(
                                 self.spring_w.velocity,
@@ -725,20 +815,27 @@ impl ApplicationHandler for App {
                             media_info.position_ms = self.seeking_preview_ms;
                             media_info.last_update = Instant::now();
                         }
+                        if !self.config.audio_gate {
+                            self.audio.set_gate_override(false);
+                        } else if self.config.auto_gate {
+                            let is_hidden = self.auto_hidden || self.manually_hidden;
+                            self.audio.set_gate_override(!is_hidden);
+                        } else {
+                            self.audio.set_gate_override(true);
+                        }
                         media_info.spectrum = self.audio.get_spectrum();
+                        if !self.config.audio_gate {
+                            media_info.spectrum = [0.0; 6];
+                        }
                         let mut music_active = false;
-                        if self.config.smtc_enabled
-                            && !media_info.title.is_empty()
-                            && (media_info.is_playing
-                                || self.last_playing_time.elapsed() < Duration::from_secs(5))
-                        {
+                        if self.config.smtc_enabled && !media_info.title.is_empty() {
                             music_active = true;
                         }
 
-                        draw_island(
+                        let widget_animating = draw_island(
                             surface,
-                            DrawIslandParams {
-                                layout: LayoutParams {
+                            crate::core::render::DrawIslandParams {
+                                layout: crate::core::render::LayoutParams {
                                     current_w: self.spring_w.value,
                                     current_h: self.spring_h.value,
                                     current_r: self.spring_r.value,
@@ -751,28 +848,41 @@ impl ApplicationHandler for App {
                                     hide_progress: self.spring_hide.value,
                                     dock_position: self.config.dock_position,
                                 },
-                                media: MediaParams {
+                                media: crate::core::render::MediaParams {
                                     media: &media_info,
                                     music_active,
                                 },
-                                lyrics: LyricsParams {
+                                lyrics: crate::core::render::LyricsParams {
                                     current_lyric: &self.current_lyric_text,
                                     old_lyric: &self.old_lyric_text,
                                     lyric_transition: self.lyric_transition,
                                     lyric_scroll_offset: self.lyric_scroll_offset,
                                 },
-                                window: WindowParams {
+                                window: crate::core::render::WindowParams {
                                     win_x: self.win_x,
                                     win_y: self.win_y,
+                                    monitor_x: self.last_mon_pos.0,
+                                    monitor_y: self.last_mon_pos.1,
+                                    monitor_w: self.last_mon_size.0,
+                                    monitor_h: self.last_mon_size.1,
                                 },
-                                style: StyleParams {
+                                style: crate::core::render::StyleParams {
                                     island_style: &self.config.island_style,
                                     use_blur: self.config.motion_blur,
                                     font_size: self.config.font_size,
                                     weights: self.border_weights,
+                                    mini_cover_shape: &self.config.mini_cover_shape,
+                                    expanded_cover_shape: &self.config.expanded_cover_shape,
+                                    cover_rotate: self.config.cover_rotate,
+                                    mini_controls: self.config.mini_controls,
+                                    lyrics_delay: self.config.lyrics_delay,
+                                    dt,
                                 },
                             },
                         );
+                        if widget_animating && let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
                     }
                 }
                 _ => (),
@@ -783,7 +893,6 @@ impl ApplicationHandler for App {
         if let Some(window) = &self.window {
             Self::enforce_topmost(window, self.win_x, self.win_y, self.os_w, self.os_h);
             let frame_start = Instant::now();
-
             if let Some(tray) = &self.tray
                 && let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv()
             {
@@ -794,29 +903,86 @@ impl ApplicationHandler for App {
                         tray.update_item_text(self.visible);
                     }
                     Some(TrayAction::OpenSettings) => {
-                        self.open_settings();
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                        }
+                    }
+                    Some(TrayAction::Restart) => {
+                        // SAFETY: FindWindowW searches for a top-level window by class/name.
+                        // PostMessageW posts WM_CLOSE to gracefully close the settings window.
+                        // Both use valid string literals and standard message parameters.
+                        unsafe {
+                            let hwnd = FindWindowW(None, w!("WinIsland Settings"));
+                            if let Ok(hwnd) = hwnd
+                                && !hwnd.is_invalid()
+                            {
+                                let _ = PostMessageW(hwnd, WM_CLOSE, None, None);
+                            }
+                        }
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).arg("--restart").spawn();
+                        }
+                        event_loop.exit();
                     }
                     Some(TrayAction::Exit) => {
-                        if let Some(mut settings) = self.settings_process.borrow_mut().take() {
-                            let _ = settings.kill();
+                        // SAFETY: FindWindowW searches for a top-level window by class/name.
+                        // PostMessageW posts WM_CLOSE to gracefully close the settings window.
+                        // Both use valid string literals and standard message parameters.
+                        unsafe {
+                            let hwnd = FindWindowW(None, w!("WinIsland Settings"));
+                            if let Ok(hwnd) = hwnd
+                                && !hwnd.is_invalid()
+                            {
+                                let _ = PostMessageW(hwnd, WM_CLOSE, None, None);
+                            }
                         }
                         event_loop.exit();
                     }
                     None => (),
                 }
             }
-            if self.frame_count.is_multiple_of(60) {
+            if self.frame_count.is_multiple_of(30) {
                 let current_config = load_config();
                 if current_config != self.config {
                     let old_scale = self.config.global_scale;
                     let old_max_w = self.config.expanded_width;
                     let old_max_h = self.config.expanded_height;
+                    let old_style = self.config.island_style.clone();
+                    let old_mini_shape = self.config.mini_cover_shape.clone();
+                    let old_expanded_shape = self.config.expanded_cover_shape.clone();
+                    let old_font = self.config.custom_font_path.clone();
 
                     self.config = current_config;
                     self.smtc
                         .set_lyrics_source(self.config.lyrics_source.clone());
                     self.smtc.set_lyrics_fallback(self.config.lyrics_fallback);
                     self.smtc.set_allowed_apps(self.config.smtc_apps.clone());
+
+                    if old_style != self.config.island_style {
+                        crate::utils::backdrop::clear_dynamic_bg_cache();
+                        clear_mica_cache();
+                        clear_liquid_glass_cache();
+                        if old_style == "mica"
+                            && let Some(window) = &self.window
+                            && let Ok(handle) = window.window_handle()
+                        {
+                            let raw = handle.as_raw();
+                            if let RawWindowHandle::Win32(win32_handle) = raw {
+                                let hwnd = HWND(win32_handle.hwnd.get() as _);
+                                disable_mica(hwnd);
+                            }
+                        }
+                    }
+
+                    if old_mini_shape != self.config.mini_cover_shape
+                        || old_expanded_shape != self.config.expanded_cover_shape
+                    {
+                        crate::ui::expanded::music_view::clear_cover_cache();
+                    }
+
+                    if old_font != self.config.custom_font_path {
+                        crate::utils::font::FontManager::global().refresh_custom_font();
+                    }
 
                     let max_w = self.config.expanded_width.max(450.0);
                     let new_os_w = (max_w * self.config.global_scale + PADDING) as u32;
@@ -835,8 +1001,8 @@ impl ApplicationHandler for App {
                         let _ = window.request_inner_size(PhysicalSize::new(self.os_w, self.os_h));
                         if let Some(surface) = self.surface.as_mut() {
                             let _ = surface.resize(
-                                std::num::NonZeroU32::new(self.os_w).unwrap(),
-                                std::num::NonZeroU32::new(self.os_h).unwrap(),
+                                std::num::NonZeroU32::new(self.os_w.max(1)).unwrap(),
+                                std::num::NonZeroU32::new(self.os_h.max(1)).unwrap(),
                             );
                         }
                     }
@@ -932,24 +1098,24 @@ impl ApplicationHandler for App {
             let media = self.smtc.get_info();
             if self.config.smtc_enabled && !media.title.is_empty() {
                 self.last_media_playing = media.is_playing;
-                if self.last_media_playing {
-                    self.last_playing_time = Instant::now();
-                    music_active = true;
-                } else if self.last_playing_time.elapsed() < Duration::from_secs(5) {
-                    music_active = true;
-                }
+                music_active = true;
                 if media.title != self.last_media_title {
                     self.last_media_title = media.title.clone();
+                    crate::ui::expanded::music_view::trigger_cover_flip();
+                    crate::utils::backdrop::clear_dynamic_bg_cache();
                     window.request_redraw();
                 }
             }
 
-            let is_idle =
-                !is_hovering_visible && !self.expanded && !music_active && !self.is_dragging;
+            let is_paused_idle = music_active && !media.is_playing;
+            let is_idle = !is_hovering_visible
+                && !self.expanded
+                && !self.is_dragging
+                && (!music_active || is_paused_idle);
             if !self.config.auto_hide {
                 self.auto_hidden = false;
                 self.idle_timer = Instant::now();
-            } else if music_active && self.auto_hidden && !self.manually_hidden {
+            } else if media.is_playing && self.auto_hidden && !self.manually_hidden {
                 self.auto_hidden = false;
                 self.idle_timer = Instant::now();
                 self.spring_hide.velocity = -0.65;
@@ -969,18 +1135,19 @@ impl ApplicationHandler for App {
                 self.idle_timer = Instant::now();
             }
 
-            // Handle dragging on the progress bar while mouse is held
             if self.seeking_progress && (is_left_button_pressed() || self.touch_id.is_some()) {
                 let page_shift = self.spring_view.value * self.spring_w.value;
                 let click_x = rel_x as f32 - page_shift;
-                let ratio = ((click_x - self.seeking_bar_left)
-                    / (self.seeking_bar_right - self.seeking_bar_left))
-                    .clamp(0.0, 1.0);
+                let bar_width = self.seeking_bar_right - self.seeking_bar_left;
+                let ratio = if bar_width > 0.0 {
+                    ((click_x - self.seeking_bar_left) / bar_width).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 let seek_ms = (ratio as f64 * self.seeking_duration_ms as f64) as u64;
                 self.seeking_preview_ms = seek_ms;
                 window.request_redraw();
             } else if self.seeking_progress {
-                // Fallback: handle cases where mouse release isn't observed (e.g. released outside window)
                 self.seeking_progress = false;
                 if self.seeking_duration_ms > 0 {
                     self.smtc.request_seek(self.seeking_preview_ms);
@@ -998,6 +1165,7 @@ impl ApplicationHandler for App {
                     &media,
                     music_active,
                     self.config.global_scale,
+                    &self.config.expanded_cover_shape,
                 ) {
                     let page_shift = self.spring_view.value * self.spring_w.value;
                     let cx = rel_x as f32 - page_shift;
@@ -1098,7 +1266,8 @@ impl ApplicationHandler for App {
                 }
             }
 
-            let current_lyric_opt = if self.config.show_lyrics {
+            let is_paused = music_active && !media.is_playing;
+            let current_lyric_opt = if self.config.show_lyrics && !is_paused {
                 media.current_lyric((self.config.lyrics_delay * 1000.0) as i64)
             } else {
                 None
@@ -1111,7 +1280,7 @@ impl ApplicationHandler for App {
                     self.lyric_scroll_offset = 0.0;
                     self.lyric_scroll_pause = 0.0;
                 }
-            } else if !self.current_lyric_text.is_empty() {
+            } else if !is_paused && !self.current_lyric_text.is_empty() {
                 self.old_lyric_text = self.current_lyric_text.clone();
                 self.current_lyric_text = String::new();
                 self.lyric_transition = 0.0;
@@ -1156,7 +1325,7 @@ impl ApplicationHandler for App {
                             let available_text_w = (fixed_w - 59.0) * self.config.global_scale;
                             let full_text_w = text_w * self.config.global_scale;
                             let overflow = full_text_w - available_text_w;
-                            if overflow > 0.0 && self.lyric_transition >= 1.0 {
+                            if overflow > 0.0 && self.lyric_transition >= 1.0 && !is_paused {
                                 if self.lyric_scroll_offset < overflow {
                                     if self.lyric_scroll_pause > 0.0 {
                                         self.lyric_scroll_pause -= dt / 60.0;
@@ -1225,7 +1394,7 @@ impl ApplicationHandler for App {
             self.spring_view.update_dt(target_view, 0.12, 0.68, dt);
 
             if self.expanded
-                || music_active
+                || (music_active && media.is_playing)
                 || self.spring_w.velocity.abs() > 0.001
                 || self.spring_h.velocity.abs() > 0.001
                 || self.spring_r.velocity.abs() > 0.001

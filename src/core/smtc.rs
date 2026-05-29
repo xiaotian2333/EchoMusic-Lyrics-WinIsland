@@ -8,6 +8,7 @@ use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
 };
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
@@ -66,7 +67,8 @@ impl MediaInfo {
         }
 
         let raw_pos = if self.is_playing {
-            self.position_ms + self.last_update.elapsed().as_millis() as u64
+            self.position_ms
+                .saturating_add(self.last_update.elapsed().as_millis() as u64)
         } else {
             self.position_ms
         };
@@ -188,6 +190,21 @@ fn smtc_poll_loop(
     mut allowed_apps_rx: mpsc::UnboundedReceiver<Vec<String>>,
     cancel: CancellationToken,
 ) {
+    // SAFETY: CoInitializeEx initializes COM for this thread. We use
+    // COINIT_MULTITHREADED because tokio's spawn_blocking pool is MTA.
+    // If it fails (e.g. already initialized with a different mode), we
+    // skip creating the guard so CoUninitialize is not called unbalanced.
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            // SAFETY: CoUninitialize balances the successful CoInitializeEx
+            // that triggered the creation of this guard.
+            unsafe { CoUninitialize() };
+        }
+    }
+    let _com_guard = com_initialized.then_some(ComGuard);
+
     let manager = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
         Ok(op) => match op.get() {
             Ok(m) => m,
@@ -222,14 +239,32 @@ fn smtc_poll_loop(
         current_allowed_apps = apps;
     }
 
-    // Initial update
-    update_media_info(
-        &manager,
-        &info_tx,
-        &current_lyrics_source,
-        current_lyrics_fallback,
-        &mut current_allowed_apps,
-    );
+    // Initial update with retries for SMTC timeline readiness.
+    // Some music apps (Spotify, Netease) take 1-2s to populate
+    // TimelineProperties after session creation, so we retry up
+    // to 2 seconds (10 × 200ms).
+    for attempt in 0..10 {
+        update_media_info(
+            &manager,
+            &info_tx,
+            &current_lyrics_source,
+            current_lyrics_fallback,
+            &mut current_allowed_apps,
+        );
+        let info = info_tx.borrow();
+        let timeline_ready = info.duration_ms > 0
+            || info.position_ms > 0
+            || !info.is_playing
+            || info.title.is_empty();
+        if timeline_ready {
+            drop(info);
+            break;
+        }
+        drop(info);
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     let mut last_manager_refresh = Instant::now();
     let mut current_manager = manager;
@@ -375,6 +410,7 @@ fn auto_allow_new_apps(
     allowed: &[String],
 ) -> Vec<String> {
     let mut new_allowed = allowed.to_vec();
+    let mut new_app_ids: Vec<String> = Vec::new();
     if let Ok(sessions) = mgr.GetSessions()
         && let Ok(count) = sessions.Size()
     {
@@ -387,28 +423,39 @@ fn auto_allow_new_apps(
                 && let Ok(id) = session.SourceAppUserModelId()
             {
                 let app_id = id.to_string();
-                let mut config = load_config();
-                let mut changed = false;
-
-                if !config.smtc_known_apps.contains(&app_id) {
-                    let is_first_run = config.smtc_known_apps.is_empty();
-                    config.smtc_known_apps.push(app_id.clone());
-
-                    if is_first_run && !config.smtc_apps.contains(&app_id) {
-                        config.smtc_apps.push(app_id.clone());
-                        if !new_allowed.contains(&app_id) {
-                            new_allowed.push(app_id);
-                        }
-                    }
-                    changed = true;
-                }
-
-                if changed {
-                    save_config(&config);
+                if !new_app_ids.contains(&app_id) {
+                    new_app_ids.push(app_id);
                 }
             }
         }
     }
+
+    if new_app_ids.is_empty() {
+        return new_allowed;
+    }
+
+    let mut config = load_config();
+    let mut changed = false;
+
+    for app_id in &new_app_ids {
+        if !config.smtc_known_apps.contains(app_id) {
+            let is_first_run = config.smtc_known_apps.is_empty();
+            config.smtc_known_apps.push(app_id.clone());
+
+            if is_first_run && !config.smtc_apps.contains(app_id) {
+                config.smtc_apps.push(app_id.clone());
+                if !new_allowed.contains(app_id) {
+                    new_allowed.push(app_id.clone());
+                }
+            }
+            changed = true;
+        }
+    }
+
+    if changed {
+        save_config(&config);
+    }
+
     new_allowed
 }
 
@@ -552,7 +599,9 @@ fn fetch_properties(
             info.lyrics = None;
             info.thumbnail = None;
             info.thumbnail_hash = 0;
-            info.position_ms = smtc_pos;
+            if smtc_pos > 0 {
+                info.position_ms = smtc_pos;
+            }
             info.last_smtc_pos = smtc_pos;
             info.last_update = Instant::now();
             info.last_thumbnail_fetch = Instant::now();
@@ -568,7 +617,8 @@ fn fetch_properties(
             should_fetch_thumbnail = true;
         }
         let current_extrapolated = if info.is_playing {
-            info.position_ms + info.last_update.elapsed().as_millis() as u64
+            info.position_ms
+                .saturating_add(info.last_update.elapsed().as_millis() as u64)
         } else {
             info.position_ms
         };
@@ -582,7 +632,9 @@ fn fetch_properties(
             || (smtc_changed && (diff_with_extrapolated > 2000 || !is_playing));
 
         if should_sync {
-            info.position_ms = smtc_pos;
+            if smtc_pos > 0 || !song_changed {
+                info.position_ms = smtc_pos;
+            }
             info.last_update = Instant::now();
         }
 
@@ -598,10 +650,24 @@ fn fetch_properties(
         let session_clone = session.clone();
         let title_clone = new_title.clone();
         let artist_clone = new_artist.clone();
+        let is_song_change = should_fetch_lyrics;
         tokio::task::spawn_blocking(move || {
-            for _ in 0..10 {
-                let res = (|| -> windows::core::Result<Vec<u8>> {
+            if is_song_change {
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            for attempt in 0..10 {
+                let res = (|| -> windows::core::Result<(String, String, Vec<u8>)> {
                     let props = session_clone.TryGetMediaPropertiesAsync()?.get()?;
+                    let fetched_title = props.Title()?.to_string();
+                    let fetched_artist = props.Artist()?.to_string();
+                    if fetched_title != title_clone || fetched_artist != artist_clone {
+                        // HRESULT(-2) is a sentinel value to signal stale media properties,
+                        // not a standard COM error code. The caller retries on this error.
+                        return Err(windows::core::Error::new(
+                            windows::core::HRESULT(-2),
+                            "Stale properties",
+                        ));
+                    }
                     let thumb_ref = props.Thumbnail()?;
                     let stream = thumb_ref.OpenReadAsync()?.get()?;
                     let size = stream.Size()?;
@@ -622,10 +688,10 @@ fn fetch_properties(
                     let reader = windows::Storage::Streams::DataReader::FromBuffer(&res_buffer)?;
                     let mut bytes = vec![0u8; size as usize];
                     reader.ReadBytes(&mut bytes)?;
-                    Ok(bytes)
+                    Ok((fetched_title, fetched_artist, bytes))
                 })();
 
-                if let Ok(bytes) = res {
+                if let Ok((_t, _a, bytes)) = res {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
                     let mut hasher = DefaultHasher::new();
@@ -645,7 +711,8 @@ fn fetch_properties(
                     }
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                let delay = if attempt < 3 { 300 } else { 500 };
+                std::thread::sleep(Duration::from_millis(delay));
             }
         });
     }

@@ -73,6 +73,7 @@ pub fn hit_test(items: &[SettingsItem], mx: f32, my: f32, start_y: f32, width: f
             {
                 return ClickResult::AppItem(idx);
             }
+            SettingsItem::RowLabel { .. } => {}
             SettingsItem::CenterLink { .. }
                 if mx >= width / 2.0 - 100.0
                     && mx <= width / 2.0 + 100.0

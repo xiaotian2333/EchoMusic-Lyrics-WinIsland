@@ -10,24 +10,29 @@ use windows::Win32::Media::Audio::{
     IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::core::Interface;
 
 pub struct AudioProcessor {
     spectrum: Arc<Mutex<[f32; 6]>>,
     gate: Arc<AtomicU32>,
+    gate_override: Arc<AtomicU32>,
     cancel_token: CancellationToken,
 }
 
 impl AudioProcessor {
     pub fn new() -> Self {
         let spectrum = Arc::new(Mutex::new([0.0f32; 6]));
-        let gate = Arc::new(AtomicU32::new(0f32.to_bits()));
+        let gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        // AtomicU32 stores f32 bit patterns since std::sync::atomic doesn't provide AtomicF32.
+        // Relaxed ordering is sufficient: we only need eventual consistency for the gate value.
+        let gate_override = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let cancel_token = CancellationToken::new();
         let processor = Self {
             spectrum,
             gate,
+            gate_override,
             cancel_token,
         };
         processor.start_capture();
@@ -36,14 +41,23 @@ impl AudioProcessor {
     }
 
     pub fn get_spectrum(&self) -> [f32; 6] {
-        *self.spectrum.lock().unwrap()
+        *self.spectrum.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_gate_override(&self, value: bool) {
+        let v = if value { 1.0f32 } else { 0.0f32 };
+        self.gate_override.store(v.to_bits(), Ordering::Relaxed);
     }
 
     fn start_meter_thread(&self) {
         let cancel = self.cancel_token.clone();
         let gate_clone = self.gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            // SAFETY: CoInitializeEx initializes COM for this thread. COINIT_MULTITHREADED
+            // is safe as we don't use single-threaded COM apartments.
+            let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            // SAFETY: CoCreateInstance creates COM objects for audio enumeration.
+            // All COM calls operate on locally created objects with no shared mutable state.
             let session_manager: Option<IAudioSessionManager2> = unsafe {
                 (|| -> Option<IAudioSessionManager2> {
                     let enumerator: IMMDeviceEnumerator =
@@ -55,6 +69,9 @@ impl AudioProcessor {
             while !cancel.is_cancelled() {
                 let mut max_peak = 0.0f32;
                 if let Some(ref mgr) = session_manager {
+                    // SAFETY: GetSessionEnumerator and subsequent COM calls enumerate audio
+                    // sessions for peak meter reading. All objects are obtained from the
+                    // session_manager which is valid for the lifetime of this thread.
                     unsafe {
                         if let Ok(enumerator) = mgr.GetSessionEnumerator() {
                             let count = enumerator.GetCount().unwrap_or(0);
@@ -79,6 +96,14 @@ impl AudioProcessor {
                 gate_clone.store(gate_val.to_bits(), Ordering::Relaxed);
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            // Drop COM objects while COM is still initialized, then clean up.
+            drop(session_manager);
+            if hr.is_ok() {
+                // SAFETY: COM was initialized above, and all COM objects are dropped.
+                unsafe {
+                    CoUninitialize();
+                }
+            }
         });
     }
 
@@ -86,6 +111,7 @@ impl AudioProcessor {
         let spectrum_arc = self.spectrum.clone();
         let cancel = self.cancel_token.clone();
         let gate_clone = self.gate.clone();
+        let gate_override_clone = self.gate_override.clone();
         tokio::task::spawn_blocking(move || {
             let host = cpal::default_host();
             let device = match host.default_output_device() {
@@ -98,22 +124,77 @@ impl AudioProcessor {
             };
             let stream_config: StreamConfig = config.config();
             let stream = match config.sample_format() {
-                SampleFormat::F32 => {
-                    build_capture_stream::<f32>(&device, &stream_config, spectrum_arc, gate_clone)
-                }
-                SampleFormat::I16 => {
-                    build_capture_stream::<i16>(&device, &stream_config, spectrum_arc, gate_clone)
-                }
-                SampleFormat::U16 => {
-                    build_capture_stream::<u16>(&device, &stream_config, spectrum_arc, gate_clone)
-                }
+                SampleFormat::F32 => build_capture_stream::<f32>(
+                    &device,
+                    &stream_config,
+                    spectrum_arc,
+                    gate_clone,
+                    gate_override_clone,
+                ),
+                SampleFormat::I16 => build_capture_stream::<i16>(
+                    &device,
+                    &stream_config,
+                    spectrum_arc,
+                    gate_clone,
+                    gate_override_clone,
+                ),
+                SampleFormat::U16 => build_capture_stream::<u16>(
+                    &device,
+                    &stream_config,
+                    spectrum_arc,
+                    gate_clone,
+                    gate_override_clone,
+                ),
                 _ => return,
             };
             if let Ok(s) = stream {
+                // SAFETY: CoInitializeEx initializes COM for this thread. COINIT_MULTITHREADED
+                // is safe as we don't use single-threaded COM apartments.
+                let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+                // SAFETY: CoCreateInstance and subsequent COM calls create audio session objects.
+                // All objects are locally scoped and valid for the lifetime of this thread.
+                let _session = unsafe {
+                    let enumerator: IMMDeviceEnumerator =
+                        match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok() {
+                            Some(e) => e,
+                            None => {
+                                let _ = s.play();
+                                while !cancel.is_cancelled() {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                if hr.is_ok() {
+                                    // SAFETY: COM was initialized above, no COM objects to drop.
+                                    CoUninitialize();
+                                }
+                                return;
+                            }
+                        };
+                    let mut session = None;
+                    if let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
+                        && let Ok(mgr) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
+                        && let Ok(ses) = mgr.GetSimpleAudioVolume(None, 0)
+                    {
+                        session = Some(ses);
+                    }
+                    session
+                };
+                // TODO: Re-enable auto-mute for monitoring wallpaper-only audio
+                // if let Some(ref ses) = session {
+                //     let _ = unsafe { ses.SetMute(true, std::ptr::null()) };
+                // }
                 let _ = s.play();
                 while !cancel.is_cancelled() {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+                // Drop COM objects while COM is still initialized, then clean up.
+                drop(_session);
+                if hr.is_ok() {
+                    // SAFETY: COM was initialized above, and all COM objects are dropped.
+                    unsafe {
+                        CoUninitialize();
+                    }
+                }
+                // TODO: Re-enable auto-mute cleanup
             }
         });
     }
@@ -124,6 +205,7 @@ fn build_capture_stream<T>(
     config: &StreamConfig,
     spectrum_arc: Arc<Mutex<[f32; 6]>>,
     gate_clone: Arc<AtomicU32>,
+    gate_override_clone: Arc<AtomicU32>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + Copy,
@@ -149,11 +231,12 @@ where
                         &mut adaptive_max,
                         &spectrum_arc,
                         &gate_clone,
+                        &gate_override_clone,
                     );
                 }
             }
         },
-        |err| eprintln!("Audio error: {}", err),
+        |err| log::error!("Audio error: {}", err),
         None,
     )
 }
@@ -165,10 +248,23 @@ fn update_spectrum(
     adaptive_max: &mut [f32; 6],
     spectrum_arc: &Arc<Mutex<[f32; 6]>>,
     gate_clone: &Arc<AtomicU32>,
+    gate_override_clone: &Arc<AtomicU32>,
 ) {
-    let mut indata = pcm_buffer[..1024].to_vec();
-    let _ = fft.process(&mut indata, output);
+    let fft_len = 1024;
+    let mut indata = pcm_buffer[..fft_len].to_vec();
+    pcm_buffer.drain(..fft_len);
+    if let Err(e) = fft.process(&mut indata, output) {
+        log::warn!("FFT processing failed: {:?}", e);
+        // Feed the floor value into adaptive_max to prevent slow baseline decay
+        // when FFT frames are intermittently dropped.
+        for v in adaptive_max.iter_mut() {
+            *v = *v * 0.995 + 0.01 * 0.005;
+        }
+        return;
+    }
     let gate = f32::from_bits(gate_clone.load(Ordering::Relaxed));
+    let gate_override = f32::from_bits(gate_override_clone.load(Ordering::Relaxed));
+    let effective_gate = gate * gate_override;
     let mut raw_bins = [0.0f32; 6];
     let ranges = [(2, 8), (8, 20), (20, 50), (50, 120), (120, 280), (280, 511)];
     for (j, (start, end)) in ranges.iter().enumerate() {
@@ -176,7 +272,7 @@ fn update_spectrum(
         sum += output[*start..*end].iter().map(|v| v.norm()).sum::<f32>();
         let avg = sum / (*end - *start) as f32;
         adaptive_max[j] = adaptive_max[j] * 0.995 + avg.max(0.01) * 0.005;
-        raw_bins[j] = (avg / (adaptive_max[j] * 2.3) * gate).clamp(0.0, 1.0);
+        raw_bins[j] = (avg / (adaptive_max[j] * 2.3) * effective_gate).clamp(0.0, 1.0);
     }
     let mut final_bins = [0.0f32; 6];
     final_bins[0] = raw_bins[5] * 0.8;
@@ -188,7 +284,6 @@ fn update_spectrum(
     if let Ok(mut s) = spectrum_arc.try_lock() {
         *s = final_bins;
     }
-    pcm_buffer.clear();
 }
 
 impl Drop for AudioProcessor {
