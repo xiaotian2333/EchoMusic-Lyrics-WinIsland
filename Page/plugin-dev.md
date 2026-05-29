@@ -50,20 +50,128 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-winisland-plugin-api = { git = "https://github.com/Eatgrapes/WinIsland", branch = "master" }
+winisland-plugin-api = "0.1"
 ```
 
-## Packaging as ZIP (ﾉ◕ヮ◕)ﾉ
+## Implementing the Plugin
+
+Create a minimal plugin that exports the required C ABI entry point.
+
+**src/lib.rs:**
+
+```rust
+use winisland_plugin_api::*;
+
+// The plugin instance is your plugin's state.
+struct MyPlugin;
+
+// The one and only entry point — WinIsland calls this via libloading.
+#[no_mangle]
+pub extern "C" fn plugin_get_instance() -> PluginInstanceC {
+    let handle = Box::into_raw(Box::new(MyPlugin)) as PluginHandle;
+
+    // The vtable is static — it lives as long as the DLL is loaded.
+    static VTABLE: PluginVTable = PluginVTable {
+        on_load:    on_load,
+        on_unload:  on_unload,
+        destroy:    destroy,
+        get_content: None,
+        on_click:   None,
+        on_expanded: None,
+        supports_expand: None,
+        get_colors: None,
+        get_animations: None,
+        get_shortcuts_count: None,
+        get_shortcut_at: None,
+        execute_shortcut: None,
+    };
+
+    PluginInstanceC {
+        handle,
+        metadata: PluginMetadataC {
+            id:          *b"my-plugin\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            name:        *b"My Plugin\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            version:     *b"0.1.0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            author:      *b"you\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            description: *b"A minimal WinIsland plugin\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        },
+        vtable: &VTABLE,
+        plugin_type: PluginType::Content as u32,
+    }
+}
+
+unsafe extern "C" fn on_load(_handle: PluginHandle) -> PluginResultC {
+    PluginResultC::ok()
+}
+
+unsafe extern "C" fn on_unload(_handle: PluginHandle) -> PluginResultC {
+    PluginResultC::ok()
+}
+
+unsafe extern "C" fn destroy(handle: PluginHandle) {
+    drop(unsafe { Box::from_raw(handle as *mut MyPlugin) });
+}
+```
+
+## Packaging with One Command (ﾉ◕ヮ◕)ﾉ
+
+The `winisland-plugin-api` crate comes with an optional **packager** module that automates release builds, signing, and ZIP packaging.
+
+### 1. Add a packing script
+
+Add to your `Cargo.toml`:
+
+```toml
+[dev-dependencies]
+winisland-plugin-api = { version = "0.1", features = ["packager"] }
+
+[[bin]]
+name = "pack"
+path = "package.rs"
+```
+
+Create `package.rs` at the project root:
+
+```rust
+fn main() {
+    winisland_plugin_api::packager::PluginPackager::from_cargo()
+        .unwrap()
+        .signing_key_path("signing_key.pem")  // optional
+        .include_dir("assets")                 // optional
+        .build()
+        .unwrap();
+}
+```
+
+### 2. Build everything
+
+```bash
+# This single command compiles, signs (if key provided), and packages into a ZIP:
+cargo run --bin pack
+# Output: target/my-winisland-plugin-0.1.0.zip
+```
+
+That's it! The packager will:
+
+1. Run `cargo build --release` to compile your DLL
+2. Find the built `.dll` in `target/release/`
+3. Copy any extra directories (like `assets/`)
+4. Compute SHA-256 hashes of all DLLs
+5. Sign the manifest with your Ed25519 key (if provided)
+6. Generate `plugin.yml` with all metadata
+7. Pack everything into `<name>-<version>.zip`
+
+### Without the packager (manual ZIP)
 
 Your plugin must be packaged as `.zip` to be loaded by WinIsland. The ZIP must contain:
 
 ```
 my-plugin.zip
 ├── plugin.yml    ← plugin manifest (required)
-└── *.dll         ← plugin binary (required, multiple .dll OK — all will be loaded)
+└── *.dll         ← plugin binary (required, multiple .dll OK)
 ```
 
-### plugin.yml
+#### plugin.yml
 
 ```yaml
 name: example
@@ -75,13 +183,84 @@ github-link: example/example-plugin
 
 **All 5 fields are required** — missing any will cause install to fail o(TヘTo)
 
+## Digital Signing (Recommended)
+
+Plugins can be **optionally** signed with Ed25519 to verify authenticity. Signed plugins are verified before loading — unsigned ones still work but show a warning.
+
+### Generate a signing key
+
+```bash
+openssl genpkey -algorithm ed25519 -out signing_key.pem
+openssl pkey -in signing_key.pem -pubout -out public_key.pem
+```
+
+The `public_key.pem` is embedded into the WinIsland binary by the project maintainers. If you're a plugin developer, you'll receive the signing key from the WinIsland team through a secure channel.
+
+### Sign during packaging
+
+```bash
+cargo run --bin pack
+```
+
+If `signing_key.pem` is present in the project root, the packager automatically signs the plugin. The signature is embedded in `plugin.yml`:
+
+```yaml
+name: my-plugin
+author: you
+version: 1.0.0
+description: My awesome plugin
+github-link: you/my-plugin
+signature: "abc123deadbeef..."    # Ed25519 signature (64 bytes hex)
+dll_hashes:
+  - "sha256hashofdll..."
+```
+
+### CI signing with environment variable
+
+```yaml
+# .github/workflows/release.yml
+- run: cargo run --bin pack
+  env:
+    PLUGIN_SIGNING_KEY: ${{ secrets.PLUGIN_SIGNING_KEY }}
+```
+
+```rust
+// package.rs
+PluginPackager::from_cargo()
+    .unwrap()
+    .signing_key_env("PLUGIN_SIGNING_KEY")
+    .build()
+    .unwrap();
+```
+
 ## Installing ฅ^•ﻌ•^ฅ
 
-Simply **drag the `.zip` file onto the island**! The plugin is extracted to `C:\Users\<YourName>\AppData\Roaming\WinIsland\plugins\<plugin-name>\` and auto-loaded.
+Simply **drag the `.zip` file onto the island**! The plugin is extracted in a background thread (so your island stays smooth and responsive) and loaded automatically.
 
 A Windows notification dialog will confirm successful installation.
 
-You can also manually place `.dll` files into subdirectories under `plugins\` — WinIsland scans them on startup.
+You can also manually place `.dll` files into subdirectories under the plugins folder — WinIsland scans them on startup.
+
+### Plugin storage location
+
+```
+C:\Users\<YourName>\AppData\Roaming\WinIsland\plugins\<plugin-name>\*.dll
+```
+
+## Security
+
+WinIsland applies several security measures when loading plugins:
+
+| Protection | Details |
+|-----------|---------|
+| **Plugin ID validation** | IDs must match `[a-zA-Z0-9_-]+` only |
+| **ID conflict detection** | Duplicate plugin IDs are rejected |
+| **Signature verification** | Ed25519 signature checked before loading (if present) |
+| **Path traversal protection** | ZIP entries with `..`, `:`, or absolute paths are rejected |
+| **Symlink rejection** | ZIP symlink entries are rejected |
+| **Background extraction** | ZIP decompression runs in a background thread |
+| **Poison handling** | Lock poisoning doesn't crash the host |
+| **VTable validation** | Required function pointers checked for null before calling |
 
 ## How to Verify Your Plugin Loaded?
 
@@ -91,8 +270,6 @@ Since the host-side API is still under development, plugins won't display anythi
 1. Press `F12` to open the WinIsland debug log window
 2. Search for your plugin name — you should see something like `Loaded plugin: xxx (xxx)`
 3. Dropping a ZIP triggers a Windows popup confirming success/failure
-
-It's a rough skeleton, but it works! (｡･ω･｡)
 
 ## C ABI Type Reference
 
@@ -149,6 +326,9 @@ pub struct PluginVTable {
     pub supports_expand: Option<unsafe extern "C" fn(PluginHandle) -> bool>,
     pub get_colors: Option<unsafe extern "C" fn(PluginHandle) -> ThemeColorsC>,
     pub get_animations: Option<unsafe extern "C" fn(PluginHandle) -> AnimationConfigC>,
+    pub get_shortcuts_count: Option<unsafe extern "C" fn(PluginHandle) -> u32>,
+    pub get_shortcut_at: Option<unsafe extern "C" fn(PluginHandle, i: u32, out: *mut ShortcutC)>,
+    pub execute_shortcut: Option<unsafe extern "C" fn(PluginHandle, id: *const c_char) -> PluginResultC>,
 }
 ```
 
@@ -163,7 +343,7 @@ pub struct PluginInstanceC {
 }
 ```
 
-### ThemeColorsC / AnimationConfigC
+### ThemeColorsC / AnimationConfigC / ShortcutC
 
 ```rust
 pub struct ThemeColorsC {
@@ -178,6 +358,14 @@ pub struct AnimationConfigC {
     pub expand_duration_ms: u32,
     pub collapse_duration_ms: u32,
     pub bounce_intensity: f32,
+}
+
+pub struct ShortcutC {
+    pub id: [u8; 64],
+    pub name: [u8; 128],
+    pub description: [u8; 256],
+    pub icon: [u8; 256],
+    pub hotkey: [u8; 32],
 }
 ```
 

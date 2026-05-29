@@ -6,7 +6,7 @@ WinIsland is currently in active development. You can download the latest nightl
 
 Nightly builds are automatically generated every time we update the code. They include the latest features but might be less stable than official releases.
 
-[Download Latest Nightly (.exe)](https://github.com/Eatgrapes/WinIsland/releases/download/nightly/WinIsland.exe)
+[Download Latest Nightly (.exe)](https://github.com/Neamyoo-dev/WinIsland/releases/download/nightly/WinIsland.exe)
 
 ---
 

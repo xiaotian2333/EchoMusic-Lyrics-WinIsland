@@ -1,18 +1,75 @@
+//! # WinIsland Plugin API
+//!
+//! C ABI types and tooling for developing [WinIsland](https://github.com/Eatgrapes/WinIsland) plugins.
+//!
+//! Plugins are native DLLs that communicate with the WinIsland host via a
+//! C-compatible vtable interface — no serialization, no IPC, straight FFI.
+//!
+//! ## Usage modes
+//!
+//! ### 1. Writing a plugin (core C ABI types, zero extra dependencies)
+//!
+//! ```toml
+//! [dependencies]
+//! winisland-plugin-api = "0.1"
+//! ```
+//!
+//! Implement the C ABI by exporting a `plugin_get_instance` function:
+//!
+//! ```rust,no_run
+//! use winisland_plugin_api::*;
+//!
+//! #[no_mangle]
+//! pub unsafe extern "C" fn plugin_get_instance() -> PluginInstanceC {
+//!     // See the crate docs for a full plugin example.
+//!     unimplemented!()
+//! }
+//! ```
+//!
+//! ### 2. Packaging a plugin (requires `packager` feature)
+//!
+//! ```toml
+//! [dev-dependencies]
+//! winisland-plugin-api = { version = "0.1", features = ["packager"] }
+//! ```
+//!
+//! Add a `package.rs` binary that builds, signs and zips the plugin:
+//!
+//! ```rust,no_run
+//! fn main() {
+//!     winisland_plugin_api::packager::PluginPackager::from_cargo()
+//!         .unwrap()
+//!         .signing_key_path("signing_key.pem")
+//!         .build()
+//!         .unwrap();
+//! }
+//! ```
+//!
+//! Then run `cargo run --bin pack` to produce a signed `.zip` distributable.
+
 use std::ffi::c_char;
 
+/// Opaque handle to a plugin instance, passed through every vtable call.
 pub type PluginHandle = *mut std::ffi::c_void;
 
 #[cfg(feature = "packager")]
 pub mod packager;
 
+/// Identifies what capability a plugin provides to the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginType {
+    /// Plugin provides island content (music, notification, status, etc.)
     Content = 1,
+    /// Plugin provides theme colours and animation configuration.
     Theme = 2,
+    /// Plugin provides keyboard shortcuts / quick actions.
     Shortcut = 3,
 }
 
 impl PluginType {
+    /// Convert a raw `u32` discriminant from the C ABI into a `PluginType`.
+    ///
+    /// Returns `None` for unknown values.
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             1 => Some(Self::Content),
@@ -23,13 +80,19 @@ impl PluginType {
     }
 }
 
+/// The return type for fallible plugin host calls.
+///
+/// This is a C-compatible equivalent of `Result<(), String>`.
 #[repr(C)]
 pub struct PluginResultC {
+    /// `true` for success, `false` for failure.
     pub ok: bool,
+    /// Null-terminated UTF-8 error message (max 255 bytes + NUL).
     pub error: [u8; 256],
 }
 
 impl PluginResultC {
+    /// Construct a success result.
     pub fn ok() -> Self {
         Self {
             ok: true,
@@ -37,6 +100,9 @@ impl PluginResultC {
         }
     }
 
+    /// Construct an error result with the given message.
+    ///
+    /// The message is truncated to 255 bytes if it exceeds the buffer.
     pub fn err(msg: &str) -> Self {
         let mut error = [0u8; 256];
         let bytes = msg.as_bytes();
@@ -45,6 +111,7 @@ impl PluginResultC {
         Self { ok: false, error }
     }
 
+    /// Convert back into a Rust `Result`.
     pub fn into_result(self) -> Result<(), String> {
         if self.ok {
             Ok(())
@@ -55,31 +122,58 @@ impl PluginResultC {
     }
 }
 
+/// Fixed-width plugin metadata exchanged over FFI.
+///
+/// Every field is a fixed-size byte buffer. The host reads them via
+/// [`read_c_str`] and [`read_opt_c_str`] helpers.
 #[repr(C)]
 pub struct PluginMetadataC {
+    /// Unique identifier (e.g. `"my-awesome-plugin"`). Max 63 bytes + NUL.
     pub id: [u8; 64],
+    /// Human-readable name. Max 127 bytes + NUL.
     pub name: [u8; 128],
+    /// Semver version string (e.g. `"1.0.0"`). Max 31 bytes + NUL.
     pub version: [u8; 32],
+    /// Author name. Max 127 bytes + NUL.
     pub author: [u8; 128],
+    /// Description. Max 255 bytes + NUL.
     pub description: [u8; 256],
 }
 
+/// Content data pushed to the WinIsland island display.
+///
+/// The `tag` field selects which content variant the host should render.
 #[repr(C)]
 pub struct IslandContentC {
+    /// Discriminant: [`ISLAND_CONTENT_TAG_MUSIC`], [`ISLAND_CONTENT_TAG_NOTIFICATION`],
+    /// or [`ISLAND_CONTENT_TAG_STATUS`].
     pub tag: u32,
+    /// Title text (e.g. song title, notification subject). Max 255 bytes + NUL.
     pub title: [u8; 256],
+    /// Artist / subtitle text. Max 255 bytes + NUL.
     pub artist: [u8; 256],
+    /// URL to cover album art or notification icon. Max 511 bytes + NUL.
     pub cover_url: [u8; 512],
+    /// Playback state.
     pub is_playing: bool,
+    /// Notification body / extra message. Max 255 bytes + NUL.
     pub message: [u8; 256],
+    /// Status metric label (e.g. "CPU"). Max 127 bytes + NUL.
     pub label: [u8; 128],
+    /// Status metric value (e.g. "45%"). Max 127 bytes + NUL.
     pub value: [u8; 128],
 }
 
+/// Content variant: music playback info with cover art.
 pub const ISLAND_CONTENT_TAG_MUSIC: u32 = 1;
+/// Content variant: system / app notification.
 pub const ISLAND_CONTENT_TAG_NOTIFICATION: u32 = 2;
+/// Content variant: status metric (CPU, memory, etc.).
 pub const ISLAND_CONTENT_TAG_STATUS: u32 = 3;
 
+/// Colour palette returned by a theme plugin.
+///
+/// Each colour is `[R, G, B, A]` in sRGB.
 #[repr(C)]
 pub struct ThemeColorsC {
     pub primary: [u8; 4],
@@ -89,45 +183,144 @@ pub struct ThemeColorsC {
     pub border: [u8; 4],
 }
 
+/// Animation timing configuration for island transitions.
 #[repr(C)]
 pub struct AnimationConfigC {
+    /// Expand transition duration in milliseconds.
     pub expand_duration_ms: u32,
+    /// Collapse transition duration in milliseconds.
     pub collapse_duration_ms: u32,
+    /// Spring bounce intensity (0.0 = no bounce, typical range 0.3–0.8).
     pub bounce_intensity: f32,
 }
 
+/// A keyboard shortcut or quick action exposed by a plugin.
 #[repr(C)]
 pub struct ShortcutC {
+    /// Stable identifier used in `execute_shortcut` calls. Max 63 bytes + NUL.
     pub id: [u8; 64],
+    /// Display name shown in the shortcut palette. Max 127 bytes + NUL.
     pub name: [u8; 128],
+    /// One-line description of what the shortcut does. Max 255 bytes + NUL.
     pub description: [u8; 256],
+    /// Optional icon hint. Max 255 bytes + NUL.
     pub icon: [u8; 256],
+    /// Optional hotkey binding (e.g. `"Ctrl+Shift+M"`). Max 31 bytes + NUL.
     pub hotkey: [u8; 32],
 }
 
+/// Virtual function table that every plugin DLL must expose.
+///
+/// This is the **core of the plugin ABI**: the host calls through these
+/// function pointers on the plugin's handle. Required fields (`on_load`,
+/// `on_unload`, `destroy`) must always be non-null. Optional fields
+/// may be `None` if the plugin doesn't support that capability.
 #[repr(C)]
 pub struct PluginVTable {
+    /// Called when the plugin is first loaded. Perform one-time initialisation.
+    ///
+    /// **Must be non-null.** Return `PluginResultC::ok()` on success.
     pub on_load: unsafe extern "C" fn(PluginHandle) -> PluginResultC,
+
+    /// Called when the plugin is about to be unloaded. Release resources.
+    ///
+    /// **Must be non-null.** The return value is logged but does not
+    /// prevent unloading.
     pub on_unload: unsafe extern "C" fn(PluginHandle) -> PluginResultC,
+
+    /// Final destructor called after `on_unload`. Free the `handle`.
+    ///
+    /// **Must be non-null.** After this returns, the handle pointer
+    /// becomes invalid.
     pub destroy: unsafe extern "C" fn(PluginHandle),
+
+    /// Return the current island content to display.
+    ///
+    /// Required for [`PluginType::Content`] plugins. The host polls this
+    /// at a regular interval.
     pub get_content: Option<unsafe extern "C" fn(PluginHandle) -> IslandContentC>,
+
+    /// Called when the user clicks on the plugin's content area.
     pub on_click: Option<unsafe extern "C" fn(PluginHandle)>,
+
+    /// Called when the island expands / collapses.
+    ///
+    /// `true` = expanded, `false` = collapsed.
     pub on_expanded: Option<unsafe extern "C" fn(PluginHandle, bool)>,
+
+    /// Whether this content plugin supports an expanded view.
+    ///
+    /// If `None`, the host assumes no expanded view.
     pub supports_expand: Option<unsafe extern "C" fn(PluginHandle) -> bool>,
+
+    /// Return the current theme colours.
+    ///
+    /// Required for [`PluginType::Theme`] plugins.
     pub get_colors: Option<unsafe extern "C" fn(PluginHandle) -> ThemeColorsC>,
+
+    /// Return animation timing configuration.
+    ///
+    /// Required for [`PluginType::Theme`] plugins.
     pub get_animations: Option<unsafe extern "C" fn(PluginHandle) -> AnimationConfigC>,
+
+    /// Number of shortcuts exposed by this plugin.
+    ///
+    /// Required for [`PluginType::Shortcut`] plugins.
     pub get_shortcuts_count: Option<unsafe extern "C" fn(PluginHandle) -> u32>,
+
+    /// Write the `i`-th shortcut (0-indexed) into the output buffer.
+    ///
+    /// Required for [`PluginType::Shortcut`] plugins.
     pub get_shortcut_at: Option<unsafe extern "C" fn(PluginHandle, i: u32, out: *mut ShortcutC)>,
+
+    /// Execute the shortcut identified by `id`.
+    ///
+    /// Required for [`PluginType::Shortcut`] plugins.
     pub execute_shortcut:
         Option<unsafe extern "C" fn(PluginHandle, id: *const c_char) -> PluginResultC>,
 }
 
+/// The complete plugin instance returned by the DLL's entry point.
+///
+/// Every plugin DLL must export a `plugin_get_instance` function
+/// returning one of these:
+///
+/// ```rust,no_run
+/// # use winisland_plugin_api::*;
+/// #[no_mangle]
+/// pub unsafe extern "C" fn plugin_get_instance() -> PluginInstanceC {
+///     PluginInstanceC {
+///         handle: std::ptr::null_mut(),
+///         metadata: PluginMetadataC {
+///             id: read_c_str(b"my-plugin\0"),
+///             name: read_c_str(b"My Plugin\0"),
+///             version: read_c_str(b"1.0.0\0"),
+///             author: read_c_str(b"Me\0"),
+///             description: read_c_str(b"Does cool stuff\0"),
+///         },
+///         vtable: &VTABLE,
+///         plugin_type: PluginType::Content as u32,
+///     }
+/// }
+/// ```
 #[repr(C)]
 pub struct PluginInstanceC {
+    /// Opaque handle passed back to every vtable call.
     pub handle: PluginHandle,
+    /// Plugin identity metadata.
     pub metadata: PluginMetadataC,
+    /// Pointer to the virtual function table.
+    ///
+    /// The vtable must remain valid for the lifetime of the handle.
     pub vtable: *const PluginVTable,
+    /// Plugin type discriminant ([`PluginType`]).
     pub plugin_type: u32,
 }
 
+/// Entry-point function signature that every plugin DLL must export.
+///
+/// ```ignore
+/// #[no_mangle]
+/// pub unsafe extern "C" fn plugin_get_instance() -> PluginInstanceC;
+/// ```
 pub type PluginGetInstanceFn = unsafe extern "C" fn() -> PluginInstanceC;
