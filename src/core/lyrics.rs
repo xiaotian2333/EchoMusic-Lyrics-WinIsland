@@ -98,9 +98,10 @@ pub async fn fetch_lyrics(
     //    NetEase hit). Only try the selected source once, skip fallback.
     if artist.trim().is_empty() {
         return match source {
-            "lrclib" => fetch_lyrics_lrclib(title, artist, duration_secs).await,
-            _ => fetch_lyrics_163(title, artist).await,
+            "lrclib" => fetch_lyrics_lrclib(title, "", duration_secs).await,
+            _ => fetch_lyrics_163(title, "").await,
         };
+    }
     }
 
     // 3. Online sources
