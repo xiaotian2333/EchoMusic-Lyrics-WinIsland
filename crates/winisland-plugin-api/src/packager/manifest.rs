@@ -68,6 +68,9 @@ impl PluginManifest {
         if self.description.trim().is_empty() {
             return Err("'description' is empty".into());
         }
+        if self.github_link.trim().is_empty() {
+            return Err("'github-link' is empty".into());
+        }
         Ok(())
     }
 }
