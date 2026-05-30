@@ -886,7 +886,6 @@ impl ApplicationHandler for App {
                     0,
                     WS_MAXIMIZEBOX.0 as isize | WS_THICKFRAME.0 as isize,
                 );
-                crate::utils::win32::set_island_hwnd(hwnd);
             }
 
             self.window = Some(window.clone());

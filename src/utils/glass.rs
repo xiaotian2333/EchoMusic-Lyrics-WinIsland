@@ -1,4 +1,3 @@
-use crate::utils::win32::with_capture_exclusion;
 use skia_safe::{
     AlphaType, Color, ColorType, Data, ISize, Image, ImageInfo, Paint, image_filters, images,
     surfaces,
@@ -50,9 +49,7 @@ pub fn get_glass_background(
 
     // SAFETY: capture_and_blur has been validated by the caller: w and h
     // are non-zero. The function internally checks GDI handle validity.
-    let result = with_capture_exclusion(|| unsafe {
-        capture_and_blur(screen_x, screen_y, w, h, blur_sigma)
-    });
+    let result = unsafe { capture_and_blur(screen_x, screen_y, w, h, blur_sigma) };
 
     if let Some(ref img) = result {
         GLASS_CACHE.with(|cell| {

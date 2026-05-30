@@ -191,8 +191,39 @@ pub fn draw_island(
 
     let mut bg_color = Color::BLACK;
 
-    let text_color = Color::WHITE;
-    let text_color_sec = Color::WHITE;
+    // Liquid glass text uses a tint derived from the music palette — keeps it
+    // readable on the dark refractive background while feeling cohesive.
+    let liquid_palette = if island_style == "liquid_glass" {
+        let p = get_media_palette(media);
+        if p.is_empty() || (p[0].r() >= 250 && p[0].g() >= 250 && p[0].b() >= 250) {
+            vec![Color::from_rgb(200, 200, 200)]
+        } else {
+            p
+        }
+    } else {
+        vec![Color::from_rgb(200, 200, 200)]
+    };
+
+    let text_color = if island_style == "liquid_glass" {
+        let c = &liquid_palette[0];
+        Color::from_rgb(
+            (c.r() as f32 * 0.25 + 255.0 * 0.75) as u8,
+            (c.g() as f32 * 0.25 + 255.0 * 0.75) as u8,
+            (c.b() as f32 * 0.25 + 255.0 * 0.75) as u8,
+        )
+    } else {
+        Color::WHITE
+    };
+    let text_color_sec = if island_style == "liquid_glass" {
+        let c = &liquid_palette[0];
+        Color::from_rgb(
+            (c.r() as f32 * 0.15 + 255.0 * 0.85) as u8,
+            (c.g() as f32 * 0.15 + 255.0 * 0.85) as u8,
+            (c.b() as f32 * 0.15 + 255.0 * 0.85) as u8,
+        )
+    } else {
+        Color::WHITE
+    };
 
     if island_style == "liquid_glass" {
         let screen_x = win_x + offset_x as i32;
