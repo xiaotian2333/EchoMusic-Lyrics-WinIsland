@@ -295,7 +295,9 @@ impl PluginPackager {
         }
 
         // 9. Validate and write plugin.yml
-        manifest.validate().map_err(|e| format!("Invalid manifest: {}", e))?;
+        manifest
+            .validate()
+            .map_err(|e| format!("Invalid manifest: {}", e))?;
         manifest
             .write_to_yaml(&staging_path.join("plugin.yml"))
             .map_err(|e| format!("Cannot write plugin.yml: {}", e))?;
