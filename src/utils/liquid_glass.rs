@@ -68,9 +68,9 @@ half4 main(float2 coord) {
 
 type CacheEntry = (Image, Instant, i32, i32, u32, u32);
 
-// Captured + blurred desktop background, keyed by screen position only.
-// Refreshed when position changes or every 5s (heavily blurred = stale content invisible).
-type BgCacheEntry = (Image, i32, i32, Instant);
+// Captured + blurred desktop background, keyed by screen position and size.
+// Refreshed when position/size changes or every 5s (heavily blurred = stale content invisible).
+type BgCacheEntry = (Image, i32, i32, u32, u32, Instant);
 
 thread_local! {
     static GLASS_CACHE: RefCell<Option<CacheEntry>> = const { RefCell::new(None) };
