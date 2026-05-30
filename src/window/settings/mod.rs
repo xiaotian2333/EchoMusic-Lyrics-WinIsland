@@ -178,6 +178,7 @@ pub struct SettingsApp {
     cached_content_height: f32,
     cached_max_scroll: f32,
     cached_row_tops: Vec<f32>,
+    cached_row_heights: Vec<f32>,
     win_w: f32,
     win_h: f32,
 }
@@ -226,6 +227,7 @@ impl SettingsApp {
             cached_content_height: 0.0,
             cached_max_scroll: 0.0,
             cached_row_tops: Vec::new(),
+            cached_row_heights: Vec::new(),
             win_w: WIN_W,
             win_h: WIN_H,
         }
@@ -686,10 +688,12 @@ impl SettingsApp {
         let view_h = self.win_h / scale;
         self.cached_max_scroll = (self.cached_content_height - view_h + 20.0).max(0.0);
         self.cached_row_tops.clear();
+        self.cached_row_heights.clear();
         let mut y = content_start_y;
         for item in &self.cached_items {
             if item.is_row() {
                 self.cached_row_tops.push(y);
+                self.cached_row_heights.push(item.height());
             }
             y += item.height();
         }
@@ -1450,7 +1454,7 @@ impl ApplicationHandler for SettingsApp {
                                 Err(i) => Some(i - 1),
                             };
                             if let Some(i) = idx
-                                && content_y <= self.cached_row_tops[i] + ROW_HEIGHT
+                                && content_y <= self.cached_row_tops[i] + self.cached_row_heights[i]
                             {
                                 new_row = Some(i);
                             }
