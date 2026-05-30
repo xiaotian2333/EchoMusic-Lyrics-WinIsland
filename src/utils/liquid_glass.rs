@@ -139,12 +139,14 @@ pub fn get_liquid_glass_background(
 }
 
 fn get_or_capture_background(screen_x: i32, screen_y: i32, w: u32, h: u32) -> Option<Image> {
-    // Check BG_CACHE: same position and less than 5s old
+    // Check BG_CACHE: same position, same dimensions, and less than 5s old
     let cached = BG_CACHE.with(|cell| {
         let cache = cell.borrow();
-        if let Some((img, cx, cy, time)) = cache.as_ref()
+        if let Some((img, cx, cy, cw, ch, time)) = cache.as_ref()
             && *cx == screen_x
             && *cy == screen_y
+            && *cw == w
+            && *ch == h
             && time.elapsed().as_millis() < 5000
         {
             return Some(img.clone());
@@ -159,7 +161,7 @@ fn get_or_capture_background(screen_x: i32, screen_y: i32, w: u32, h: u32) -> Op
     let blurred = capture_and_blur(screen_x, screen_y, w, h)?;
 
     BG_CACHE.with(|cell| {
-        *cell.borrow_mut() = Some((blurred.clone(), screen_x, screen_y, Instant::now()));
+        *cell.borrow_mut() = Some((blurred.clone(), screen_x, screen_y, w, h, Instant::now()));
     });
 
     Some(blurred)
