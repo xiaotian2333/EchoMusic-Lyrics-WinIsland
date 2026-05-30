@@ -62,8 +62,14 @@ pub fn hit_test(items: &[SettingsItem], mx: f32, my: f32, start_y: f32, width: f
                     }
                 }
             }
-            SettingsItem::RowFolderPicker { clear_label, .. } => {
-                let cy = y + ROW_HEIGHT / 2.0;
+            SettingsItem::RowFolderPicker {
+                clear_label,
+                current_path,
+                ..
+            } => {
+                let has_path = current_path.as_ref().is_some_and(|p| !p.is_empty());
+                let row_h = if has_path { 64.0 } else { ROW_HEIGHT };
+                let cy = y + row_h / 2.0;
                 let sel_w: f32 = 60.0;
                 let sel_x = CONTENT_PADDING + content_w - GROUP_INNER_PAD - sel_w;
                 if in_rect(mx, my, sel_x, cy - 13.0, sel_w, 26.0) {

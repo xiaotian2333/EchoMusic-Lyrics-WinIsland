@@ -336,7 +336,35 @@ fn smtc_poll_loop(
             current_lyrics_fallback = fb;
         }
         while let Ok(dir) = lyrics_local_dir_rx.try_recv() {
-            current_lyrics_local_dir = dir;
+            if dir != current_lyrics_local_dir {
+                current_lyrics_local_dir = dir;
+                // Re-fetch lyrics for current song when local dir changes
+                let info = info_tx.borrow();
+                if !info.title.is_empty() {
+                    let title = info.title.clone();
+                    let artist = info.artist.clone();
+                    let duration = info.duration_secs;
+                    let src = current_lyrics_source.clone();
+                    let fb = current_lyrics_fallback;
+                    let info_tx_clone = info_tx.clone();
+                    let local_dir = current_lyrics_local_dir.clone();
+                    drop(info);
+                    tokio::spawn(async move {
+                        if let Some(lyrics) =
+                            fetch_lyrics(&title, &artist, duration, &src, fb, local_dir.as_deref())
+                                .await
+                        {
+                            let current = info_tx_clone.borrow();
+                            if current.title == title && current.artist == artist {
+                                drop(current);
+                                let mut new_info = info_tx_clone.borrow().clone();
+                                new_info.lyrics = Some(lyrics);
+                                let _ = info_tx_clone.send(new_info);
+                            }
+                        }
+                    });
+                }
+            }
         }
         while let Ok(apps) = allowed_apps_rx.try_recv() {
             current_allowed_apps = apps;
