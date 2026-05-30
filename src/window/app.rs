@@ -15,7 +15,7 @@ use crate::utils::backdrop::{clear_mica_cache, disable_mica};
 use crate::utils::blur::calculate_blur_sigmas;
 use crate::utils::color::get_island_border_weights;
 use crate::utils::icon::get_app_icon;
-use crate::utils::liquid_glass::clear_liquid_glass_cache;
+use crate::utils::liquid_glass::{clear_liquid_glass_cache, set_exclude_from_capture};
 use crate::utils::mouse::{
     get_global_cursor_pos, is_cursor_hidden, is_foreground_fullscreen, is_left_button_pressed,
     is_point_in_rect,
@@ -702,13 +702,19 @@ impl App {
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 clear_mica_cache();
                 clear_liquid_glass_cache();
-                if old_style == "mica"
-                    && let Ok(handle) = window.window_handle()
-                {
+                if let Ok(handle) = window.window_handle() {
                     let raw = handle.as_raw();
                     if let RawWindowHandle::Win32(win32_handle) = raw {
                         let hwnd = HWND(win32_handle.hwnd.get() as _);
-                        disable_mica(hwnd);
+                        if old_style == "mica" {
+                            disable_mica(hwnd);
+                        }
+                        if old_style == "liquid_glass" {
+                            set_exclude_from_capture(hwnd, false);
+                        }
+                        if self.config.island_style == "liquid_glass" {
+                            set_exclude_from_capture(hwnd, true);
+                        }
                     }
                 }
             }
@@ -886,6 +892,9 @@ impl ApplicationHandler for App {
                     0,
                     WS_MAXIMIZEBOX.0 as isize | WS_THICKFRAME.0 as isize,
                 );
+                if self.config.island_style == "liquid_glass" {
+                    set_exclude_from_capture(hwnd, true);
+                }
             }
 
             self.window = Some(window.clone());

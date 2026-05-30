@@ -4,11 +4,31 @@ use skia_safe::{
 };
 use std::cell::RefCell;
 use std::time::Instant;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WINDOW_DISPLAY_AFFINITY};
 
-// Reduced brightness multipliers to compensate for self-capture feedback
-// (without WDA_EXCLUDEFROMCAPTURE the captured desktop includes the island's
-// own bright content, so we dial back the shader's built-in brightening).
+/// Exclude (or re-include) the island window from GDI screen captures.
+///
+/// Must be called before every `capture_and_blur` to prevent self-capture
+/// feedback (the GDI BitBlt would otherwise include the island's own bright
+/// content). Set when entering liquid glass mode, cleared when leaving.
+pub fn set_exclude_from_capture(hwnd: HWND, exclude: bool) {
+    unsafe {
+        let _ = SetWindowDisplayAffinity(
+            hwnd,
+            if exclude {
+                WINDOW_DISPLAY_AFFINITY(0x00000011)
+            } else {
+                WINDOW_DISPLAY_AFFINITY(0x00000000)
+            },
+        );
+    }
+}
+
+// SKSL shader — uses multi-tap blur on the captured desktop background to
+// produce a frosted-glass look with an edge highlight and specular sheen.
+
 const SKSL_SOURCE: &str = r#"
 uniform shader uBackground;
 uniform float4 uShape;
@@ -40,15 +60,14 @@ half4 main(float2 coord) {
     float2 sourceCoord = sourceUV * uShape.zw + uShape.xy;
 
     float blurAmt = 6.0;
-    half4 color = uBackground.eval(sourceCoord) * 0.35;
-    color += uBackground.eval(sourceCoord + float2(blurAmt, 0)) * 0.13;
-    color += uBackground.eval(sourceCoord - float2(blurAmt, 0)) * 0.13;
-    color += uBackground.eval(sourceCoord + float2(0, blurAmt)) * 0.13;
-    color += uBackground.eval(sourceCoord - float2(0, blurAmt)) * 0.13;
+    half4 color = uBackground.eval(sourceCoord) * 0.40;
+    color += uBackground.eval(sourceCoord + float2(blurAmt, 0)) * 0.15;
+    color += uBackground.eval(sourceCoord - float2(blurAmt, 0)) * 0.15;
+    color += uBackground.eval(sourceCoord + float2(0, blurAmt)) * 0.15;
+    color += uBackground.eval(sourceCoord - float2(0, blurAmt)) * 0.15;
 
     float gray = dot(color.rgb, half3(0.299, 0.587, 0.114));
     color.rgb = mix(float3(gray), color.rgb, 1.0);
-    color.rgb *= 0.95;
 
     float edgeBright = smoothstep(0.0, -0.3, normDist) * 0.08;
     color.rgb += edgeBright;
