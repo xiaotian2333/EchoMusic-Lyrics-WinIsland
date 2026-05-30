@@ -51,10 +51,10 @@ fn evict_one_if_full<K, V>(cache: &mut HashMap<K, V>, limit: usize)
 where
     K: Clone + std::cmp::Eq + std::hash::Hash,
 {
-    if cache.len() > limit {
-        if let Some(key) = cache.keys().next().cloned() {
-            cache.remove(&key);
-        }
+    if cache.len() > limit
+        && let Some(key) = cache.keys().next().cloned()
+    {
+        cache.remove(&key);
     }
 }
 
@@ -301,12 +301,11 @@ impl FontManager {
         TEXT_CACHE.with(|cache| {
             let mut cache_mut = cache.borrow_mut();
             evict_one_if_full(&mut cache_mut, TEXT_CACHE_LIMIT);
-            if let Some((width, _)) = cache_mut.get(&cache_key) {
-                return *width;
-            }
-            let (width, groups) = compute_text_groups(text, size, style);
-            cache_mut.insert(cache_key, (width, groups));
-            width
+            let entry = cache_mut.entry(cache_key).or_insert_with(|| {
+                let (width, groups) = compute_text_groups(text, size, style);
+                (width, groups)
+            });
+            entry.0
         })
     }
 
@@ -320,11 +319,11 @@ impl FontManager {
         TEXT_CACHE.with(|cache| {
             let mut cache_mut = cache.borrow_mut();
             evict_one_if_full(&mut cache_mut, TEXT_CACHE_LIMIT);
-            if !cache_mut.contains_key(&cache_key) {
+            let entry = cache_mut.entry(cache_key).or_insert_with(|| {
                 let (_, groups) = compute_text_groups(params.text, params.size, style);
-                cache_mut.insert(cache_key, (0.0, groups));
-            }
-            let (_, groups) = cache_mut.get(&cache_key).unwrap();
+                (0.0, groups)
+            });
+            let (_, groups) = entry;
             let mut x = params.x;
             let y = params.y.round();
             for (s, tf, embolden) in groups {
@@ -334,8 +333,8 @@ impl FontManager {
                 }
                 params
                     .canvas
-                    .draw_str(s, (x.round(), y), &font, params.paint);
-                let (w, _) = font.measure_str(s, None);
+                    .draw_str(&**s, (x.round(), y), &font, params.paint);
+                let (w, _) = font.measure_str(&**s, None);
                 x += w;
             }
         });
