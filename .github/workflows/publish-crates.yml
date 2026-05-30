@@ -20,22 +20,24 @@ jobs:
       - name: Parse crate name and version from tag
         id: parse
         shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG="${{ github.ref_name }}"
           # e.g. winisland-plugin-api-v0.2.0 → package=winisland-plugin-api, version=0.2.0
-          PACKAGE="${TAG%-v*}"
-          VERSION="${TAG##*-v}"
+          PACKAGE="${REF_NAME%-v*}"
+          VERSION="${REF_NAME##*-v}"
           echo "package=$PACKAGE" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Verify version matches Cargo.toml
         shell: bash
+        env:
+          PKG: ${{ steps.parse.outputs.package }}
+          EXPECTED: ${{ steps.parse.outputs.version }}
         run: |
-          PKG="${{ steps.parse.outputs.package }}"
-          EXPECTED="${{ steps.parse.outputs.version }}"
           FOUND=$(cargo metadata --format-version 1 --no-deps | \
-            python3 -c "import sys,json; data=json.load(sys.stdin); \
-            pkg=[p for p in data['packages'] if p['name']=='$PKG'][0]; print(pkg['version'])")
+            python3 -c "import sys,json,os; data=json.load(sys.stdin); \
+            pkg=[p for p in data['packages'] if p['name']==os.environ['PKG']][0]; print(pkg['version'])")
           if [ "$FOUND" != "$EXPECTED" ]; then
             echo "Version mismatch: tag says $EXPECTED, Cargo.toml says $FOUND"
             exit 1
@@ -43,6 +45,6 @@ jobs:
           echo "Version $FOUND verified"
 
       - name: Publish
-        run: cargo publish -p ${{ steps.parse.outputs.package }}
+        run: cargo publish -p "${{ steps.parse.outputs.package }}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

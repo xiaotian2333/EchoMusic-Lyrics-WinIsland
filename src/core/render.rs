@@ -342,7 +342,9 @@ pub fn draw_island(
     let expanded_alpha_f = (expansion_progress.powf(2.0)).clamp(0.0, 1.0) * (1.0 - hide_progress);
     let mini_alpha_f = (1.0 - expansion_progress * 1.5).clamp(0.0, 1.0) * (1.0 - hide_progress);
 
-    let palette = if expanded_alpha_f > 0.01 || mini_alpha_f > 0.01 {
+    let palette = if island_style == "liquid_glass" {
+        liquid_palette.clone()
+    } else if expanded_alpha_f > 0.01 || mini_alpha_f > 0.01 {
         get_media_palette(media)
     } else {
         vec![

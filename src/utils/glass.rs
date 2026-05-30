@@ -14,11 +14,15 @@ thread_local! {
 }
 
 /// Frosted dark glass backdrop: captures the island region + margin from the
-/// desktop, then applies a heavy blur (sigma ~40). WDA_EXCLUDEFROMCAPTURE
-/// naturally blacks out the island window in the capture, producing a dark
-/// base. A strong darkening blend is applied as a fallback in case WDA does
-/// not fully work on the current system (e.g. certain GPU drivers or Win10
-/// configurations that don't honour the display affinity flag).
+/// desktop, then applies a heavy blur (sigma ~40). A strong darkening blend
+/// (Multiply + dark base) guarantees the signature dark glass look.
+///
+/// Note: WDA_EXCLUDEFROMCAPTURE is intentionally NOT set. It was previously
+/// used to black out the island window during GDI capture, preventing
+/// self-feedback. However, it introduced a one-frame lag on window transitions
+/// (screenshot tools couldn't capture the island, and every GDI capture had to
+/// toggle the affinity flag). The dark Multiply blend layer already masks any
+/// residual self-capture artifacts, making WDA unnecessary for glass style.
 pub fn get_glass_background(
     screen_x: i32,
     screen_y: i32,

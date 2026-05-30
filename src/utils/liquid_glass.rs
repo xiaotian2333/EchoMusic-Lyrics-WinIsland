@@ -155,6 +155,12 @@ fn render_liquid_glass(
     // calls operate on valid handles obtained within this block. Resources
     // are released in reverse order: SelectObject restore, DeleteObject,
     // DeleteDC, ReleaseDC. GetDC with default HWND retrieves the desktop DC.
+    //
+    // Note: WDA_EXCLUDEFROMCAPTURE is intentionally NOT used here — the
+    // toggle caused a one-frame delay on window transitions (screenshot tools
+    // couldn't capture the island). Liquid glass's refractive effect may
+    // capture the island window itself, but the visual impact is negligible
+    // in practice and the seamless transition experience is preferred.
     unsafe {
         let hdc_screen = GetDC(windows::Win32::Foundation::HWND::default());
         if hdc_screen.is_invalid() {

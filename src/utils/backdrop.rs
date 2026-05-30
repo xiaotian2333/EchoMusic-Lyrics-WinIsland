@@ -168,6 +168,9 @@ fn capture_and_blur_mica(
     // SAFETY: GDI screen capture for mica backdrop. All Win32 API calls
     // operate on valid handles obtained within this block. Resources are
     // released in reverse order. monitor_w/h are verified non-zero by caller.
+    //
+    // Note: WDA_EXCLUDEFROMCAPTURE is intentionally NOT set — see glass.rs
+    // doc comment for rationale. Mica's dark overlay masks any self-capture.
     unsafe {
         let hdc_screen = GetDC(HWND::default());
         if hdc_screen.is_invalid() {

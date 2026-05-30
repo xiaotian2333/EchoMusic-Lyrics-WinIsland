@@ -270,6 +270,7 @@ fn smtc_poll_loop(
     let mut last_manager_refresh = Instant::now();
     let mut current_manager = manager;
     let mut last_regular_update = Instant::now();
+    let mut regular_poll_count = 0u32;
 
     while !cancel.is_cancelled() {
         // Refresh manager every 30 seconds
@@ -378,13 +379,18 @@ fn smtc_poll_loop(
 
         // Regular update — only if last update was > 300ms ago
         if last_regular_update.elapsed() > Duration::from_millis(300) {
+            // Periodically run auto_allow as a safety net: every 10th poll (~3s)
+            // in case COM session-change events were missed (e.g. handler lost
+            // during manager refresh).
+            regular_poll_count += 1;
+            let do_auto_allow = regular_poll_count.is_multiple_of(10);
             update_media_info(
                 &current_manager,
                 &info_tx,
                 &current_lyrics_source,
                 current_lyrics_fallback,
                 &mut current_allowed_apps,
-                false,
+                do_auto_allow,
             );
             last_regular_update = Instant::now();
         }
