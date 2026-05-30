@@ -125,7 +125,8 @@ pub fn extract_plugin(
             || name.starts_with('\\')
             || name.contains(':')
             || name.is_empty()
-            || name.split(['/', '\\']).any(|c| c.is_empty())
+            || name.split(['/', '\\']).any(|c| !c.is_empty() && c == "..")
+            || name.split(['/', '\\']).filter(|c| !c.is_empty()).count() == 0
         {
             return Err(format!("Zip entry '{}' has unsafe path", name));
         }
