@@ -18,8 +18,8 @@ cargo test           # Run tests
 |------|-----------------|
 | [.ai/ARCHITECTURE.md](.ai/ARCHITECTURE.md) | Project structure, module responsibilities, rendering pipeline, plugin system, Windows API usage |
 | [.ai/STYLE-GUIDE.md](.ai/STYLE-GUIDE.md) | Coding conventions, naming, unsafe safety comments, Skia patterns |
-| [.ai/skills/build-winisland/SKILL.md](.ai/skills/build-winisland/SKILL.md) | Build & test automation for AI agents |
-| [.ai/skills/commit-winisland/SKILL.md](.ai/skills/commit-winisland/SKILL.md) | Commit message generation for AI agents |
+| [.agents/skills/build-winisland/SKILL.md](.agents/skills/build-winisland/SKILL.md) | Build & test automation for AI agents |
+| [.agents/skills/commit-winisland/SKILL.md](.agents/skills/commit-winisland/SKILL.md) | Commit message generation for AI agents |
 
 ## Agent behavior rules
 
