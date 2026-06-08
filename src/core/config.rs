@@ -145,7 +145,6 @@ pub struct AppConfig {
     pub motion_blur: bool,
     #[serde(default = "default_island_style")]
     pub island_style: String,
-    pub smtc_enabled: bool,
     pub smtc_apps: Vec<String>,
     #[serde(default = "default_smtc_known_apps")]
     pub smtc_known_apps: Vec<String>,
@@ -320,7 +319,6 @@ impl Default for AppConfig {
             adaptive_border: false,
             motion_blur: true,
             island_style: "default".to_string(),
-            smtc_enabled: true,
             smtc_apps: Vec::new(),
             smtc_known_apps: Vec::new(),
             show_lyrics: true,

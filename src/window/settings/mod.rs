@@ -201,7 +201,6 @@ impl SettingsApp {
             config.auto_start,
             config.auto_hide,
             config.check_for_updates,
-            config.smtc_enabled,
             config.show_lyrics,
             config.lyrics_scroll,
         ]);
@@ -541,22 +540,12 @@ impl SettingsApp {
 
     fn build_music_items(&self) -> Vec<SettingsItem> {
         let show_lyrics = self.config.show_lyrics;
-        let enabled = self.config.smtc_enabled;
+        let enabled = true;
 
         let mut items = vec![
             SettingsItem::PageTitle {
                 text: tr("tab_music"),
             },
-            SettingsItem::SectionHeader {
-                label: tr("section_playback"),
-            },
-            SettingsItem::GroupStart,
-            SettingsItem::RowSwitch {
-                label: tr("smtc_control"),
-                on: self.config.smtc_enabled,
-                enabled: true,
-            },
-            SettingsItem::GroupEnd,
             SettingsItem::SectionHeader {
                 label: tr("section_lyrics"),
             },
@@ -794,14 +783,13 @@ impl SettingsApp {
         self.switch_anim.set_target(7, self.config.auto_hide);
         self.switch_anim
             .set_target(8, self.config.check_for_updates);
-        self.switch_anim.set_target(9, self.config.smtc_enabled);
-        self.switch_anim.set_target(10, self.config.show_lyrics);
+        self.switch_anim.set_target(9, self.config.show_lyrics);
         let fw_on = if self.config.show_lyrics {
             self.config.lyrics_scroll
         } else {
             false
         };
-        self.switch_anim.set_target(11, fw_on);
+        self.switch_anim.set_target(10, fw_on);
     }
 
     fn update_detected_apps(&mut self) {
@@ -1240,7 +1228,7 @@ impl SettingsApp {
                 2 => SwitchAnimator::new_with_anims(&self.switch_anim, &[6, 7, 8]),
                 _ => SwitchAnimator::new(&[]),
             },
-            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10, 11]),
+            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10]),
             _ => SwitchAnimator::new(&[]),
         }
     }

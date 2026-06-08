@@ -485,7 +485,7 @@ impl App {
 
             if view_val < 0.5 {
                 let media = self.smtc.get_info();
-                let music_on = self.config.smtc_enabled && !media.title.is_empty();
+                let music_on = !media.title.is_empty();
 
                 let (bx, by, bw, bh) = get_pause_btn_rect(
                     offset_x as f32,
@@ -596,7 +596,7 @@ impl App {
             }
         } else {
             let media = self.smtc.get_info();
-            let music_on = self.config.smtc_enabled && !media.title.is_empty();
+            let music_on = !media.title.is_empty();
 
             if music_on && !media.is_playing && self.config.mini_controls {
                 let w = self.spring_w.value;
@@ -1063,11 +1063,7 @@ impl ApplicationHandler for App {
                             - self.config.base_height * self.config.global_scale)
                             .abs();
                         let progress = (dist_h / total_h).clamp(0.0, 1.0);
-                        let mut media_info = if self.config.smtc_enabled {
-                            self.smtc.get_info()
-                        } else {
-                            crate::core::smtc::MediaInfo::default()
-                        };
+                        let mut media_info = self.smtc.get_info();
                         if self.seeking_progress && self.seeking_duration_ms > 0 {
                             media_info.position_ms = self.seeking_preview_ms;
                             media_info.last_update = Instant::now();
@@ -1085,7 +1081,7 @@ impl ApplicationHandler for App {
                             media_info.spectrum = [0.0; 6];
                         }
                         let mut music_active = false;
-                        if self.config.smtc_enabled && !media_info.title.is_empty() {
+                        if !media_info.title.is_empty() {
                             music_active = true;
                         }
 
@@ -1240,7 +1236,7 @@ impl ApplicationHandler for App {
 
         let mut music_active = false;
         let media = self.smtc.get_info();
-        if self.config.smtc_enabled && !media.title.is_empty() {
+        if !media.title.is_empty() {
             self.last_media_playing = media.is_playing;
             music_active = true;
             if media.title != self.last_media_title {

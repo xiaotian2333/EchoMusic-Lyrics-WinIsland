@@ -536,7 +536,6 @@ impl SettingsApp {
                     self.config.auto_start,
                     self.config.auto_hide,
                     self.config.check_for_updates,
-                    self.config.smtc_enabled,
                     self.config.show_lyrics,
                     self.config.lyrics_scroll,
                 ]);
@@ -576,9 +575,6 @@ impl SettingsApp {
                     .nth(idx);
                 if let Some(label) = label {
                     match label.as_str() {
-                        l if l == tr("smtc_control") => {
-                            self.config.smtc_enabled = !self.config.smtc_enabled
-                        }
                         l if l == tr("show_lyrics") => {
                             self.config.show_lyrics = !self.config.show_lyrics
                         }
@@ -680,9 +676,7 @@ impl SettingsApp {
                     }
                 }
             }
-            ClickResult::AppItem(idx)
-                if self.config.smtc_enabled && !self.detected_apps.is_empty() =>
-            {
+            ClickResult::AppItem(idx) if !self.detected_apps.is_empty() => {
                 let app_start = items
                     .iter()
                     .position(|i| matches!(i, SettingsItem::RowAppItem { .. }))
