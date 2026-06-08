@@ -4,9 +4,6 @@ use crate::core::lyrics::{current_lyric_index, filtered_lyric_text};
 use crate::core::persistence::load_config;
 use crate::core::render::{draw_island, get_mini_control_rects};
 use crate::core::smtc::SmtcListener;
-use crate::plugin::PluginManager;
-use crate::plugin::zip_loader;
-use crate::plugin::zip_loader::PluginManifest;
 use crate::ui::expanded::music_view::{
     get_next_btn_rect, get_pause_btn_rect, get_prev_btn_rect, get_progress_bar_rect,
     set_progress_dragging, set_progress_hover, trigger_cover_flip, trigger_next_click,
@@ -25,10 +22,7 @@ use crate::utils::physics::Spring;
 use crate::window::tray::{TrayAction, TrayManager};
 use regex::Regex;
 use softbuffer::{Context, Surface};
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
@@ -43,8 +37,6 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowButtons, WindowId, WindowLevel};
-
-type InstallResult = Result<(PluginManifest, PathBuf, Vec<String>), String>;
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -97,8 +89,6 @@ pub struct App {
     is_cursor_suppressed: bool,
     touch_id: Option<u64>,
     touch_pos: PhysicalPosition<f64>,
-    plugin_mgr: PluginManager,
-    pending_install: Option<mpsc::Receiver<InstallResult>>,
 }
 
 impl Default for App {
@@ -155,8 +145,6 @@ impl Default for App {
             is_cursor_suppressed: false,
             touch_id: None,
             touch_pos: PhysicalPosition::new(0.0, 0.0),
-            plugin_mgr: PluginManager::default(),
-            pending_install: None,
         }
     }
 }
@@ -173,55 +161,12 @@ struct IslandLayout {
 
 impl App {
     fn set_aumid() {
-        let aumid = "WinIsland.PluginManager";
+        let aumid = "WinIsland";
         let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: SetCurrentProcessExplicitAppUserModelID sets a process-wide string identifier.
         // The wide string is valid and null-terminated. Called once during init before any windows.
         unsafe {
             let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR::from_raw(wide.as_ptr()));
-        }
-    }
-
-    fn show_toast(title: &str, message: &str) {
-        use windows::UI::Notifications::{
-            ToastNotification, ToastNotificationManager, ToastTemplateType,
-        };
-        use windows::core::HSTRING;
-        Self::set_aumid();
-        let tmpl =
-            match ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastText02) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("Toast template failed: {:?}", e);
-                    return;
-                }
-            };
-        if let Ok(nodes) = tmpl.SelectNodes(&HSTRING::from("//text")) {
-            if let Ok(node) = nodes.Item(0) {
-                let _ = node.SetInnerText(&HSTRING::from(title));
-            }
-            if let Ok(node) = nodes.Item(1) {
-                let _ = node.SetInnerText(&HSTRING::from(message));
-            }
-        }
-        let toast = match ToastNotification::CreateToastNotification(&tmpl) {
-            Ok(t) => t,
-            Err(e) => {
-                log::error!("CreateToastNotification failed: {:?}", e);
-                return;
-            }
-        };
-        let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
-            "WinIsland.PluginManager",
-        )) {
-            Ok(n) => n,
-            Err(e) => {
-                log::error!("CreateToastNotifier failed: {:?}", e);
-                return;
-            }
-        };
-        if let Err(e) = notifier.Show(&toast) {
-            log::error!("Toast Show failed: {:?}", e);
         }
     }
 
@@ -263,25 +208,6 @@ impl App {
         } else {
             Some(lyrics[idx].text.clone())
         }
-    }
-
-    fn install_zip_drop(&mut self, path: &Path) {
-        if self.pending_install.is_some() {
-            Self::show_toast("Plugin Info", "Another installation is already in progress");
-            return;
-        }
-
-        let plugin_dir = self.plugin_mgr.plugin_dir().to_path_buf();
-        let zip_path = path.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-
-        std::thread::spawn(move || {
-            let result = zip_loader::extract_plugin(&zip_path, &plugin_dir);
-            let _ = tx.send(result);
-        });
-
-        self.pending_install = Some(rx);
-        log::info!("Plugin extraction started in background thread");
     }
 
     fn get_target_monitor(
@@ -900,7 +826,6 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(ControlFlow::Poll);
         if self.window.is_none() {
             Self::set_aumid();
-            self.plugin_mgr.load_all();
             let max_w = self.config.expanded_width.max(450.0);
             self.os_w = (max_w * self.config.global_scale + PADDING) as u32;
             self.os_h = (self.config.expanded_height * self.config.global_scale + PADDING) as u32;
@@ -1001,13 +926,6 @@ impl ApplicationHandler for App {
                     win.set_maximized(false);
                 }
                 WindowEvent::CloseRequested => (),
-                WindowEvent::DroppedFile(path)
-                    if path
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("zip")) =>
-                {
-                    self.install_zip_drop(&path);
-                }
                 WindowEvent::HoveredFile(_) => (),
                 WindowEvent::HoveredFileCancelled => (),
                 WindowEvent::MouseInput {
@@ -1153,32 +1071,6 @@ impl ApplicationHandler for App {
         let frame_start = Instant::now();
         self.handle_tray_events(&window, event_loop);
         self.reload_config_if_changed(&window);
-
-        if let Some(rx) = self.pending_install.take() {
-            match rx.try_recv() {
-                Ok(Ok((manifest, _dest, dll_paths))) => {
-                    for dll in &dll_paths {
-                        self.plugin_mgr.load_dll(Path::new(dll));
-                    }
-                    Self::show_toast(
-                        "Plugin Installed",
-                        &format!("{} loaded successfully!", manifest.name),
-                    );
-                    log::info!("Plugin '{}' installed via drop", manifest.name);
-                }
-                Ok(Err(e)) => {
-                    Self::show_toast("Plugin Error", &e);
-                    log::error!("Failed to install plugin from drop: {}", e);
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.pending_install = Some(rx);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Self::show_toast("Plugin Error", "Installation thread crashed");
-                    log::error!("Plugin installation thread disconnected unexpectedly");
-                }
-            }
-        }
 
         let dt = (self.last_frame_time.elapsed().as_secs_f32() * 60.0).clamp(0.1, 3.0);
         self.last_frame_time = Instant::now();

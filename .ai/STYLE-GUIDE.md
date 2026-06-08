@@ -16,13 +16,13 @@ All code, comments, and commit messages are in **English** unless the project co
 
 | Category | Convention | Example |
 |----------|-----------|---------|
-| Types/structs/enums | PascalCase | `NativePlugin`, `PluginError` |
+| Types/structs/enums | PascalCase | `AudioProcessor`, `TrayManager` |
 | Functions/methods | snake_case | `get_liquid_glass_background` |
 | Variables | snake_case | `screen_x`, `cached_img` |
 | Constants/statics | SCREAMING_SNAKE_CASE | `SKSL_SOURCE`, `MAX_FILENAME_COMPONENT` |
 | Type aliases | PascalCase | `BgCacheEntry` |
 | Thread-locals | SCREAMING_SNAKE_CASE | `GLASS_CACHE`, `EFFECT_CACHE` |
-| Module/file names | snake_case | `liquid_glass.rs`, `zip_loader.rs` |
+| Module/file names | snake_case | `liquid_glass.rs`, `music_view.rs` |
 
 ## Module responsibility
 
@@ -88,5 +88,5 @@ Group imports in this order, separated by blank lines:
 
 - Thread-local storage (`thread_local!`) for caches that don't cross thread boundaries
 - `AtomicUsize` / `AtomicBool` for simple cross-thread state
-- `RwLock` for read-heavy shared state (e.g., `PluginManager`)
+- `RwLock` for read-heavy shared state
 - `Arc<RwLock<>>` for long-lived shared state (e.g., `I18n` singleton)

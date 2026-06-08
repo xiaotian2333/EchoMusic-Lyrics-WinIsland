@@ -8,7 +8,6 @@ WinIsland is a Windows desktop application that creates a Dynamic Island overlay
 - **Rendering**: skia-safe (Skia canvas API)
 - **Media integration**: Windows SMTC (System Media Transport Controls) via COM
 - **Audio visualization**: cpal (loopback capture) + realfft (6-band spectrum)
-- **Plugin system**: Native C ABI DLLs loaded via libloading
 - **Language**: English & Chinese (i18n via custom .lang files)
 
 ---
@@ -26,11 +25,6 @@ src/
 │   ├── render.rs      Main draw_island() — all Skia rendering lives here
 │   └── smtc.rs        SMTC session manager — polls media info, handles commands
 ├── icons/             Custom Skia path icons (arrows, controls, music, settings)
-├── plugin/            Native plugin system
-│   ├── loader.rs      NativePlugin — wraps DLL via libloading, C ABI vtable
-│   ├── manager.rs     PluginManager — RwLock registry, discover/install/unload
-│   ├── types.rs       Host-side Rust types mirroring C ABI structs
-│   └── zip_loader.rs  Plugin package extraction + manifest validation
 ├── ui/expanded/       Expanded island views
 │   ├── music_view.rs  Music player page (album art, controls, progress)
 │   └── widget_view.rs Widget/page view for additional content
@@ -70,12 +64,11 @@ about_to_wait() [every frame ~144 FPS]:
   1. Enforce topmost position
   2. Handle tray events
   3. Check config changes (every 30 frames)
-  4. Process pending plugin installs
-  5. Update cursor hit-test & auto-hide state
-  6. Update seeking, borders, lyrics transitions
-  7. Compute spring targets, update all springs
-  8. Request redraw if animating
-  9. Sleep to maintain 144 FPS (~6944 µs)
+  4. Update cursor hit-test & auto-hide state
+  5. Update seeking, borders, lyrics transitions
+  6. Compute spring targets, update all springs
+  7. Request redraw if animating
+  8. Sleep to maintain 144 FPS (~6944 µs)
 
 RedrawRequested → draw_island():
   1. Compute dt, motion blur sigmas
@@ -108,32 +101,6 @@ Each style draws its background differently:
 - Auto-allow list: known music apps are automatically registered
 - Handles seek/play/pause/skip commands from the UI
 - Periodically refreshes (every 30th poll ~9s) to catch new apps
-
----
-
-## Plugin system
-
-Plugins are native DLLs loaded via `libloading` with a C ABI interface:
-
-```
-DLL exports: plugin_get_instance() -> PluginInstanceC
-
-PluginInstanceC:
-  metadata: PluginMetadataC (id, name, version, author, description)
-  plugin_type: u32 (Content=0, Theme=1, Shortcut=2)
-  handle: *mut c_void (plugin's self pointer)
-  vtable: *const PluginVTable
-
-PluginVTable (required):
-  on_load(handle) -> PluginResultC
-  on_unload(handle) -> PluginResultC
-  destroy(handle)
-  [+ optional: get_content, on_click, on_expanded, supports_expand,
-              get_colors, get_animations, get_shortcuts_count,
-              get_shortcut_at, execute_shortcut]
-```
-
-Plugin packages are `.zip` files with a manifest (YAML), optional signature, and the compiled DLL.
 
 ---
 

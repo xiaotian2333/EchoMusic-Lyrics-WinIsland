@@ -39,9 +39,7 @@ Match the scope to the module or subsystem affected:
 | `render` | `src/core/render.rs` — rendering |
 | `glass` | `src/utils/glass.rs` — glass effect |
 | `liquid-glass` | `src/utils/liquid_glass.rs` — liquid glass effect |
-| `plugin` | `src/plugin/` or `crates/winisland-plugin-api/` |
 | `settings` | `src/window/settings/` or settings UI |
-| `packager` | `crates/winisland-plugin-api/src/packager/` |
 | `window` | `src/window/` — window management |
 | (none) | Use no scope for cross-cutting changes |
 
@@ -50,9 +48,9 @@ Match the scope to the module or subsystem affected:
 ```
 feat(lyrics): prevent unrelated lyrics for browser video sessions and add local lyrics
 fix: filter empty path in RowFolderPicker clear_label and current_path
-refactor: restructure rendering pipeline, optimize code quality, fix plugin security issues
+refactor: restructure rendering pipeline and optimize code quality
 perf(liquid_glass): capture background once, cache by position, reduce shader brightness
-style: fix fmt formatting in packager mod.rs
+style: fix fmt formatting in window module
 ```
 
 ## Procedure
