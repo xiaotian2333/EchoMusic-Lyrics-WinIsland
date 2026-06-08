@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-pub const APP_VERSION: &str = "1.0.0";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_AUTHOR: &str = "xiaotian2333";
 pub const APP_HOMEPAGE: &str = "https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland";
 pub const WINDOW_TITLE: &str = "EchoMusic-Lyrics-WinIsland";

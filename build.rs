@@ -12,9 +12,14 @@ fn main() {
             );
         }
 
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.0".to_string());
         res.set("CompanyName", "xiaotian2333");
         res.set("FileDescription", "EchoMusic-Lyrics-WinIsland");
         res.set("ProductName", "EchoMusic-Lyrics-WinIsland");
+        res.set("FileVersion", &version);
+        res.set("ProductVersion", &version);
+        res.set("OriginalFilename", "EchoMusic-Lyrics-WinIsland.exe");
+        res.set("InternalName", "EchoMusic-Lyrics-WinIsland");
         res.set("LegalCopyright", "Copyright (c) xiaotian2333");
 
         let manifest = r#"

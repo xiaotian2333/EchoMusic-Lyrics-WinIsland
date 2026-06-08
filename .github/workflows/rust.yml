@@ -2,59 +2,130 @@ name: Rust Build
 
 on:
   push:
-    branches: [ "master", "main" ]
-    paths-ignore:
-      - 'Docs/**/*.md'
-      - '*.md'
-      - '.github/**'
-      - '.ai/**'
-      - '.agents/**'
-      - 'AGENTS.md'
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag, for example v1.0.1'
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  BUILD_TARGET: x86_64-pc-windows-msvc
+  BUILD_ARCH: AMD64
 
 jobs:
   build-rust:
-    if: ${{ !contains(github.event.head_commit.message, '[ci-skip]') && !contains(github.event.head_commit.message, '[docs]') }}
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Resolve release metadata
+      id: meta
+      shell: pwsh
+      run: |
+        $tag = ""
+        if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.tag_name }}" -ne "") {
+          $tag = "${{ inputs.tag_name }}"
+        } elseif ("${{ github.ref_type }}" -eq "tag") {
+          $tag = "${{ github.ref_name }}"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($tag)) {
+          throw "手动触发发布时需要填写 tag_name，或在 v* tag 上运行。"
+        }
+        if ($tag -notlike "v*") {
+          throw "Release tag 必须以 v 开头，当前为 $tag。"
+        }
+
+        git fetch --tags --force
+        git rev-parse "$tag" | Out-Null
+        git checkout "$tag"
+
+        $cargoVersion = $null
+        foreach ($line in Get-Content Cargo.toml) {
+          if ($line -match '^version\s*=\s*"(.+)"') {
+            $cargoVersion = $Matches[1]
+            break
+          }
+        }
+        if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
+          throw "无法从 Cargo.toml 读取 package.version。"
+        }
+
+        $expectedTag = "v$cargoVersion"
+        if ($tag -ne $expectedTag) {
+          throw "Release tag $tag 与 Cargo.toml 版本 $expectedTag 不一致。"
+        }
+
+        "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "cargo_version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ env.BUILD_TARGET }}
+
     - name: Rust Cache
       uses: swatinem/rust-cache@v2
+
     - name: Install dependencies
       run: |
         choco install ninja
+
     - name: Build Release
-      run: cargo build --release --verbose
-    - name: Generate Version Info
+      run: cargo build --release --verbose --target ${{ env.BUILD_TARGET }}
+
+    - name: Rename release asset
+      shell: pwsh
       run: |
-        $date = (Get-Date).ToUniversalTime().AddHours(8).ToString("yyyy-MM-dd HH:mm:ss")
-        $json = @{ timestamp = $date } | ConvertTo-Json
-        $json | Out-File -FilePath target/release/version_info.json -Encoding utf8
-    - name: Delete Old Nightly Release
+        $source = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland.exe"
+        $target = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}.exe"
+        Copy-Item $source $target -Force
+
+    - name: Generate release notes
+      shell: pwsh
       run: |
-        gh release delete nightly --yes --cleanup-tag
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      continue-on-error: true
-    - name: Upload Nightly Release
+        $tag = "${{ steps.meta.outputs.tag_name }}"
+        $previousTag = $null
+        $previousTagOutput = git describe --tags --match "v*" --abbrev=0 "$tag^" 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($previousTagOutput)) {
+          $previousTag = $previousTagOutput.Trim()
+        }
+
+        "## Changes" | Out-File -FilePath release_notes.md -Encoding utf8
+        "" | Out-File -FilePath release_notes.md -Append -Encoding utf8
+
+        if ($previousTag) {
+          $range = "$previousTag..$tag"
+        } else {
+          $range = $tag
+        }
+
+        $notes = git log $range --no-merges --pretty=format:"- %s"
+        if ([string]::IsNullOrWhiteSpace($notes)) {
+          "- 无提交记录" | Out-File -FilePath release_notes.md -Append -Encoding utf8
+        } else {
+          $notes | Out-File -FilePath release_notes.md -Append -Encoding utf8
+        }
+
+    - name: Upload GitHub Release
       uses: softprops/action-gh-release@v2
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       with:
-        tag_name: nightly
-        name: Nightly Build
+        tag_name: ${{ steps.meta.outputs.tag_name }}
+        name: ${{ steps.meta.outputs.tag_name }}
         draft: false
-        prerelease: true
-        files: |
-          target/release/EchoMusic-Lyrics-WinIsland.exe
-          target/release/version_info.json
+        prerelease: false
         make_latest: true
+        body_path: release_notes.md
+        files: |
+          target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
