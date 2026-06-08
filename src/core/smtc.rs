@@ -223,6 +223,8 @@ fn smtc_poll_loop(
         current_allowed_apps = apps;
     }
 
+    let mut pending_seek: Option<(u64, Instant, Duration)> = None;
+
     // Initial update with retries for SMTC timeline readiness.
     // Some music apps (Spotify, Netease) take 1-2s to populate
     // TimelineProperties after session creation, so we retry up
@@ -233,6 +235,7 @@ fn smtc_poll_loop(
             &info_tx,
             &lyrics_ws_handle,
             &mut current_allowed_apps,
+            &mut pending_seek,
             true,
         );
         let info = info_tx.borrow();
@@ -294,11 +297,11 @@ fn smtc_poll_loop(
         {
             let ticks = seek_pos as i64 * 10_000;
             let _ = session.TryChangePlaybackPositionAsync(ticks);
+            pending_seek = Some((seek_pos, Instant::now(), Duration::from_secs(5)));
             let mut info = info_tx.borrow().clone();
             info.position_ms = seek_pos;
             info.last_update = Instant::now();
-            // Do not update last_smtc_pos here: SMTC timeline can lag after seek, and treating
-            // seek_pos as authoritative would make the next poll think SMTC changed and sync back.
+            info.last_smtc_pos = seek_pos;
             let _ = info_tx.send(info);
         }
 
@@ -334,6 +337,7 @@ fn smtc_poll_loop(
                 &info_tx,
                 &lyrics_ws_handle,
                 &mut current_allowed_apps,
+                &mut pending_seek,
                 true,
             );
             last_regular_update = Instant::now();
@@ -351,6 +355,7 @@ fn smtc_poll_loop(
                 &info_tx,
                 &lyrics_ws_handle,
                 &mut current_allowed_apps,
+                &mut pending_seek,
                 do_auto_allow,
             );
             last_regular_update = Instant::now();
@@ -365,6 +370,7 @@ fn update_media_info(
     info_tx: &watch::Sender<MediaInfo>,
     lyrics_ws_handle: &LyricsWsHandle,
     allowed_apps: &mut Vec<String>,
+    pending_seek: &mut Option<(u64, Instant, Duration)>,
     auto_allow: bool,
 ) {
     if auto_allow {
@@ -372,8 +378,9 @@ fn update_media_info(
     }
 
     if let Some(session) = get_target_session(manager, allowed_apps) {
-        let _ = fetch_properties(&session, info_tx, lyrics_ws_handle);
+        let _ = fetch_properties(&session, info_tx, lyrics_ws_handle, pending_seek);
     } else {
+        *pending_seek = None;
         let info = info_tx.borrow();
         if !info.title.is_empty() {
             drop(info);
@@ -572,6 +579,7 @@ fn fetch_properties(
     session: &GlobalSystemMediaTransportControlsSession,
     info_tx: &watch::Sender<MediaInfo>,
     lyrics_ws_handle: &LyricsWsHandle,
+    pending_seek: &mut Option<(u64, Instant, Duration)>,
 ) -> windows::core::Result<()> {
     if !is_music_session(session) {
         let info = info_tx.borrow();
@@ -634,6 +642,7 @@ fn fetch_properties(
         let song_changed =
             info.title != new_title || info.artist != new_artist || info.album != new_album;
         if song_changed {
+            *pending_seek = Some((0, Instant::now(), Duration::from_secs(7)));
             info.title = new_title.clone();
             info.artist = new_artist.clone();
             info.album = new_album.clone();
@@ -642,9 +651,7 @@ fn fetch_properties(
             info.lyrics = None;
             info.thumbnail = None;
             info.thumbnail_hash = 0;
-            if smtc_pos > 0 {
-                info.position_ms = smtc_pos;
-            }
+            info.position_ms = 0;
             info.last_smtc_pos = smtc_pos;
             info.last_update = Instant::now();
             info.last_thumbnail_fetch = Instant::now();
@@ -668,11 +675,30 @@ fn fetch_properties(
 
         let smtc_changed = smtc_pos != info.last_smtc_pos;
         let diff_with_extrapolated = (smtc_pos as i64 - current_extrapolated as i64).abs();
+        let suppress_smtc_sync =
+            if let Some((target_pos, started_at, protect_duration)) = *pending_seek {
+                let diff_with_target = (smtc_pos as i64 - target_pos as i64).abs();
+                if target_pos == 0 && smtc_pos <= 1000 {
+                    *pending_seek = None;
+                    false
+                } else if target_pos > 0 && diff_with_target <= 2000 {
+                    *pending_seek = None;
+                    false
+                } else if started_at.elapsed() <= protect_duration {
+                    true
+                } else {
+                    *pending_seek = None;
+                    false
+                }
+            } else {
+                false
+            };
 
-        let should_sync = song_changed
-            || (info.is_playing != is_playing)
-            || (smtc_pos > 0 && info.position_ms == 0)
-            || (smtc_changed && (diff_with_extrapolated > 2000 || !is_playing));
+        let should_sync = !song_changed
+            && !suppress_smtc_sync
+            && ((info.is_playing != is_playing)
+                || (smtc_pos > 0 && info.position_ms == 0)
+                || (smtc_changed && (diff_with_extrapolated > 2000 || !is_playing)));
 
         if should_sync {
             if smtc_pos > 0 || !song_changed {
