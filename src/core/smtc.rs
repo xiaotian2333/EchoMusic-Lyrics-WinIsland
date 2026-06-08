@@ -11,6 +11,8 @@ use windows::Media::Control::{
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
+const POSITION_SYNC_THRESHOLD_MS: i64 = 500;
+
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
     pub title: String,
@@ -698,7 +700,8 @@ fn fetch_properties(
             && !suppress_smtc_sync
             && ((info.is_playing != is_playing)
                 || (smtc_pos > 0 && info.position_ms == 0)
-                || (smtc_changed && (diff_with_extrapolated > 2000 || !is_playing)));
+                || (smtc_changed
+                    && (diff_with_extrapolated > POSITION_SYNC_THRESHOLD_MS || !is_playing)));
 
         if should_sync {
             if smtc_pos > 0 || !song_changed {
