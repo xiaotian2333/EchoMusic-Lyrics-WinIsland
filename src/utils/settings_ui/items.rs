@@ -69,11 +69,6 @@ pub enum SettingsItem {
         invalid: bool,
         focused: bool,
     },
-    RowAppItem {
-        label: String,
-        active: bool,
-        enabled: bool,
-    },
     RowLabel {
         label: String,
     },
@@ -124,7 +119,6 @@ impl SettingsItem {
                 | SettingsItem::RowFolderPicker { .. }
                 | SettingsItem::RowSourceSelect { .. }
                 | SettingsItem::RowTextInput { .. }
-                | SettingsItem::RowAppItem { .. }
                 | SettingsItem::RowLabel { .. }
         )
     }

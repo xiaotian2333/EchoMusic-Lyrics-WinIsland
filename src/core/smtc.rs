@@ -1,6 +1,5 @@
 use crate::core::lyrics::{LyricLine, TrackLyrics, current_lyric_index};
 use crate::core::lyrics_ws::{LyricsWsEvent, LyricsWsHandle, start_lyrics_ws_server};
-use crate::core::persistence::{load_config, save_config};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -10,6 +9,8 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+
+pub const TARGET_MEDIA_APP_ID: &str = "com.hoowhoami.echomusic";
 
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
@@ -90,22 +91,18 @@ pub struct SmtcListener {
     info_rx: watch::Receiver<MediaInfo>,
     seek_tx: mpsc::UnboundedSender<u64>,
     playback_tx: mpsc::UnboundedSender<PlaybackCommand>,
-    allowed_apps_tx: mpsc::UnboundedSender<Vec<String>>,
     lyrics_ws_handle: LyricsWsHandle,
     cancel_token: CancellationToken,
 }
 
 impl SmtcListener {
-    pub fn new(allowed: Vec<String>) -> Self {
+    pub fn new() -> Self {
         let (info_tx, info_rx) = watch::channel(MediaInfo::default());
         let (seek_tx, seek_rx) = mpsc::unbounded_channel();
         let (playback_tx, playback_rx) = mpsc::unbounded_channel();
-        let (allowed_apps_tx, allowed_apps_rx) = mpsc::unbounded_channel();
         let (lyrics_event_tx, lyrics_event_rx) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
         let lyrics_ws_handle = start_lyrics_ws_server(lyrics_event_tx, cancel_token.clone());
-
-        let _ = allowed_apps_tx.send(allowed);
 
         let cancel = cancel_token.clone();
         let poll_lyrics_ws_handle = lyrics_ws_handle.clone();
@@ -114,7 +111,6 @@ impl SmtcListener {
                 info_tx,
                 seek_rx,
                 playback_rx,
-                allowed_apps_rx,
                 lyrics_event_rx,
                 poll_lyrics_ws_handle,
                 cancel,
@@ -125,14 +121,9 @@ impl SmtcListener {
             info_rx,
             seek_tx,
             playback_tx,
-            allowed_apps_tx,
             lyrics_ws_handle,
             cancel_token,
         }
-    }
-
-    pub fn set_allowed_apps(&self, apps: Vec<String>) {
-        let _ = self.allowed_apps_tx.send(apps);
     }
 
     pub fn get_info(&self) -> MediaInfo {
@@ -168,7 +159,6 @@ fn smtc_poll_loop(
     info_tx: watch::Sender<MediaInfo>,
     mut seek_rx: mpsc::UnboundedReceiver<u64>,
     mut playback_rx: mpsc::UnboundedReceiver<PlaybackCommand>,
-    mut allowed_apps_rx: mpsc::UnboundedReceiver<Vec<String>>,
     mut lyrics_event_rx: mpsc::UnboundedReceiver<LyricsWsEvent>,
     lyrics_ws_handle: LyricsWsHandle,
     cancel: CancellationToken,
@@ -206,14 +196,6 @@ fn smtc_poll_loop(
     );
     let _ = manager.SessionsChanged(&handler);
 
-    // Local state mirrored from channels
-    let mut current_allowed_apps: Vec<String> = Vec::new();
-
-    // Drain initial config values from channels
-    while let Ok(apps) = allowed_apps_rx.try_recv() {
-        current_allowed_apps = apps;
-    }
-
     let mut pending_seek: Option<(u64, Instant, Duration)> = None;
 
     // Initial update with retries for SMTC timeline readiness.
@@ -221,14 +203,7 @@ fn smtc_poll_loop(
     // TimelineProperties after session creation, so we retry up
     // to 2 seconds (10 × 200ms).
     for attempt in 0..10 {
-        update_media_info(
-            &manager,
-            &info_tx,
-            &lyrics_ws_handle,
-            &mut current_allowed_apps,
-            &mut pending_seek,
-            true,
-        );
+        update_media_info(&manager, &info_tx, &lyrics_ws_handle, &mut pending_seek);
         let info = info_tx.borrow();
         let timeline_ready = info.duration_ms > 0
             || info.position_ms > 0
@@ -247,7 +222,6 @@ fn smtc_poll_loop(
     let mut last_manager_refresh = Instant::now();
     let mut current_manager = manager;
     let mut last_regular_update = Instant::now();
-    let mut regular_poll_count = 0u32;
 
     while !cancel.is_cancelled() {
         // Refresh manager every 30 seconds
@@ -273,18 +247,13 @@ fn smtc_poll_loop(
             }
         }
 
-        // Drain config channels
-        while let Ok(apps) = allowed_apps_rx.try_recv() {
-            current_allowed_apps = apps;
-        }
-
         // Handle seek request (keep only the latest)
         let mut seek_pos = None;
         while let Ok(v) = seek_rx.try_recv() {
             seek_pos = Some(v);
         }
         if let Some(seek_pos) = seek_pos
-            && let Some(session) = get_target_session(&current_manager, &current_allowed_apps)
+            && let Some(session) = get_target_session(&current_manager)
         {
             let ticks = seek_pos as i64 * 10_000;
             let _ = session.TryChangePlaybackPositionAsync(ticks);
@@ -298,7 +267,7 @@ fn smtc_poll_loop(
 
         // Handle playback commands
         while let Ok(cmd) = playback_rx.try_recv() {
-            if let Some(session) = get_target_session(&current_manager, &current_allowed_apps) {
+            if let Some(session) = get_target_session(&current_manager) {
                 match cmd {
                     PlaybackCommand::Toggle => {
                         if let Ok(pb_info) = session.GetPlaybackInfo()
@@ -327,27 +296,18 @@ fn smtc_poll_loop(
                 &current_manager,
                 &info_tx,
                 &lyrics_ws_handle,
-                &mut current_allowed_apps,
                 &mut pending_seek,
-                true,
             );
             last_regular_update = Instant::now();
         }
 
         // Regular update — only if last update was > 300ms ago
         if last_regular_update.elapsed() > Duration::from_millis(300) {
-            // Periodically run auto_allow as a safety net: every 10th poll (~3s)
-            // in case COM session-change events were missed (e.g. handler lost
-            // during manager refresh).
-            regular_poll_count += 1;
-            let do_auto_allow = regular_poll_count.is_multiple_of(10);
             update_media_info(
                 &current_manager,
                 &info_tx,
                 &lyrics_ws_handle,
-                &mut current_allowed_apps,
                 &mut pending_seek,
-                do_auto_allow,
             );
             last_regular_update = Instant::now();
         }
@@ -360,15 +320,9 @@ fn update_media_info(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     info_tx: &watch::Sender<MediaInfo>,
     lyrics_ws_handle: &LyricsWsHandle,
-    allowed_apps: &mut Vec<String>,
     pending_seek: &mut Option<(u64, Instant, Duration)>,
-    auto_allow: bool,
 ) {
-    if auto_allow {
-        *allowed_apps = auto_allow_new_apps(manager, allowed_apps);
-    }
-
-    if let Some(session) = get_target_session(manager, allowed_apps) {
+    if let Some(session) = get_target_session(manager) {
         let _ = fetch_properties(&session, info_tx, lyrics_ws_handle, pending_seek);
     } else {
         *pending_seek = None;
@@ -447,79 +401,23 @@ fn apply_track_lyrics(info_tx: &watch::Sender<MediaInfo>, track_lyrics: TrackLyr
     let _ = info_tx.send(new_info);
 }
 
-fn auto_allow_new_apps(
-    mgr: &GlobalSystemMediaTransportControlsSessionManager,
-    allowed: &[String],
-) -> Vec<String> {
-    let mut new_allowed = allowed.to_vec();
-    let mut new_app_ids: Vec<String> = Vec::new();
-    if let Ok(sessions) = mgr.GetSessions()
-        && let Ok(count) = sessions.Size()
-    {
-        for i in 0..count {
-            if let Ok(session) = sessions.GetAt(i)
-                && let Ok(pb_info) = session.GetPlaybackInfo()
-                && let Ok(playback_type) = pb_info.PlaybackType()
-                && let Ok(value) = playback_type.Value()
-                && value == windows::Media::MediaPlaybackType::Music
-                && let Ok(id) = session.SourceAppUserModelId()
-            {
-                let app_id = id.to_string();
-                if !new_app_ids.contains(&app_id) {
-                    new_app_ids.push(app_id);
-                }
-            }
-        }
-    }
-
-    if new_app_ids.is_empty() {
-        return new_allowed;
-    }
-
-    let mut config = load_config();
-    let mut changed = false;
-
-    for app_id in &new_app_ids {
-        if !config.smtc_known_apps.contains(app_id) {
-            let is_first_run = config.smtc_known_apps.is_empty();
-            config.smtc_known_apps.push(app_id.clone());
-
-            if is_first_run && !config.smtc_apps.contains(app_id) {
-                config.smtc_apps.push(app_id.clone());
-                if !new_allowed.contains(app_id) {
-                    new_allowed.push(app_id.clone());
-                }
-            }
-            changed = true;
-        }
-    }
-
-    if changed {
-        save_config(&config);
-    }
-
-    new_allowed
+fn is_target_app_session(session: &GlobalSystemMediaTransportControlsSession) -> bool {
+    session
+        .SourceAppUserModelId()
+        .map(|id| id == TARGET_MEDIA_APP_ID)
+        .unwrap_or(false)
 }
 
 fn get_target_session(
     mgr: &GlobalSystemMediaTransportControlsSessionManager,
-    allowed: &[String],
 ) -> Option<GlobalSystemMediaTransportControlsSession> {
-    if allowed.is_empty() {
-        return None;
-    }
     let mut audio_session = None;
     if let Ok(sessions) = mgr.GetSessions()
         && let Ok(count) = sessions.Size()
     {
         for i in 0..count {
             if let Ok(session) = sessions.GetAt(i) {
-                if let Ok(id) = session.SourceAppUserModelId() {
-                    let app_id = id.to_string();
-                    if !allowed.iter().any(|a| a == &app_id) {
-                        continue;
-                    }
-                } else {
+                if !is_target_app_session(&session) {
                     continue;
                 }
                 if !is_music_session(&session) {
@@ -539,18 +437,11 @@ fn get_target_session(
     if let Some(session) = audio_session {
         return Some(session);
     }
-    if let Ok(session) = mgr.GetCurrentSession() {
-        if let Ok(id) = session.SourceAppUserModelId() {
-            let app_id = id.to_string();
-            if !allowed.iter().any(|a| a == &app_id) {
-                return None;
-            }
-        } else {
-            return None;
-        }
-        if is_music_session(&session) {
-            return Some(session);
-        }
+    if let Ok(session) = mgr.GetCurrentSession()
+        && is_target_app_session(&session)
+        && is_music_session(&session)
+    {
+        return Some(session);
     }
     None
 }

@@ -682,25 +682,6 @@ impl SettingsApp {
                     }
                 }
             }
-            ClickResult::AppItem(idx) if !self.detected_apps.is_empty() => {
-                let app_start = items
-                    .iter()
-                    .position(|i| matches!(i, SettingsItem::RowAppItem { .. }))
-                    .unwrap_or(items.len());
-                let app_idx = idx - app_start;
-                if app_idx < self.detected_apps.len() {
-                    let app = &self.detected_apps[app_idx];
-                    if self.config.smtc_apps.contains(app) {
-                        self.config.smtc_apps.retain(|a| a != app);
-                    } else {
-                        self.config.smtc_apps.push(app.clone());
-                        if !self.config.smtc_known_apps.contains(app) {
-                            self.config.smtc_known_apps.push(app.clone());
-                        }
-                    }
-                    changed = true;
-                }
-            }
             _ => {}
         }
 

@@ -171,7 +171,6 @@ pub struct SettingsApp {
     target_scroll_y: f32,
     scroll_vel_y: f32,
     last_frame_time: Instant,
-    detected_apps: Vec<String>,
     sidebar_hover: i32,
     popup: Option<PopupState>,
     hover_row: Option<usize>,
@@ -220,7 +219,6 @@ impl SettingsApp {
             target_scroll_y: 0.0,
             scroll_vel_y: 0.0,
             last_frame_time: Instant::now(),
-            detected_apps: Vec::new(),
             sidebar_hover: -1,
             popup: None,
             hover_row: None,
@@ -540,9 +538,8 @@ impl SettingsApp {
 
     fn build_music_items(&self) -> Vec<SettingsItem> {
         let show_lyrics = self.config.show_lyrics;
-        let enabled = true;
 
-        let mut items = vec![
+        vec![
             SettingsItem::PageTitle {
                 text: tr("tab_music"),
             },
@@ -618,29 +615,7 @@ impl SettingsApp {
                 ),
             },
             SettingsItem::GroupEnd,
-            SettingsItem::SectionHeader {
-                label: tr("media_apps"),
-            },
-            SettingsItem::GroupStart,
-        ];
-
-        if self.detected_apps.is_empty() {
-            items.push(SettingsItem::RowLabel {
-                label: tr("no_sessions"),
-            });
-        } else {
-            for app in &self.detected_apps {
-                let display_name = app.split('!').next().unwrap_or(app).to_string();
-                let active = self.config.smtc_apps.contains(app);
-                items.push(SettingsItem::RowAppItem {
-                    label: display_name,
-                    active,
-                    enabled,
-                });
-            }
-        }
-        items.push(SettingsItem::GroupEnd);
-        items
+        ]
     }
 
     fn build_about_items(&self) -> Vec<SettingsItem> {
@@ -790,37 +765,6 @@ impl SettingsApp {
             false
         };
         self.switch_anim.set_target(10, fw_on);
-    }
-
-    fn update_detected_apps(&mut self) {
-        use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-        let mut changed = false;
-        if let Ok(manager_async) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-            && let Ok(manager) = manager_async.get()
-            && let Ok(sessions) = manager.GetSessions()
-            && let Ok(size) = sessions.Size()
-        {
-            for i in 0..size {
-                if let Ok(session) = sessions.GetAt(i)
-                    && let Ok(id) = session.SourceAppUserModelId()
-                {
-                    let name = id.to_string();
-                    if !self.detected_apps.contains(&name) {
-                        self.detected_apps.push(name);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        for app in &self.config.smtc_known_apps {
-            if !self.detected_apps.contains(app) {
-                self.detected_apps.push(app.clone());
-                changed = true;
-            }
-        }
-        if changed {
-            self.items_dirty = true;
-        }
     }
 
     fn draw(&mut self) {
@@ -1269,7 +1213,6 @@ impl ApplicationHandler for SettingsApp {
         resize_surface(&mut surface, size.width, size.height);
         self.surface = Some(surface);
         self.update_theme();
-        self.update_detected_apps();
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1566,10 +1509,6 @@ impl ApplicationHandler for SettingsApp {
                 }
             }
         }
-        if self.frame_count.is_multiple_of(120) {
-            self.update_detected_apps();
-        }
-
         let has_anim = self.switch_anim.is_animating() || self.anim.is_animating();
         let has_popup = self.popup.is_some();
         let is_scrolling = (self.target_scroll_y - self.scroll_y).abs() > 0.1;

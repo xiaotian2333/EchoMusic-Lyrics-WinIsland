@@ -145,9 +145,6 @@ pub struct AppConfig {
     pub motion_blur: bool,
     #[serde(default = "default_island_style")]
     pub island_style: String,
-    pub smtc_apps: Vec<String>,
-    #[serde(default = "default_smtc_known_apps")]
-    pub smtc_known_apps: Vec<String>,
     #[serde(default = "default_show_lyrics")]
     pub show_lyrics: bool,
     #[serde(default = "default_custom_font")]
@@ -206,10 +203,6 @@ fn default_island_style() -> String {
 
 fn default_show_lyrics() -> bool {
     true
-}
-
-fn default_smtc_known_apps() -> Vec<String> {
-    Vec::new()
 }
 
 fn default_custom_font() -> Option<String> {
@@ -319,8 +312,6 @@ impl Default for AppConfig {
             adaptive_border: false,
             motion_blur: true,
             island_style: "default".to_string(),
-            smtc_apps: Vec::new(),
-            smtc_known_apps: Vec::new(),
             show_lyrics: true,
             custom_font_path: None,
             auto_start: false,

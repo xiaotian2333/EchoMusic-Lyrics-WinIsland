@@ -109,7 +109,7 @@ impl Default for App {
             spring_h: Spring::new(config.base_height * config.global_scale),
             spring_r: Spring::new((config.base_height * config.global_scale) / 2.0),
             spring_view: Spring::new(0.0),
-            smtc: SmtcListener::new(config.smtc_apps.clone()),
+            smtc: SmtcListener::new(),
             audio: AudioProcessor::new(),
             os_w: 0,
             os_h: 0,
@@ -661,8 +661,6 @@ impl App {
             let old_font = self.config.custom_font_path.clone();
 
             self.config = current_config;
-            self.smtc.set_allowed_apps(self.config.smtc_apps.clone());
-
             if old_style != self.config.island_style {
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 clear_mica_cache();
