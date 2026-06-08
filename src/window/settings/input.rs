@@ -2,8 +2,8 @@ use super::{
     CONTENT_START_Y, POPUP_OPACITY_KEY, SIDEBAR_PAD, SIDEBAR_ROW_H, SIDEBAR_W, SUB_TAB_H,
     SUB_TAB_START_Y,
 };
-use super::{PopupKind, PopupState, SettingsApp};
-use crate::core::config::{APP_HOMEPAGE, AppConfig, DockPosition};
+use super::{FocusedTextInput, PopupKind, PopupState, SettingsApp};
+use crate::core::config::{APP_HOMEPAGE, AppConfig, DockPosition, LyricsFilterScope};
 use crate::core::i18n::{current_lang, init_i18n, set_lang, tr};
 use crate::core::persistence::save_config;
 use crate::utils::autostart::set_autostart;
@@ -13,6 +13,52 @@ use crate::utils::settings_ui::*;
 use skia_safe::Rect;
 
 impl SettingsApp {
+    pub(super) fn commit_text_input(&mut self) {
+        if let Some(FocusedTextInput::LyricsFilterRegex) = self.focused_text_input {
+            self.config.lyrics_filter_regex = self.text_input_buffer.clone();
+            if regex::Regex::new(&self.config.lyrics_filter_regex).is_ok() {
+                self.focused_text_input = None;
+                self.text_input_buffer.clear();
+            }
+            save_config(&self.config);
+        }
+        self.mark_items_dirty();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
+    pub(super) fn cancel_text_input(&mut self) {
+        self.focused_text_input = None;
+        self.text_input_buffer.clear();
+        self.mark_items_dirty();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
+    pub(super) fn push_text_input_char(&mut self, ch: char) {
+        if self.focused_text_input.is_none() || ch.is_control() || !ch.is_ascii() {
+            return;
+        }
+        self.text_input_buffer.push(ch);
+        self.mark_items_dirty();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
+    pub(super) fn pop_text_input_char(&mut self) {
+        if self.focused_text_input.is_none() {
+            return;
+        }
+        self.text_input_buffer.pop();
+        self.mark_items_dirty();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
     pub(super) fn handle_click(&mut self) {
         let (mx, my) = self.logical_mouse_pos;
 
@@ -44,6 +90,14 @@ impl SettingsApp {
                     }
                     PopupKind::ExpandedCoverShape => {
                         self.config.expanded_cover_shape = value;
+                    }
+                    PopupKind::LyricsFilterScope => {
+                        self.config.lyrics_filter_scope = value
+                            .parse::<LyricsFilterScope>()
+                            .unwrap_or(LyricsFilterScope::Off);
+                        if self.config.lyrics_filter_scope == LyricsFilterScope::Off {
+                            self.focused_text_input = None;
+                        }
                     }
                 }
                 save_config(&self.config);
@@ -431,6 +485,25 @@ impl SettingsApp {
                             self.win_w / scale,
                             self.win_h / scale,
                         ));
+                    } else if label == &tr("lyrics_filter_scope") {
+                        let selected_idx = match self.config.lyrics_filter_scope {
+                            LyricsFilterScope::Off => 0,
+                            LyricsFilterScope::Desktop => 1,
+                            LyricsFilterScope::All => 2,
+                        };
+                        self.popup = Some(PopupState::new(
+                            PopupKind::LyricsFilterScope,
+                            Rect::from_xywh(btn_x, btn_y, POPUP_BTN_W, POPUP_BTN_H),
+                            vec![
+                                tr("lyrics_filter_off"),
+                                tr("lyrics_filter_desktop"),
+                                tr("lyrics_filter_all"),
+                            ],
+                            vec!["off".to_string(), "desktop".to_string(), "all".to_string()],
+                            selected_idx,
+                            self.win_w / scale,
+                            self.win_h / scale,
+                        ));
                     } else {
                         let lang = current_lang();
                         self.popup = Some(PopupState::new(
@@ -548,6 +621,62 @@ impl SettingsApp {
                                 (self.config.lyrics_scroll_max_width + 10.0).min(500.0);
                         }
                         changed = true;
+                    }
+                }
+            }
+            ClickResult::SourceButton(idx) => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .unwrap_or(1.0);
+                let content_w = width;
+                let mut btn_content_y = start_y;
+                for item in items.iter().take(idx) {
+                    btn_content_y += item.height();
+                }
+                let cy = btn_content_y + ROW_HEIGHT / 2.0;
+                let btn_x = SIDEBAR_W + CONTENT_PADDING + content_w - GROUP_INNER_PAD - POPUP_BTN_W;
+                let btn_y = cy - POPUP_BTN_H / 2.0 - self.scroll_y;
+
+                if let Some(SettingsItem::RowSourceSelect { label, .. }) = items.get(idx)
+                    && label == &tr("lyrics_filter_scope")
+                {
+                    let selected_idx = match self.config.lyrics_filter_scope {
+                        LyricsFilterScope::Off => 0,
+                        LyricsFilterScope::Desktop => 1,
+                        LyricsFilterScope::All => 2,
+                    };
+                    self.popup = Some(PopupState::new(
+                        PopupKind::LyricsFilterScope,
+                        Rect::from_xywh(btn_x, btn_y, POPUP_BTN_W, POPUP_BTN_H),
+                        vec![
+                            tr("lyrics_filter_off"),
+                            tr("lyrics_filter_desktop"),
+                            tr("lyrics_filter_all"),
+                        ],
+                        vec!["off".to_string(), "desktop".to_string(), "all".to_string()],
+                        selected_idx,
+                        self.win_w / scale,
+                        self.win_h / scale,
+                    ));
+                    self.anim.set_with_speed(POPUP_OPACITY_KEY, 1.0, 0.25);
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                }
+            }
+            ClickResult::TextInput(idx) => {
+                if let Some(SettingsItem::RowTextInput { label, enabled, .. }) = items.get(idx)
+                    && *enabled
+                    && label == &tr("lyrics_filter_regex")
+                {
+                    self.focused_text_input = Some(FocusedTextInput::LyricsFilterRegex);
+                    self.text_input_buffer = self.config.lyrics_filter_regex.clone();
+                    self.popup = None;
+                    self.mark_items_dirty();
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
                     }
                 }
             }

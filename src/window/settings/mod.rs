@@ -1,4 +1,4 @@
-use crate::core::config::{APP_AUTHOR, APP_VERSION, AppConfig, DockPosition};
+use crate::core::config::{APP_AUTHOR, APP_VERSION, AppConfig, DockPosition, LyricsFilterScope};
 use crate::core::i18n::{current_lang, tr};
 use crate::utils::anim::AnimPool;
 use crate::utils::color::*;
@@ -46,6 +46,11 @@ enum PopupKind {
     SettingsTheme,
     MiniCoverShape,
     ExpandedCoverShape,
+    LyricsFilterScope,
+}
+
+enum FocusedTextInput {
+    LyricsFilterRegex,
 }
 
 struct PopupState {
@@ -180,6 +185,8 @@ pub struct SettingsApp {
     cached_row_heights: Vec<f32>,
     win_w: f32,
     win_h: f32,
+    focused_text_input: Option<FocusedTextInput>,
+    text_input_buffer: String,
 }
 
 impl SettingsApp {
@@ -228,6 +235,8 @@ impl SettingsApp {
             cached_row_heights: Vec::new(),
             win_w: WIN_W,
             win_h: WIN_H,
+            focused_text_input: None,
+            text_input_buffer: String::new(),
         }
     }
 
@@ -581,6 +590,43 @@ impl SettingsApp {
                 label: tr("lyrics_scroll_max_width"),
                 value: format!("{}", self.config.lyrics_scroll_max_width as i32),
                 enabled: show_lyrics && self.config.lyrics_scroll,
+            },
+            SettingsItem::RowSourceSelect {
+                label: tr("lyrics_filter_scope"),
+                options: vec![
+                    (
+                        tr("lyrics_filter_off"),
+                        self.config.lyrics_filter_scope == LyricsFilterScope::Off,
+                    ),
+                    (
+                        tr("lyrics_filter_desktop"),
+                        self.config.lyrics_filter_scope == LyricsFilterScope::Desktop,
+                    ),
+                    (
+                        tr("lyrics_filter_all"),
+                        self.config.lyrics_filter_scope == LyricsFilterScope::All,
+                    ),
+                ],
+                enabled: show_lyrics,
+            },
+            SettingsItem::RowTextInput {
+                label: tr("lyrics_filter_regex"),
+                value: if matches!(
+                    self.focused_text_input,
+                    Some(FocusedTextInput::LyricsFilterRegex)
+                ) {
+                    self.text_input_buffer.clone()
+                } else {
+                    self.config.lyrics_filter_regex.clone()
+                },
+                placeholder: tr("lyrics_filter_regex_placeholder"),
+                enabled: show_lyrics && self.config.lyrics_filter_scope != LyricsFilterScope::Off,
+                invalid: !self.config.lyrics_filter_regex.trim().is_empty()
+                    && regex::Regex::new(&self.config.lyrics_filter_regex).is_err(),
+                focused: matches!(
+                    self.focused_text_input,
+                    Some(FocusedTextInput::LyricsFilterRegex)
+                ),
             },
             SettingsItem::GroupEnd,
             SettingsItem::SectionHeader {
@@ -1266,6 +1312,21 @@ impl ApplicationHandler for SettingsApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.focused_text_input.is_some() {
+                    match event.logical_key {
+                        Key::Named(NamedKey::Enter) => self.commit_text_input(),
+                        Key::Named(NamedKey::Escape) => self.cancel_text_input(),
+                        Key::Named(NamedKey::Backspace) => self.pop_text_input_char(),
+                        _ => {
+                            if let Some(text) = event.text {
+                                for ch in text.chars() {
+                                    self.push_text_input_char(ch);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => {}
                     Key::Named(NamedKey::ArrowLeft) => {

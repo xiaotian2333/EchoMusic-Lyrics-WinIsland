@@ -1,5 +1,6 @@
 use crate::core::audio::AudioProcessor;
-use crate::core::config::{AppConfig, PADDING, TOP_OFFSET, WINDOW_TITLE};
+use crate::core::config::{AppConfig, LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE};
+use crate::core::lyrics::{current_lyric_index, filtered_lyric_text};
 use crate::core::persistence::load_config;
 use crate::core::render::{draw_island, get_mini_control_rects};
 use crate::core::smtc::SmtcListener;
@@ -22,6 +23,7 @@ use crate::utils::mouse::{
 };
 use crate::utils::physics::Spring;
 use crate::window::tray::{TrayAction, TrayManager};
+use regex::Regex;
 use softbuffer::{Context, Surface};
 use std::path::Path;
 use std::path::PathBuf;
@@ -71,6 +73,8 @@ pub struct App {
     current_lyric_text: String,
     old_lyric_text: String,
     lyric_transition: f32,
+    lyrics_filter_pattern_cache: String,
+    lyrics_filter_regex_cache: Option<Regex>,
     idle_timer: Instant,
     spring_hide: Spring,
     auto_hidden: bool,
@@ -127,6 +131,8 @@ impl Default for App {
             current_lyric_text: String::new(),
             old_lyric_text: String::new(),
             lyric_transition: 1.0,
+            lyrics_filter_pattern_cache: String::new(),
+            lyrics_filter_regex_cache: None,
             idle_timer: Instant::now(),
             spring_hide: Spring::new(0.0),
             auto_hidden: false,
@@ -216,6 +222,46 @@ impl App {
         };
         if let Err(e) = notifier.Show(&toast) {
             log::error!("Toast Show failed: {:?}", e);
+        }
+    }
+
+    fn refresh_lyrics_filter_regex(&mut self) {
+        if self.lyrics_filter_pattern_cache == self.config.lyrics_filter_regex {
+            return;
+        }
+        self.lyrics_filter_pattern_cache = self.config.lyrics_filter_regex.clone();
+        self.lyrics_filter_regex_cache = if self.config.lyrics_filter_regex.trim().is_empty() {
+            None
+        } else {
+            match Regex::new(&self.config.lyrics_filter_regex) {
+                Ok(regex) => Some(regex),
+                Err(err) => {
+                    log::warn!("歌词过滤正则无效: {}", err);
+                    None
+                }
+            }
+        };
+    }
+
+    fn current_filtered_lyric(&mut self, media: &crate::core::smtc::MediaInfo) -> Option<String> {
+        let lyrics = media.lyrics.as_ref()?;
+        let raw_pos = if media.is_playing {
+            media
+                .position_ms
+                .saturating_add(media.last_update.elapsed().as_millis() as u64)
+        } else {
+            media.position_ms
+        };
+        let current_pos =
+            (raw_pos as i64 + (self.config.lyrics_delay * 1000.0) as i64).max(0) as u64;
+        let idx = current_lyric_index(lyrics, current_pos)?;
+        self.refresh_lyrics_filter_regex();
+        if let Some(regex) = &self.lyrics_filter_regex_cache {
+            Some(filtered_lyric_text(lyrics, idx, &media.title, |text| {
+                regex.is_match(text)
+            }))
+        } else {
+            Some(lyrics[idx].text.clone())
         }
     }
 
@@ -993,6 +1039,9 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::RedrawRequested => {
+                    if self.config.lyrics_filter_scope != LyricsFilterScope::Off {
+                        self.refresh_lyrics_filter_regex();
+                    }
                     if let Some(surface) = self.surface.as_mut() {
                         let dt =
                             (self.last_frame_time.elapsed().as_secs_f32() * 60.0).clamp(0.1, 3.0);
@@ -1084,6 +1133,8 @@ impl ApplicationHandler for App {
                                     cover_rotate: self.config.cover_rotate,
                                     mini_controls: self.config.mini_controls,
                                     lyrics_delay: self.config.lyrics_delay,
+                                    lyrics_filter_scope: self.config.lyrics_filter_scope,
+                                    lyrics_filter_regex: self.lyrics_filter_regex_cache.as_ref(),
                                     dt,
                                 },
                             },
@@ -1359,7 +1410,11 @@ impl ApplicationHandler for App {
 
         let is_paused = music_active && !media.is_playing;
         let current_lyric_opt = if self.config.show_lyrics && !is_paused {
-            media.current_lyric((self.config.lyrics_delay * 1000.0) as i64)
+            if self.config.lyrics_filter_scope.filters_desktop() {
+                self.current_filtered_lyric(&media)
+            } else {
+                media.current_lyric((self.config.lyrics_delay * 1000.0) as i64)
+            }
         } else {
             None
         };

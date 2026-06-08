@@ -7,6 +7,41 @@ pub struct LyricLine {
     pub text: String,
 }
 
+pub fn current_lyric_index(lyrics: &[LyricLine], current_pos: u64) -> Option<usize> {
+    if lyrics.is_empty() {
+        return None;
+    }
+    match lyrics.binary_search_by_key(&current_pos, |line| line.time_ms) {
+        Ok(idx) => Some(idx),
+        Err(idx) => idx.checked_sub(1),
+    }
+}
+
+pub fn filtered_lyric_text<F>(
+    lyrics: &[LyricLine],
+    current_idx: usize,
+    title: &str,
+    matcher: F,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    if current_idx >= lyrics.len() {
+        return title.to_string();
+    }
+    let current = lyrics[current_idx].text.trim();
+    if !matcher(current) {
+        return current.to_string();
+    }
+    lyrics[..current_idx]
+        .iter()
+        .rev()
+        .map(|line| line.text.trim())
+        .find(|text| !text.is_empty() && !matcher(text))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| title.to_string())
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct TrackLyrics {
     pub track_id: Option<String>,

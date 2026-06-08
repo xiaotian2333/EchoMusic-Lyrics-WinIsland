@@ -1,4 +1,4 @@
-use crate::core::config::{DockPosition, PADDING, TOP_OFFSET};
+use crate::core::config::{DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET};
 use crate::core::smtc::MediaInfo;
 use crate::icons::controls::draw_play_button;
 use crate::ui::expanded::music_view::{
@@ -71,6 +71,8 @@ pub struct StyleParams<'a> {
     pub cover_rotate: bool,
     pub mini_controls: bool,
     pub lyrics_delay: f64,
+    pub lyrics_filter_scope: LyricsFilterScope,
+    pub lyrics_filter_regex: Option<&'a regex::Regex>,
     pub dt: f32,
 }
 
@@ -135,6 +137,8 @@ pub fn draw_island(
         cover_rotate,
         mini_controls: _,
         lyrics_delay,
+        lyrics_filter_scope,
+        lyrics_filter_regex,
         dt,
     } = style;
     let mut buffer = surface.buffer_mut().unwrap();
@@ -406,6 +410,8 @@ pub fn draw_island(
             media,
             font_size,
             lyrics_delay,
+            lyrics_filter_scope,
+            lyrics_filter_regex,
             dt,
             text_color,
         );

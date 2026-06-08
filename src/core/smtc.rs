@@ -1,4 +1,4 @@
-use crate::core::lyrics::{LyricLine, TrackLyrics};
+use crate::core::lyrics::{LyricLine, TrackLyrics, current_lyric_index};
 use crate::core::lyrics_ws::{LyricsWsEvent, LyricsWsHandle, start_lyrics_ws_server};
 use crate::core::persistence::{load_config, save_config};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use windows::Media::Control::{
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
-const POSITION_SYNC_THRESHOLD_MS: i64 = 500;
+const POSITION_SYNC_THRESHOLD_MS: i64 = 0;
 
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
@@ -77,16 +77,7 @@ impl MediaInfo {
         };
         let current_pos = (raw_pos as i64 + delay_ms).max(0) as u64;
 
-        match lyrics.binary_search_by_key(&current_pos, |line| line.time_ms) {
-            Ok(idx) => Some(lyrics[idx].text.clone()),
-            Err(idx) => {
-                if idx > 0 {
-                    Some(lyrics[idx - 1].text.clone())
-                } else {
-                    None
-                }
-            }
-        }
+        current_lyric_index(lyrics, current_pos).map(|idx| lyrics[idx].text.clone())
     }
 }
 

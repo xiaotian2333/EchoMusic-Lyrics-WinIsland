@@ -17,6 +17,7 @@ dependencies = [
  "once_cell",
  "open",
  "realfft",
+ "regex",
  "reqwest",
  "rfd",
  "serde",

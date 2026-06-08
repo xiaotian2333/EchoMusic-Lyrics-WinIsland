@@ -80,6 +80,60 @@ impl From<DockPosition> for String {
         value.as_str().to_string()
     }
 }
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(from = "String", into = "String")]
+pub enum LyricsFilterScope {
+    #[default]
+    Off,
+    Desktop,
+    All,
+}
+
+impl LyricsFilterScope {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Desktop => "desktop",
+            Self::All => "all",
+        }
+    }
+
+    pub const fn filters_desktop(&self) -> bool {
+        matches!(self, Self::Desktop | Self::All)
+    }
+
+    pub const fn filters_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+impl std::str::FromStr for LyricsFilterScope {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "desktop" => Ok(Self::Desktop),
+            "all" => Ok(Self::All),
+            "off" => Ok(Self::Off),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<String> for LyricsFilterScope {
+    fn from(value: String) -> Self {
+        value.parse().unwrap_or_default()
+    }
+}
+
+impl From<LyricsFilterScope> for String {
+    fn from(value: LyricsFilterScope) -> Self {
+        value.as_str().to_string()
+    }
+}
+
+pub const DEFAULT_LYRICS_FILTER_REGEX: &str = r"^([^：]*)：.*$|^([^:]*):.*$|^([^翻唱]*)翻唱.*$|^([^许可]*)许可.*$|^([^音乐人]*)音乐人.*$|^([^国风]*)国风.*$|^([^纯音乐]*)纯音乐.*$|^([^星曜计划]*)星曜计划.*$";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppConfig {
     pub global_scale: f32,
@@ -117,6 +171,10 @@ pub struct AppConfig {
     pub lyrics_scroll: bool,
     #[serde(default = "default_lyrics_scroll_max_width")]
     pub lyrics_scroll_max_width: f32,
+    #[serde(default = "default_lyrics_filter_scope")]
+    pub lyrics_filter_scope: LyricsFilterScope,
+    #[serde(default = "default_lyrics_filter_regex")]
+    pub lyrics_filter_regex: String,
     #[serde(default = "default_position_x_offset")]
     pub position_x_offset: i32,
     #[serde(default = "default_position_y_offset")]
@@ -195,6 +253,14 @@ fn default_lyrics_scroll_max_width() -> f32 {
     300.0
 }
 
+fn default_lyrics_filter_scope() -> LyricsFilterScope {
+    LyricsFilterScope::Desktop
+}
+
+fn default_lyrics_filter_regex() -> String {
+    DEFAULT_LYRICS_FILTER_REGEX.to_string()
+}
+
 fn default_position_x_offset() -> i32 {
     0
 }
@@ -268,6 +334,8 @@ impl Default for AppConfig {
             lyrics_delay: 0.0,
             lyrics_scroll: false,
             lyrics_scroll_max_width: 300.0,
+            lyrics_filter_scope: LyricsFilterScope::Desktop,
+            lyrics_filter_regex: DEFAULT_LYRICS_FILTER_REGEX.to_string(),
             position_x_offset: 0,
             position_y_offset: 0,
             dock_position: DockPosition::TopCenter,

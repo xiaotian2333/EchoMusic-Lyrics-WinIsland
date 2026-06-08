@@ -61,6 +61,14 @@ pub enum SettingsItem {
         options: Vec<(String, bool)>,
         enabled: bool,
     },
+    RowTextInput {
+        label: String,
+        value: String,
+        placeholder: String,
+        enabled: bool,
+        invalid: bool,
+        focused: bool,
+    },
     RowAppItem {
         label: String,
         active: bool,
@@ -115,6 +123,7 @@ impl SettingsItem {
                 | SettingsItem::RowFontPicker { .. }
                 | SettingsItem::RowFolderPicker { .. }
                 | SettingsItem::RowSourceSelect { .. }
+                | SettingsItem::RowTextInput { .. }
                 | SettingsItem::RowAppItem { .. }
                 | SettingsItem::RowLabel { .. }
         )

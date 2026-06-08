@@ -1,3 +1,5 @@
+use crate::core::config::LyricsFilterScope;
+use crate::core::lyrics::current_lyric_index;
 use crate::core::smtc::MediaInfo;
 use crate::icons::arrows::draw_arrow_left;
 use crate::ui::expanded::music_view::draw_text_cached;
@@ -132,6 +134,8 @@ pub fn draw_widget_page(
     media: &MediaInfo,
     _font_size: f32,
     lyrics_delay: f64,
+    lyrics_filter_scope: LyricsFilterScope,
+    lyrics_filter_regex: Option<&regex::Regex>,
     dt: f32,
     text_color: Color,
 ) -> bool {
@@ -194,15 +198,8 @@ pub fn draw_widget_page(
     };
     let current_pos = (raw_pos as i64 + (lyrics_delay * 1000.0) as i64).max(0) as u64;
 
-    let current_idx = match lyrics.binary_search_by_key(&current_pos, |line| line.time_ms) {
-        Ok(idx) => idx,
-        Err(idx) => {
-            if idx > 0 {
-                idx - 1
-            } else {
-                0
-            }
-        }
+    let Some(current_idx) = current_lyric_index(lyrics, current_pos) else {
+        return false;
     };
 
     let lyric_area_left = ox + 40.0 * scale;
@@ -223,23 +220,47 @@ pub fn draw_widget_page(
         return false;
     }
 
-    let visible_count = max_visible_lines.min(lyrics.len());
+    let should_filter = lyrics_filter_scope.filters_all();
+    let visible_indices = lyrics
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let text = line.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            if should_filter && lyrics_filter_regex.is_some_and(|regex| regex.is_match(text)) {
+                return None;
+            }
+            Some(idx)
+        })
+        .collect::<Vec<_>>();
+    if visible_indices.is_empty() {
+        return false;
+    }
+
+    let current_display_idx = match visible_indices.binary_search(&current_idx) {
+        Ok(idx) => idx,
+        Err(idx) => idx.saturating_sub(1).min(visible_indices.len() - 1),
+    };
+
+    let visible_count = max_visible_lines.min(visible_indices.len());
     let half = visible_count / 2;
 
-    let (old_idx, scroll_progress, is_animating) = LYRIC_SCROLL_STATE.with(|cell| {
+    let (old_display_idx, scroll_progress, is_animating) = LYRIC_SCROLL_STATE.with(|cell| {
         let mut state = cell.borrow_mut();
-        state.update(current_idx, dt, &media.title);
+        state.update(current_display_idx, dt, &media.title);
         (state.old_idx, state.scroll_progress, state.is_animating())
     });
 
     let center_y = oy + h / 2.0 + 4.0 * scale;
     let center_x = ox + w / 2.0;
 
-    let idx_diff = current_idx as f32 - old_idx as f32;
+    let idx_diff = current_display_idx as f32 - old_display_idx as f32;
     let ease_progress = scroll_progress * scroll_progress * (3.0 - 2.0 * scroll_progress);
     let scroll_offset = -idx_diff * line_h * (1.0 - ease_progress);
 
-    let current_line_text = &lyrics[current_idx].text;
+    let current_line_text = lyrics[visible_indices[current_display_idx]].text.trim();
     let current_font_sz = font_size + 6.0 * scale;
     let current_text_w = FontManager::global().measure_text_cached(
         current_line_text,
@@ -263,22 +284,20 @@ pub fn draw_widget_page(
         true,
     );
 
-    let total_lines = lyrics.len();
     let extra_lines = 3;
 
     for i in 0..(visible_count + extra_lines) {
-        let idx = current_idx as isize - half as isize - extra_lines as isize / 2 + i as isize;
-        if idx < 0 || idx >= total_lines as isize {
+        let display_idx =
+            current_display_idx as isize - half as isize - extra_lines as isize / 2 + i as isize;
+        if display_idx < 0 || display_idx >= visible_indices.len() as isize {
             continue;
         }
-        let idx = idx as usize;
+        let display_idx = display_idx as usize;
+        let raw_idx = visible_indices[display_idx];
 
-        let is_current = idx == current_idx;
-        let is_old_current = idx == old_idx;
-        let line = &lyrics[idx];
-        if line.text.is_empty() {
-            continue;
-        }
+        let is_current = display_idx == current_display_idx;
+        let is_old_current = display_idx == old_display_idx;
+        let line_text = lyrics[raw_idx].text.trim();
 
         let line_y =
             center_y + (i as f32 - half as f32 - (extra_lines / 2) as f32) * line_h - scroll_offset;
@@ -298,7 +317,7 @@ pub fn draw_widget_page(
                 false,
             )
         } else {
-            let dist = (idx as f32 - current_idx as f32).abs();
+            let dist = (display_idx as f32 - current_display_idx as f32).abs();
             let scale_factor = 0.96_f32.powf(dist);
             let opacity_factor = 0.82_f32.powf(dist);
             (
@@ -325,7 +344,7 @@ pub fn draw_widget_page(
             let text_x = lyric_area_left + 2.0 * scale - current_scroll_offset;
             draw_text_cached(DrawTextCachedParams {
                 canvas,
-                text: &line.text,
+                text: &line_text,
                 x: text_x,
                 y: line_y,
                 size: font_sz,
@@ -334,10 +353,10 @@ pub fn draw_widget_page(
             });
         } else {
             let lw =
-                FontManager::global().measure_text_cached(&line.text, font_sz, FontStyle::normal());
+                FontManager::global().measure_text_cached(&line_text, font_sz, FontStyle::normal());
             draw_text_cached(DrawTextCachedParams {
                 canvas,
-                text: &line.text,
+                text: &line_text,
                 x: center_x - lw / 2.0,
                 y: line_y,
                 size: font_sz,

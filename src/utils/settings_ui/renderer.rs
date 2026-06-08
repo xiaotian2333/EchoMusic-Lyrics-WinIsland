@@ -768,6 +768,142 @@ pub fn draw_items(params: DrawItemsParams<'_>) {
                 }
                 row_idx += 1;
             }
+            SettingsItem::RowTextInput {
+                label,
+                value,
+                placeholder,
+                enabled,
+                invalid,
+                focused,
+            } => {
+                let visible = y + ROW_HEIGHT >= visible_min_y && y <= visible_max_y;
+                if visible {
+                    draw_row_hover(
+                        canvas,
+                        y,
+                        ROW_HEIGHT,
+                        content_w,
+                        row_idx,
+                        in_group,
+                        hover_anims,
+                        theme,
+                    );
+                }
+                let row_x = CONTENT_PADDING + GROUP_INNER_PAD;
+                let cy = y + ROW_HEIGHT / 2.0;
+
+                if visible {
+                    paint.set_color(if *enabled {
+                        theme.text_pri
+                    } else {
+                        theme.text_sec
+                    });
+                    fm.draw_text_cached(DrawTextCachedParams {
+                        canvas,
+                        text: label,
+                        x: row_x,
+                        y: cy + 5.0,
+                        size: 13.0,
+                        bold: false,
+                        paint: &paint,
+                    });
+
+                    let input_w = 220.0_f32.min(content_w * 0.55);
+                    let input_x = CONTENT_PADDING + content_w - GROUP_INNER_PAD - input_w;
+                    let input_y = cy - POPUP_BTN_H / 2.0;
+                    let mut p = Paint::default();
+                    p.set_anti_alias(true);
+                    p.set_color(if !*enabled {
+                        theme.disabled
+                    } else if *invalid {
+                        Color::from_argb(40, theme.danger.r(), theme.danger.g(), theme.danger.b())
+                    } else if *focused {
+                        theme.card_highlight
+                    } else {
+                        theme.card_highlight
+                    });
+                    canvas.draw_round_rect(
+                        Rect::from_xywh(input_x, input_y, input_w, POPUP_BTN_H),
+                        POPUP_BTN_R,
+                        POPUP_BTN_R,
+                        &p,
+                    );
+
+                    if *focused || *invalid {
+                        p.set_style(skia_safe::paint::Style::Stroke);
+                        p.set_stroke_width(1.2);
+                        p.set_color(if *invalid { theme.danger } else { theme.accent });
+                        canvas.draw_round_rect(
+                            Rect::from_xywh(input_x, input_y, input_w, POPUP_BTN_H),
+                            POPUP_BTN_R,
+                            POPUP_BTN_R,
+                            &p,
+                        );
+                        p.set_style(skia_safe::paint::Style::Fill);
+                    }
+
+                    let mut display = if value.is_empty() {
+                        placeholder.clone()
+                    } else {
+                        value.clone()
+                    };
+                    if *focused {
+                        display.push('|');
+                    }
+                    let display = truncate_text(fm, &display, 12.0, input_w - 12.0);
+                    p.set_color(if !*enabled {
+                        theme.text_sec
+                    } else if value.is_empty() {
+                        theme.text_sec
+                    } else if *invalid {
+                        theme.danger
+                    } else {
+                        theme.text_pri
+                    });
+                    fm.draw_text_cached(DrawTextCachedParams {
+                        canvas,
+                        text: &display,
+                        x: input_x + 6.0,
+                        y: input_y + 17.0,
+                        size: 12.0,
+                        bold: false,
+                        paint: &p,
+                    });
+
+                    if *invalid {
+                        p.set_color(theme.danger);
+                        fm.draw_text_cached(DrawTextCachedParams {
+                            canvas,
+                            text: &tr("lyrics_filter_invalid_regex"),
+                            x: input_x,
+                            y: input_y + POPUP_BTN_H + 12.0,
+                            size: 10.0,
+                            bold: false,
+                            paint: &p,
+                        });
+                    }
+                }
+
+                if in_group {
+                    group_current_row += 1;
+                    if group_current_row < group_row_count && visible {
+                        let mut sep = Paint::default();
+                        sep.set_anti_alias(true);
+                        sep.set_color(theme.separator);
+                        sep.set_stroke_width(0.5);
+                        sep.set_style(skia_safe::paint::Style::Stroke);
+                        canvas.draw_line(
+                            (row_x, y + ROW_HEIGHT),
+                            (
+                                CONTENT_PADDING + content_w - GROUP_INNER_PAD,
+                                y + ROW_HEIGHT,
+                            ),
+                            &sep,
+                        );
+                    }
+                }
+                row_idx += 1;
+            }
             SettingsItem::RowAppItem {
                 label,
                 active,
