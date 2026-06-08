@@ -1,4 +1,4 @@
-use crate::core::lyrics::{LyricLine, TrackLyrics, current_lyric_index};
+use crate::core::lyrics::{LyricLine, MusicData, MusicMetadata, current_lyric_index};
 use crate::core::lyrics_ws::{LyricsWsEvent, LyricsWsHandle, start_lyrics_ws_server};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +12,13 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 
 pub const TARGET_MEDIA_APP_ID: &str = "com.hoowhoami.echomusic";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbnailSource {
+    None,
+    Smtc,
+    MusicData,
+}
+
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
     pub title: String,
@@ -20,6 +27,7 @@ pub struct MediaInfo {
     pub is_playing: bool,
     pub thumbnail: Option<Arc<Vec<u8>>>,
     pub thumbnail_hash: u64,
+    pub thumbnail_source: ThumbnailSource,
     pub spectrum: [f32; 6],
     pub position_ms: u64,
     pub last_update: Instant,
@@ -39,6 +47,7 @@ impl Default for MediaInfo {
             is_playing: false,
             thumbnail: None,
             thumbnail_hash: 0,
+            thumbnail_source: ThumbnailSource::None,
             spectrum: [0.0; 6],
             position_ms: 0,
             last_update: Instant::now(),
@@ -241,8 +250,8 @@ fn smtc_poll_loop(
                 LyricsWsEvent::Connected | LyricsWsEvent::Subscribe => {
                     lyrics_ws_handle.request_track_lyrics();
                 }
-                LyricsWsEvent::TrackLyrics(track_lyrics) => {
-                    apply_track_lyrics(&info_tx, track_lyrics);
+                LyricsWsEvent::MusicData(music_data) => {
+                    apply_music_data(&info_tx, music_data);
                 }
             }
         }
@@ -352,53 +361,85 @@ fn text_matches(left: &str, right: &str) -> bool {
     left == right || left.contains(&right) || right.contains(&left)
 }
 
-fn artist_matches(track: &TrackLyrics, media_artist: &str) -> bool {
+fn artist_matches(metadata: &MusicMetadata, media_artist: &str) -> bool {
     if media_artist.trim().is_empty()
-        || (track.artist.trim().is_empty() && track.artists.is_empty())
+        || (metadata.artist.trim().is_empty() && metadata.artists.is_empty())
     {
         return true;
     }
-    if text_matches(&track.artist, media_artist) {
+    if text_matches(&metadata.artist, media_artist) {
         return true;
     }
-    track
+    metadata
         .artists
         .iter()
         .any(|artist| text_matches(artist, media_artist))
 }
 
-fn apply_track_lyrics(info_tx: &watch::Sender<MediaInfo>, track_lyrics: TrackLyrics) {
+fn apply_music_data(info_tx: &watch::Sender<MediaInfo>, music_data: MusicData) {
+    let metadata = &music_data.metadata;
     let current = info_tx.borrow();
     if current.title.trim().is_empty() {
         return;
     }
-    if !text_matches(&track_lyrics.title, &current.title) {
+    if !text_matches(&metadata.title, &current.title) {
         log::debug!(
-            "已丢弃不匹配歌词: {:?} {} - {}，当前曲目: {} - {}",
-            track_lyrics.track_id,
-            track_lyrics.title,
-            track_lyrics.artist,
+            "已丢弃不匹配 MusicData: {:?} {} - {}，当前曲目: {} - {}",
+            metadata.track_id,
+            metadata.title,
+            metadata.artist,
             current.title,
             current.artist
         );
         return;
     }
-    if !artist_matches(&track_lyrics, &current.artist) {
+    if !artist_matches(metadata, &current.artist) {
         log::debug!(
-            "已丢弃歌手不匹配歌词: {:?} {} - {}，当前曲目: {} - {}",
-            track_lyrics.track_id,
-            track_lyrics.title,
-            track_lyrics.artist,
+            "已丢弃歌手不匹配 MusicData: {:?} {} - {}，当前曲目: {} - {}",
+            metadata.track_id,
+            metadata.title,
+            metadata.artist,
             current.title,
             current.artist
         );
         return;
     }
 
+    let cover = metadata.cover.clone();
     drop(current);
     let mut new_info = info_tx.borrow().clone();
-    new_info.lyrics = Some(track_lyrics.lyrics);
+    new_info.lyrics = Some(music_data.lyrics);
+    if let Some(cover) = cover
+        && is_supported_image_bytes(&cover)
+    {
+        let hash = hash_thumbnail_bytes(&cover);
+        if new_info.thumbnail_hash != hash
+            || new_info.thumbnail_source != ThumbnailSource::MusicData
+        {
+            new_info.thumbnail = Some(cover);
+            new_info.thumbnail_hash = hash;
+            new_info.thumbnail_source = ThumbnailSource::MusicData;
+            new_info.last_thumbnail_fetch = Instant::now();
+        }
+    }
     let _ = info_tx.send(new_info);
+}
+
+fn hash_thumbnail_bytes(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn is_supported_image_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
 }
 
 fn is_target_app_session(session: &GlobalSystemMediaTransportControlsSession) -> bool {
@@ -533,6 +574,7 @@ fn fetch_properties(
             info.lyrics = None;
             info.thumbnail = None;
             info.thumbnail_hash = 0;
+            info.thumbnail_source = ThumbnailSource::None;
             info.position_ms = 0;
             info.last_smtc_pos = smtc_pos;
             info.last_update = Instant::now();
@@ -635,21 +677,19 @@ fn fetch_properties(
                 })();
 
                 if let Ok((_t, _a, bytes)) = res {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    bytes.hash(&mut hasher);
-                    let hash = hasher.finish();
+                    let hash = hash_thumbnail_bytes(&bytes);
 
                     let current = info_tx_clone.borrow();
                     if current.title == title_clone
                         && current.artist == artist_clone
+                        && current.thumbnail_source != ThumbnailSource::MusicData
                         && current.thumbnail_hash != hash
                     {
                         drop(current);
                         let mut new_info = info_tx_clone.borrow().clone();
                         new_info.thumbnail = Some(Arc::new(bytes));
                         new_info.thumbnail_hash = hash;
+                        new_info.thumbnail_source = ThumbnailSource::Smtc;
                         let _ = info_tx_clone.send(new_info);
                     }
                     return;

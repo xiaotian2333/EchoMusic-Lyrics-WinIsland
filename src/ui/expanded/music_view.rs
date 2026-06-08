@@ -189,7 +189,10 @@ pub fn get_cached_media_image_with_key(media: &MediaInfo) -> Option<(Image, Stri
     if media.title.is_empty() {
         return None;
     }
-    let cache_key = format!("{}-{}", media.title, media.album);
+    let cache_key = format!(
+        "{}|{}|{}|{:016x}",
+        media.title, media.artist, media.album, media.thumbnail_hash
+    );
 
     let mut result: Option<(Image, String)> = None;
     IMG_CACHE.with(|cache| {

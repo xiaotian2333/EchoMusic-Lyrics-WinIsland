@@ -61,6 +61,7 @@ pub struct App {
     win_y: i32,
     frame_count: u64,
     last_media_title: String,
+    last_media_thumbnail_hash: u64,
     last_media_playing: bool,
     current_lyric_text: String,
     old_lyric_text: String,
@@ -117,6 +118,7 @@ impl Default for App {
             win_y: 0,
             frame_count: 0,
             last_media_title: String::new(),
+            last_media_thumbnail_hash: 0,
             last_media_playing: false,
             current_lyric_text: String::new(),
             old_lyric_text: String::new(),
@@ -1129,9 +1131,22 @@ impl ApplicationHandler for App {
         if !media.title.is_empty() {
             self.last_media_playing = media.is_playing;
             music_active = true;
-            if media.title != self.last_media_title {
+            let title_changed = media.title != self.last_media_title;
+            let thumbnail_changed = media.thumbnail_hash != self.last_media_thumbnail_hash;
+            if title_changed {
+                let should_flip_cover = media.thumbnail_hash != 0 && thumbnail_changed;
                 self.last_media_title = media.title.clone();
-                crate::ui::expanded::music_view::trigger_cover_flip();
+                self.last_media_thumbnail_hash = media.thumbnail_hash;
+                if should_flip_cover {
+                    crate::ui::expanded::music_view::trigger_cover_flip();
+                }
+                crate::utils::backdrop::clear_dynamic_bg_cache();
+                window.request_redraw();
+            } else if thumbnail_changed {
+                self.last_media_thumbnail_hash = media.thumbnail_hash;
+                if media.thumbnail_hash != 0 {
+                    crate::ui::expanded::music_view::trigger_cover_flip();
+                }
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 window.request_redraw();
             }

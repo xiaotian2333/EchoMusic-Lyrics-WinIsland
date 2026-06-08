@@ -1,4 +1,4 @@
-use crate::core::lyrics::{TrackLyrics, parse_track_lyrics_payload};
+use crate::core::lyrics::{MusicData, parse_music_data_payload};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -17,7 +17,7 @@ pub enum LyricsWsCommand {
 pub enum LyricsWsEvent {
     Connected,
     Subscribe,
-    TrackLyrics(TrackLyrics),
+    MusicData(MusicData),
 }
 
 #[derive(Clone)]
@@ -155,15 +155,18 @@ where
         "subscribe" => {
             let _ = event_tx.send(LyricsWsEvent::Subscribe);
         }
-        "track_lyrics" => {
+        "MusicData" => {
             if let Some(payload) = message.get("payload")
-                && let Some(track_lyrics) = parse_track_lyrics_payload(payload)
+                && let Some(music_data) = parse_music_data_payload(payload)
             {
-                let _ = event_tx.send(LyricsWsEvent::TrackLyrics(track_lyrics));
+                let _ = event_tx.send(LyricsWsEvent::MusicData(music_data));
             }
         }
+        "track_lyrics" => {
+            log::debug!("已忽略旧歌词事件 track_lyrics，请使用 MusicData");
+        }
         "lyrics" => {
-            log::debug!("已忽略旧歌词事件 lyrics，请使用 track_lyrics");
+            log::debug!("已忽略旧歌词事件 lyrics，请使用 MusicData");
         }
         _ => {}
     }
