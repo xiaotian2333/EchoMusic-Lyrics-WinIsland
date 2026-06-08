@@ -1,40 +1,36 @@
-<p align="center">
-  <img src="resources/info-en.png" width="350" alt="">
-</p>
+# WinIsland
 
-## WinIsland
-
-English | [简体中文](./README-zh.md)
 > [!WARNING]
-> IT'S WIP, Mistakes may occur sometimes.
+> 该项目仍在开发中，可能会出现错误。
 
-This is a project that can display **Dynamic Island** on Windows.
+这是一个可以在 Windows 上以灵动岛形式显示歌词的项目。  
+此项目是基于[WinIsland](https://github.com/Eatgrapes/WinIsland/tree/ab7254285b2532441b0f69a2a050fcce478bead7)的硬fork，适用于EchoMusic
 
-## Download it
-you can in [Release](https://github.com/Eatgrapes/WinIsland/releases) or our [website](https://tanikaze.icu/WinIsland) Download WinIsland
+## 下载
+你可以在 [Release](https://github.com/xiaotian2333/WinIsland/releases) 下载WinIsland
 
-## Build it 
+## 构建项目
 
-- **Rust** environment
+- **Rust** 环境
 - **Cargo**
 
 ```cmd
-git clone https://github.com/Eatgrapes/WinIsland.git
+git clone https://github.com/xiaotian2333/WinIsland.git
 
 cd WinIsland
 
 cargo build --release
 ```
 
-## Contributes 
-We encourage contributions
+## 贡献
+我们欢迎任何形式的贡献！
 
-If you have the energy or interest, PR are welcome
+如果你有精力或兴趣，欢迎提交 PR。
 
-And You should see [Contributing](CONTRIBUTING.md)
+在提PR前，请先看[Contributing](./Docs/CONTRIBUTING-zh.md)
 
 > [!IMPORTANT]
-> Any PRs not following the [Contributing Guidelines](CONTRIBUTING.md) will be closed.
+> 所有未遵守[贡献指南](CONTRIBUTING.md)的PR将会被close
 
-## LICENCE
+## 许可证
 [MIT](LICENSE)
