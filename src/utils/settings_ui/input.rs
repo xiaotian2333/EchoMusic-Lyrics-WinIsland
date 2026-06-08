@@ -94,11 +94,7 @@ pub fn hit_test(items: &[SettingsItem], mx: f32, my: f32, start_y: f32, width: f
                 }
             }
             SettingsItem::RowTextInput { enabled, .. } if *enabled => {
-                let cy = y + ROW_HEIGHT / 2.0;
-                let input_w = 220.0_f32.min(content_w * 0.55);
-                let input_x = CONTENT_PADDING + content_w - GROUP_INNER_PAD - input_w;
-                let input_y = cy - POPUP_BTN_H / 2.0;
-                if in_rect(mx, my, input_x, input_y, input_w, POPUP_BTN_H) {
+                if in_rect(mx, my, CONTENT_PADDING, y, content_w, ROW_HEIGHT) {
                     return ClickResult::TextInput(idx);
                 }
             }

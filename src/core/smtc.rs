@@ -11,8 +11,6 @@ use windows::Media::Control::{
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
-const POSITION_SYNC_THRESHOLD_MS: i64 = 0;
-
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
     pub title: String,
@@ -659,15 +657,7 @@ fn fetch_properties(
             info.last_thumbnail_fetch = Instant::now();
             should_fetch_thumbnail = true;
         }
-        let current_extrapolated = if info.is_playing {
-            info.position_ms
-                .saturating_add(info.last_update.elapsed().as_millis() as u64)
-        } else {
-            info.position_ms
-        };
-
         let smtc_changed = smtc_pos != info.last_smtc_pos;
-        let diff_with_extrapolated = (smtc_pos as i64 - current_extrapolated as i64).abs();
         let suppress_smtc_sync =
             if let Some((target_pos, started_at, protect_duration)) = *pending_seek {
                 let diff_with_target = (smtc_pos as i64 - target_pos as i64).abs();
@@ -691,8 +681,7 @@ fn fetch_properties(
             && !suppress_smtc_sync
             && ((info.is_playing != is_playing)
                 || (smtc_pos > 0 && info.position_ms == 0)
-                || (smtc_changed
-                    && (diff_with_extrapolated > POSITION_SYNC_THRESHOLD_MS || !is_playing)));
+                || smtc_changed);
 
         if should_sync {
             if smtc_pos > 0 || !song_changed {
