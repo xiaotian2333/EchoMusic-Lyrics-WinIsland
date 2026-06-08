@@ -28,7 +28,11 @@ fn main() {
         // The name is a static string literal. GetLastError checks if the mutex
         // already exists (ERROR_ALREADY_EXISTS) to bring existing window to front.
         unsafe {
-            _settings_mutex = CreateMutexW(None, true, w!("Local\\WinIsland_Settings_Mutex"));
+            _settings_mutex = CreateMutexW(
+                None,
+                true,
+                w!("Local\\EchoMusic_Lyrics_WinIsland_Settings_Mutex"),
+            );
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 crate::window::settings::bring_settings_to_front();
                 return;
@@ -47,7 +51,11 @@ fn main() {
                 // the handle is kept in ManuallyDrop to hold the lock for the process lifetime.
                 // On ERROR_ALREADY_EXISTS, the handle is closed and we retry or exit.
                 unsafe {
-                    let h = CreateMutexW(None, true, w!("Local\\WinIsland_SingleInstance_Mutex"));
+                    let h = CreateMutexW(
+                        None,
+                        true,
+                        w!("Local\\EchoMusic_Lyrics_WinIsland_SingleInstance_Mutex"),
+                    );
                     match h {
                         Ok(handle) => {
                             if GetLastError() != ERROR_ALREADY_EXISTS {
@@ -70,7 +78,7 @@ fn main() {
                                 "-NoProfile",
                                 "-Command",
                                 &format!(
-                                    "Get-Process WinIsland -ErrorAction SilentlyContinue | Where-Object {{$_.Id -ne {own_pid}}} | Stop-Process -Force"
+                                    "Get-Process EchoMusic-Lyrics-WinIsland -ErrorAction SilentlyContinue | Where-Object {{$_.Id -ne {own_pid}}} | Stop-Process -Force"
                                 ),
                             ])
                             .output()

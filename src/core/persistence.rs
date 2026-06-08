@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 pub fn get_config_path() -> PathBuf {
     let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".winisland");
+    path.push(".echomusic-lyrics-winisland");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }

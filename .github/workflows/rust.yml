@@ -53,7 +53,7 @@ jobs:
         draft: false
         prerelease: true
         files: |
-          target/release/WinIsland.exe
+          target/release/EchoMusic-Lyrics-WinIsland.exe
           target/release/version_info.json
         make_latest: true
       env:

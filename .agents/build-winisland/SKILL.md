@@ -1,9 +1,9 @@
 ---
 name: build-winisland
-description: Build, lint, and test the WinIsland Rust project. Use when the user wants to compile, check for errors, run clippy, format code, or execute tests. Trigger after every code change to verify correctness.
+description: Build, lint, and test the EchoMusic-Lyrics-WinIsland Rust project. Use when the user wants to compile, check for errors, run clippy, format code, or execute tests. Trigger after every code change to verify correctness.
 license: MIT
 metadata:
-  project: WinIsland
+  project: EchoMusic-Lyrics-WinIsland
 ---
 
 Run these commands from the project root in order. Stop and report any failures before proceeding.

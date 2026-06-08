@@ -12,10 +12,10 @@ fn main() {
             );
         }
 
-        res.set("CompanyName", "Eatgrapes");
-        res.set("FileDescription", "WinIsland");
-        res.set("ProductName", "WinIsland");
-        res.set("LegalCopyright", "Copyright (c) Eatgrapes");
+        res.set("CompanyName", "xiaotian2333");
+        res.set("FileDescription", "EchoMusic-Lyrics-WinIsland");
+        res.set("ProductName", "EchoMusic-Lyrics-WinIsland");
+        res.set("LegalCopyright", "Copyright (c) xiaotian2333");
 
         let manifest = r#"
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>

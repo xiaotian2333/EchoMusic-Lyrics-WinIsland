@@ -1,4 +1,4 @@
-# WinIsland Style Guide
+# EchoMusic-Lyrics-WinIsland Style Guide
 
 ## Language
 

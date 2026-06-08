@@ -21,14 +21,12 @@ pub struct VersionInfo {
     pub timestamp: String,
 }
 
-const UPDATE_URL_JSON: &str =
-    "https://github.com/Eatgrapes/WinIsland/releases/download/nightly/version_info.json";
-const UPDATE_URL_EXE: &str =
-    "https://github.com/Eatgrapes/WinIsland/releases/download/nightly/WinIsland.exe";
+const UPDATE_URL_JSON: &str = "https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland/releases/download/nightly/version_info.json";
+const UPDATE_URL_EXE: &str = "https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland/releases/download/nightly/EchoMusic-Lyrics-WinIsland.exe";
 
 pub fn get_app_dir() -> PathBuf {
     let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".winisland");
+    path.push(".echomusic-lyrics-winisland");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }

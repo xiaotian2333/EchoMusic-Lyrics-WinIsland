@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 pub const APP_VERSION: &str = "1.0.0";
-pub const APP_AUTHOR: &str = "Eatgrapes";
-pub const APP_HOMEPAGE: &str = "https://github.com/Eatgrapes/WinIsland";
-pub const WINDOW_TITLE: &str = "WinIsland";
+pub const APP_AUTHOR: &str = "xiaotian2333";
+pub const APP_HOMEPAGE: &str = "https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland";
+pub const WINDOW_TITLE: &str = "EchoMusic-Lyrics-WinIsland";
 pub const TOP_OFFSET: i32 = 10;
 pub const PADDING: f32 = 80.0;
 

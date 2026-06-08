@@ -161,7 +161,7 @@ struct IslandLayout {
 
 impl App {
     fn set_aumid() {
-        let aumid = "WinIsland";
+        let aumid = "EchoMusic.Lyrics.WinIsland";
         let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: SetCurrentProcessExplicitAppUserModelID sets a process-wide string identifier.
         // The wide string is valid and null-terminated. Called once during init before any windows.
@@ -612,7 +612,7 @@ impl App {
     }
 
     fn close_settings_window() {
-        crate::utils::win32::close_window("WinIsland Settings");
+        crate::utils::win32::close_window("EchoMusic-Lyrics-WinIsland Settings");
     }
 
     fn handle_tray_events(&mut self, window: &Window, event_loop: &ActiveEventLoop) {

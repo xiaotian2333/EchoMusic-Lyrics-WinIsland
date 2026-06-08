@@ -326,7 +326,10 @@ impl SettingsApp {
                             self.config.check_for_updates = !self.config.check_for_updates
                         }
                         _ => {
-                            log::warn!("WinIsland: unhandled switch label: {}", label);
+                            log::warn!(
+                                "EchoMusic-Lyrics-WinIsland: unhandled switch label: {}",
+                                label
+                            );
                         }
                     }
                 }
@@ -584,7 +587,10 @@ impl SettingsApp {
                             }
                         }
                         _ => {
-                            log::warn!("WinIsland: unhandled switch label: {}", label);
+                            log::warn!(
+                                "EchoMusic-Lyrics-WinIsland: unhandled switch label: {}",
+                                label
+                            );
                         }
                     }
                 }

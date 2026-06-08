@@ -6,7 +6,7 @@ use windows::Win32::System::Registry::{
 use windows::core::w;
 
 pub fn set_autostart(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = w!("WinIsland");
+    let app_name = w!("EchoMusic-Lyrics-WinIsland");
     let sub_key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 
     if enabled {
@@ -51,7 +51,7 @@ pub fn set_autostart(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // SAFETY: RegCreateKeyExW opens HKEY_CURRENT_USER\Run for deletion.
         // The key path is a static string literal. RegDeleteValueW removes the
-        // WinIsland value. RegCloseKey properly closes the handle.
+        // EchoMusic-Lyrics-WinIsland value. RegCloseKey properly closes the handle.
         unsafe {
             let mut hkey = HKEY::default();
             if RegCreateKeyExW(

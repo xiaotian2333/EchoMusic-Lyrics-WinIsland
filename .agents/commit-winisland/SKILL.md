@@ -3,7 +3,7 @@ name: commit-winisland
 description: Generate a Conventional Commit message from the current git diff and commit. Use when the user says 'commit', '/commit', 'commit changes', or asks to create a git commit.
 license: MIT
 metadata:
-  project: WinIsland
+  project: EchoMusic-Lyrics-WinIsland
 ---
 
 Analyze the staged and unstaged changes, then generate a commit message following the project's existing style. The project uses **Conventional Commits** with optional scopes matching module names.

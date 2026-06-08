@@ -1,6 +1,6 @@
-# WinIsland — AI Agent Guide
+# EchoMusic-Lyrics-WinIsland — AI Agent Guide
 
-WinIsland is a **Dynamic Island for Windows**, written in Rust. It replicates the iPhone Dynamic Island experience on Windows, integrating with System Media Transport Controls (SMTC) to display now-playing media, real-time lyrics, audio spectrum visualization, and more.
+EchoMusic-Lyrics-WinIsland is a **Dynamic Island for Windows**, written in Rust. It replicates the iPhone Dynamic Island experience on Windows, integrating with System Media Transport Controls (SMTC) to display now-playing media, real-time lyrics, audio spectrum visualization, and more.
 
 ## Quick start
 

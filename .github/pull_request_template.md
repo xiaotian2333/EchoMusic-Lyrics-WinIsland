@@ -71,7 +71,7 @@
 
 > 提示：可引用 Issue 作为背景说明
 
-<!--为什么WinIsland需要这个变更？此pr解决了什么问题？-->
+<!--为什么 EchoMusic-Lyrics-WinIsland 需要这个变更？此pr解决了什么问题？-->
 
 ### 具体改动
 

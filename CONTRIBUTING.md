@@ -1,193 +1,191 @@
-# Contribution Guide
+# 贡献指南
+[English](../CONTRIBUTING.md) | 简体中文
 
-English | [简体中文](Docs/CONTRIBUTING-zh.md)
+感谢你对 EchoMusic-Lyrics-WinIsland 项目的关注！这份文档将帮助你了解如何为项目做出贡献。
 
-Thank you for your interest in the WinIsland project! This document will help you understand how to contribute.
+## PR 贡献范围
 
-## PR Contribution Scope
+对于非项目成员，你的 PR 可贡献范围如下：
 
-For non-project-members, your PR can cover the following areas:
+1. 已获得 `accepted` 标签的 Issue，你可以提交 PR。
+2. 文档、注释、代码清理（如 fix clippy warnings）、小幅 UI 调整等改动较小且明确的方向。
+3. 改动大的功能性 PR（如添加新功能、重构核心模块）需要先在 PR 中提出详细的设计方案，随后项目成员会进行review。
 
-1. Issues already labelled `accepted` — you may submit a PR for these.
-2. Documentation, comments, code cleanups (e.g. fixing clippy warnings), minor UI tweaks, and other small, well-defined changes.
-3. Feature PRs with a large diff (new features, refactoring core modules, etc.) require a detailed design proposal in the PR first; project members will then review it.
+⛔ 对于范围以外的 PR，项目成员**有权直接拒绝**。
 
-⛔ For PRs that fall outside this scope, project members **have the right to reject them directly**.
-
-> Our principle: **Any contribution should deliver more value to the project than the effort required to review it**. Please communicate with project members before starting work to avoid conflicting directions.
+> 我们的原则：**任何贡献对项目的价值都应大于审查它所需的工作量**。请在动手前与项目成员沟通，避免方向冲突。
 >
-> (Of course, if there has already been discussion in an issue, feel free to jump right in :P Just let us know :D)
+> (当然可能在issue中已经有了讨论，你可以直接动手:P 记得说一下就行:D)
 
-## Development Environment Requirements
+## 开发环境要求
 
-- **Rust**: 1.80+ (installation via [rustup](https://rustup.rs/) is recommended)
-- **Git**: latest version
-- **Windows**: WinIsland has a strong dependency on Windows APIs. Developing on Windows 10/11 (x86_64 or ARM64) is recommended.
+- **Rust**：1.80+（推荐通过 [rustup](https://rustup.rs/) 安装）
+- **Git**：最新版本
+- **Windows**：EchoMusic-Lyrics-WinIsland 强依赖 Windows API，建议在 Windows 10/11 开发（x86_64 或 ARM64）
 
-After the initial clone, run:
+首次克隆后运行：
 ```bash
 cargo build
 ```
 
-## Code Standards
+## 代码规范
 
-### Rust Code Style
+### Rust 代码风格
 
-**Formatting**: Must be run before committing:
+**格式化**：提交前必须运行
 ```bash
 cargo fmt --all
 ```
 
-**Linting**: All clippy checks must pass with no warnings allowed:
+**静态检查**：必须通过所有 clippy 检查，不允许警告
 ```bash
 cargo clippy --workspace -- -D warnings
 ```
 
-**Naming conventions**:
-- File names: `snake_case` (e.g. `audio_capture.rs`)
-- Functions/variables: `snake_case` (e.g. `get_media_info`)
-- Structs/enums/traits: `PascalCase` (e.g. `MediaInfo`, `AudioProcessor`)
-- Constants/statics: `SCREAMING_SNAKE_CASE` (e.g. `MAX_SAMPLE_RATE`)
+**命名规范**：
+- 文件名：`snake_case`（如 `audio_capture.rs`）
+- 函数/变量：`snake_case`（如 `get_media_info`）
+- 结构体/枚举/Trait：`PascalCase`（如 `MediaInfo`、`AudioProcessor`）
+- 常量/静态变量：`SCREAMING_SNAKE_CASE`（如 `MAX_SAMPLE_RATE`）
 
-**Comment conventions**:
-- Complex logic or `unsafe` blocks require inline comments explaining the reasoning.
-- Avoid meaningless comments (e.g. ones that simply repeat what the code says).
+**注释规范**：
+- 复杂逻辑或 `unsafe` 代码块需要行内注释解释原因
+- 避免无意义的注释（如重复代码内容）
 
-**Windows-specific**:
-- All Win32 API calls must be wrapped inside `unsafe {}` blocks.
-- Code involving windows, audio, or SMTC must pay attention to thread safety.
+**Windows 相关**：
+- 所有 Win32 API 调用必须包裹在 `unsafe {}` 块内
+- 涉及窗口、音频、SMTC 的代码需注意线程安全
 
-### Rendering (Skia)
+### 渲染相关（Skia）
 
-- When modifying drawing logic in `src/core/render.rs`, ensure the Skia surface has been properly initialized.
-- Drawing code should use the 2D APIs provided by `skia_safe`; do not manually write into pixel buffers.
-- Adding new icons: define Skia paths under `src/icons/`; do not hardcode SVGs elsewhere.
+- 在 `src/core/render.rs` 中修改绘制逻辑时，确保 Skia 表面已正确初始化
+- 绘制代码使用 `skia_safe` 提供的 2D API，不要手动写入像素缓冲区
+- 添加新图标：在 `src/icons/` 下定义 Skia 路径，不要在其它地方硬编码 SVG
 
-### Async Code
+### 异步代码
 
-- All async tasks should be started with `tokio::spawn`, for example updaters and audio capture.
-- When interacting with the winit event loop, use `tokio` channels or `winit::event_loop::EventLoopProxy` for cross-thread communication.
+- 所有异步任务使用 `tokio::spawn` 启动，例如更新器、音频捕获
+- 与 winit 事件循环交互时，使用 `tokio` 通道或 `winit::event_loop::EventLoopProxy` 进行线程间通信
 
-### ui Guidelines
-- All new/modified UI should follow Apple Design guidelines and maintain consistency with existing UI styles.
+### ui规范
+- 所有新添加/修改的ui都要按照Apple Design设计，保持和原有ui风格一致
 
-## Git Workflow
+## Git 工作流
 
-### Branch Naming
+### 分支命名
 
-- `feat/feature-name` — new feature
-- `fix/issue-description` — bug fix
-- `refactor/task-description` — refactoring
-- `chore/task-description` — chores (dependency updates, build config, etc.)
-- `docs/documentation-description` — documentation updates
+- `feat/功能名` - 新功能
+- `fix/问题描述` - Bug 修复
+- `refactor/任务描述` - 重构
+- `chore/任务描述` - 杂项（依赖更新、构建配置等）
+- `docs/文档说明` - 文档更新
 
-### Commit Conventions
+### Commit 规范
 
-This project enforces [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). Format:
+本项目强制使用 [约定式提交](https://www.conventionalcommits.org/zh-hans/)，格式：
 
 ```
 <type>: <subject>
 <type>(scope): <subject>
 ```
 
-`type` must be lowercase and can be one of:
+`type` 必须小写，可选值：
 
-- `feat`: A new feature
-- `fix`: A bug fix
-- `docs`: Documentation only changes
-- `style`: Code formatting (no logic change)
-- `refactor`: A code change that neither fixes a bug nor adds a feature
-- `perf`: A performance improvement
-- `test`: Adding or updating tests
-- `chore`: Build process, dependencies, etc.
-- `ci`: CI configuration changes
-- `revert`: Reverting a previous commit
+- `feat`: 新功能
+- `fix`: Bug 修复
+- `docs`: 文档更新
+- `style`: 代码格式（不影响逻辑）
+- `refactor`: 重构（非修复或功能）
+- `perf`: 性能优化
+- `test`: 测试相关
+- `chore`: 构建、依赖等杂务
+- `ci`: CI 配置变更
+- `revert`: 回滚提交
 
-**Examples**:
+**示例**：
 ```
-feat(smtc): support custom SMTC app filtering
-fix(render): fix rounded corner drawing issue in extended mode
-docs(contributing): supplement Skia rendering guidelines
+feat(smtc): 支持自定义 SMTC 应用过滤
+fix(render): 修复扩展模式下圆角绘制异常
+docs(contributing): 补充 Skia 渲染相关规范
 ```
 
-### Commit Checks
+### 提交校验
 
-The repository has automated checks configured:
+仓库配置了自动化检查：
 
-- `pre-commit`: runs `cargo fmt -- --check` to ensure correct formatting.
-- `commit-msg`: validates that the commit message follows the Conventional Commits format.
-- CI: runs clippy, format checks, builds, and tests (if any) once more.
+- `pre-commit`：运行 `cargo fmt -- --check`，确保格式正确
+- `commit-msg`：校验提交信息是否符合约定式提交格式
+- CI：再次执行 clippy、格式检查、构建和测试（如有）
 
-### What if my commit is blocked?
+### 提交被拦截怎么办？
 
-1. `cargo fmt` fails → run `cargo fmt --all`, then `git add` again.
-2. Commit message does not conform → rewrite it using the `<type>: description` format.
-3. Run self-checks beforehand: `cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings && cargo build`
+1. `cargo fmt` 失败 → 运行 `cargo fmt --all`，重新 `git add`
+2. 提交信息不符合规范 → 改为 `<type>: 描述` 格式
+3. 提前自检：运行 `cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings && cargo build`
 
-### Pull Request Process
+### Pull Request 流程
 
-1. Fork the repository and create a branch:
+1. Fork 仓库并创建分支：
    ```bash
    git checkout -b feat/your-feature
    ```
 
-2. Develop and self-check:
+2. 开发并自检：
    ```bash
    cargo fmt --all -- --check
    cargo clippy --workspace -- -D warnings
-   cargo build --release   # ensure the release build succeeds
+   cargo build --release   # 确保 release 编译通过
    ```
 
-3. Commit:
+3. 提交：
    ```bash
    git add .
-   git commit -s -m "feat(scope): feature description"
+   git commit -s -m "feat(scope): 功能描述"
    ```
 
-4. Push your branch and open a PR.
-    - Keep the PR title concise (≤70 characters). The description should include a summary of changes, testing instructions, and related issues.
-    - If you changed configuration items (`config.rs`), describe backward compatibility.
+4. 推送分支并发起 PR。
+    - PR 标题简洁（≤70 字符），描述包含变更摘要、测试方法和相关 Issue
+    - 如果修改了配置项（`config.rs`），说明向后兼容性
 
-## Code Review Standards
+## 代码审查标准
 
-### Must Meet
+### 必须满足
 
-- ✅ All CI checks pass
-- ✅ `cargo fmt` produces no diff
-- ✅ `cargo clippy` produces no warnings (`-D warnings`)
-- ✅ `cargo build --release` succeeds
-- ✅ Feature is complete and does not break existing SMTC monitoring or window behavior
-- ✅ `unsafe` blocks have adequate justification and their safety has been reviewed
+- ✅ 所有 CI 检查通过
+- ✅ `cargo fmt` 无差异
+- ✅ `cargo clippy` 无警告（`-D warnings`）
+- ✅ `cargo build --release` 成功
+- ✅ 功能完整且不会破坏已有的 SMTC 监听或窗口行为
+- ✅ `unsafe` 代码块有充分理由，且安全性已审核
 
-### Should Meet
+### 建议满足
 
-- Adequate comments and documentation
-- Tests added or updated for relevant modules (e.g. serialization tests in `src/core/config.rs`)
-- If there are UI changes, provide screenshots or describe animation effects (spring parameters, etc.)
+- 适当的注释和文档
+- 相关模块添加或更新测试（如 `src/core/config.rs` 中的序列化测试）
+- 如有 UI 变更，提供截图或描述动画效果（Spring 参数等）
 
-## FAQ
+## 常见问题
 
-### How do I run WinIsland?
+### 如何运行 EchoMusic-Lyrics-WinIsland？
 ```bash
-cargo run --package WinIsland --bin WinIsland --profile dev
+cargo run --package EchoMusic-Lyrics-WinIsland --bin EchoMusic-Lyrics-WinIsland --profile dev
 ```
-> Note: Only one instance can run at a time (protected by a Windows mutex).
+> 注意：同一时间只能运行一个实例（Windows 互斥锁保护）。
 
-### Too many clippy warnings?
+### clippy 警告太多怎么办？
 ```bash
 cargo clippy --fix --allow-dirty
 ```
 
-### How do I test audio visualization?
-- Play any audio that SMTC can recognize.
-- Check whether `src/core/audio.rs` behaves correctly (you can add temporary print statements during development).
+### 如何测试音频可视化？
+- 播放任意音频，确保 SMTC 可识别
+- 查看 `src/core/audio.rs` 是否正常（可在开发时添加临时打印）
 
-## Code of Conduct
+## 行为准则
 
-- Respect all contributors, and remain kind and professional.
-- Accept constructive feedback.
-- Help new contributors understand Windows APIs and Skia usage.
+- 尊重所有贡献者，保持友善和专业
+- 接受建设性反馈
+- 帮助新手贡献者理解 Windows API 和 Skia 的用法
 
 ---
-
-Thank you once again for your contribution! We look forward to your PR! If you have any questions, feel free to ask in an Issue or reach out to project members.
+再次感谢你的贡献！我们期待看到你的 PR！如果有任何问题，欢迎在 Issue 中提问或联系项目成员。

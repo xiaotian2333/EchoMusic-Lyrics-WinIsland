@@ -1,13 +1,13 @@
-# WinIsland
+# EchoMusic-Lyrics-WinIsland
 
 > [!WARNING]
 > 该项目仍在开发中，可能会出现错误。
 
 这是一个可以在 Windows 上以灵动岛形式显示歌词的项目。  
-此项目是基于[WinIsland](https://github.com/Eatgrapes/WinIsland/tree/ab7254285b2532441b0f69a2a050fcce478bead7)的硬fork，适用于EchoMusic
+EchoMusic-Lyrics-WinIsland 是基于 [WinIsland](https://github.com/Eatgrapes/WinIsland/tree/ab7254285b2532441b0f69a2a050fcce478bead7) 的硬 fork，适用于 EchoMusic
 
 ## 下载
-你可以在 [Release](https://github.com/xiaotian2333/WinIsland/releases) 下载WinIsland
+你可以在 [Release](https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland/releases) 下载 EchoMusic-Lyrics-WinIsland
 
 ## 构建项目
 
@@ -15,9 +15,9 @@
 - **Cargo**
 
 ```cmd
-git clone https://github.com/xiaotian2333/WinIsland.git
+git clone https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland.git
 
-cd WinIsland
+cd EchoMusic-Lyrics-WinIsland
 
 cargo build --release
 ```

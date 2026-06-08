@@ -1,8 +1,8 @@
-# WinIsland Architecture
+# EchoMusic-Lyrics-WinIsland Architecture
 
 ## Overview
 
-WinIsland is a Windows desktop application that creates a Dynamic Island overlay — a translucent, always-on-top island that displays media playback info, lyrics, and audio visualization. Built entirely in Rust with Skia for GPU-accelerated rendering.
+EchoMusic-Lyrics-WinIsland is a Windows desktop application that creates a Dynamic Island overlay — a translucent, always-on-top island that displays media playback info, lyrics, and audio visualization. Built entirely in Rust with Skia for GPU-accelerated rendering.
 
 - **Window system**: winit + softbuffer
 - **Rendering**: skia-safe (Skia canvas API)
@@ -21,7 +21,7 @@ src/
 │   ├── config.rs      AppConfig struct and defaults
 │   ├── i18n.rs        Translation system (key-value .lang files)
 │   ├── lyrics.rs      Async lyrics fetcher (NetEase, lrclib, local .lrc)
-│   ├── persistence.rs Config save/load (~/.winisland/config.toml)
+│   ├── persistence.rs Config save/load (~/.echomusic-lyrics-winisland/config.toml)
 │   ├── render.rs      Main draw_island() — all Skia rendering lives here
 │   └── smtc.rs        SMTC session manager — polls media info, handles commands
 ├── icons/             Custom Skia path icons (arrows, controls, music, settings)
@@ -125,7 +125,7 @@ All calls are in `unsafe` blocks with detailed `// SAFETY:` comments.
 
 ## Configuration
 
-Stored as TOML at `~/.winisland/config.toml`:
+Stored as TOML at `~/.echomusic-lyrics-winisland/config.toml`:
 
 - Window dimensions (compact/expanded)
 - Visual style (default/glass/mica/dynamic/liquid_glass)

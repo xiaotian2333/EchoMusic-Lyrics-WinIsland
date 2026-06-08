@@ -651,7 +651,7 @@ impl SettingsApp {
             },
             SettingsItem::Spacer { height: 20.0 },
             SettingsItem::CenterText {
-                text: "WinIsland".to_string(),
+                text: "EchoMusic-Lyrics-WinIsland".to_string(),
                 size: 28.0,
                 color: theme.text_pri,
             },
@@ -1252,7 +1252,7 @@ impl ApplicationHandler for SettingsApp {
         };
 
         let attrs = Window::default_attributes()
-            .with_title("WinIsland Settings")
+            .with_title("EchoMusic-Lyrics-WinIsland Settings")
             .with_inner_size(LogicalSize::new(WIN_W as f64, WIN_H as f64))
             .with_min_inner_size(LogicalSize::new(WIN_W as f64, WIN_H as f64))
             .with_position(LogicalPosition::new(win_x, win_y))
@@ -1556,7 +1556,7 @@ impl ApplicationHandler for SettingsApp {
                 let h = OpenMutexW(
                     MUTEX_ALL_ACCESS,
                     false,
-                    w!("Local\\WinIsland_SingleInstance_Mutex"),
+                    w!("Local\\EchoMusic_Lyrics_WinIsland_SingleInstance_Mutex"),
                 );
                 if let Ok(handle) = h {
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
@@ -1634,7 +1634,7 @@ pub fn run_settings(config: AppConfig) {
 }
 
 pub fn bring_settings_to_front() {
-    crate::utils::win32::bring_window_to_front("WinIsland Settings");
+    crate::utils::win32::bring_window_to_front("EchoMusic-Lyrics-WinIsland Settings");
 }
 
 fn resize_surface(surface: &mut Surface<Arc<Window>, Arc<Window>>, width: u32, height: u32) {
