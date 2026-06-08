@@ -48,6 +48,7 @@ pub enum SettingsItem {
         btn_label: String,
         reset_label: Option<String>,
     },
+    #[allow(dead_code)]
     RowFolderPicker {
         label: String,
         btn_label: String,

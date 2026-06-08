@@ -1,4 +1,5 @@
-use crate::core::lyrics::{LyricLine, fetch_lyrics};
+use crate::core::lyrics::{LyricLine, TrackLyrics};
+use crate::core::lyrics_ws::{LyricsWsEvent, LyricsWsHandle, start_lyrics_ws_server};
 use crate::core::persistence::{load_config, save_config};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,39 +99,33 @@ pub struct SmtcListener {
     info_rx: watch::Receiver<MediaInfo>,
     seek_tx: mpsc::UnboundedSender<u64>,
     playback_tx: mpsc::UnboundedSender<PlaybackCommand>,
-    lyrics_source_tx: mpsc::UnboundedSender<String>,
-    lyrics_fallback_tx: mpsc::UnboundedSender<bool>,
-    lyrics_local_dir_tx: mpsc::UnboundedSender<Option<String>>,
     allowed_apps_tx: mpsc::UnboundedSender<Vec<String>>,
+    lyrics_ws_handle: LyricsWsHandle,
     cancel_token: CancellationToken,
 }
 
 impl SmtcListener {
-    pub fn new(source: String, fallback: bool, allowed: Vec<String>) -> Self {
+    pub fn new(allowed: Vec<String>) -> Self {
         let (info_tx, info_rx) = watch::channel(MediaInfo::default());
         let (seek_tx, seek_rx) = mpsc::unbounded_channel();
         let (playback_tx, playback_rx) = mpsc::unbounded_channel();
-        let (lyrics_source_tx, lyrics_source_rx) = mpsc::unbounded_channel();
-        let (lyrics_fallback_tx, lyrics_fallback_rx) = mpsc::unbounded_channel();
-        let (lyrics_local_dir_tx, lyrics_local_dir_rx) = mpsc::unbounded_channel();
         let (allowed_apps_tx, allowed_apps_rx) = mpsc::unbounded_channel();
+        let (lyrics_event_tx, lyrics_event_rx) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
+        let lyrics_ws_handle = start_lyrics_ws_server(lyrics_event_tx, cancel_token.clone());
 
-        let _ = lyrics_source_tx.send(source);
-        let _ = lyrics_fallback_tx.send(fallback);
-        let _ = lyrics_local_dir_tx.send(load_config().lyrics_local_dir);
         let _ = allowed_apps_tx.send(allowed);
 
         let cancel = cancel_token.clone();
+        let poll_lyrics_ws_handle = lyrics_ws_handle.clone();
         tokio::task::spawn_blocking(move || {
             smtc_poll_loop(
                 info_tx,
                 seek_rx,
                 playback_rx,
-                lyrics_source_rx,
-                lyrics_fallback_rx,
-                lyrics_local_dir_rx,
                 allowed_apps_rx,
+                lyrics_event_rx,
+                poll_lyrics_ws_handle,
                 cancel,
             );
         });
@@ -139,10 +134,8 @@ impl SmtcListener {
             info_rx,
             seek_tx,
             playback_tx,
-            lyrics_source_tx,
-            lyrics_fallback_tx,
-            lyrics_local_dir_tx,
             allowed_apps_tx,
+            lyrics_ws_handle,
             cancel_token,
         }
     }
@@ -151,24 +144,13 @@ impl SmtcListener {
         let _ = self.allowed_apps_tx.send(apps);
     }
 
-    pub fn set_lyrics_source(&self, source: String) {
-        let _ = self.lyrics_source_tx.send(source);
-    }
-
-    pub fn set_lyrics_fallback(&self, fallback: bool) {
-        let _ = self.lyrics_fallback_tx.send(fallback);
-    }
-
-    pub fn set_lyrics_local_dir(&self, dir: Option<String>) {
-        let _ = self.lyrics_local_dir_tx.send(dir);
-    }
-
     pub fn get_info(&self) -> MediaInfo {
         self.info_rx.borrow().clone()
     }
 
     pub fn request_seek(&self, position_ms: u64) {
         let _ = self.seek_tx.send(position_ms);
+        self.lyrics_ws_handle.seek(position_ms);
     }
 
     pub fn request_toggle_play(&self) {
@@ -195,10 +177,9 @@ fn smtc_poll_loop(
     info_tx: watch::Sender<MediaInfo>,
     mut seek_rx: mpsc::UnboundedReceiver<u64>,
     mut playback_rx: mpsc::UnboundedReceiver<PlaybackCommand>,
-    mut lyrics_source_rx: mpsc::UnboundedReceiver<String>,
-    mut lyrics_fallback_rx: mpsc::UnboundedReceiver<bool>,
-    mut lyrics_local_dir_rx: mpsc::UnboundedReceiver<Option<String>>,
     mut allowed_apps_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    mut lyrics_event_rx: mpsc::UnboundedReceiver<LyricsWsEvent>,
+    lyrics_ws_handle: LyricsWsHandle,
     cancel: CancellationToken,
 ) {
     // SAFETY: CoInitializeEx initializes COM for this thread. We use
@@ -235,21 +216,9 @@ fn smtc_poll_loop(
     let _ = manager.SessionsChanged(&handler);
 
     // Local state mirrored from channels
-    let mut current_lyrics_source: String = "163".to_string();
-    let mut current_lyrics_fallback: bool = true;
-    let mut current_lyrics_local_dir: Option<String> = None;
     let mut current_allowed_apps: Vec<String> = Vec::new();
 
     // Drain initial config values from channels
-    while let Ok(src) = lyrics_source_rx.try_recv() {
-        current_lyrics_source = src;
-    }
-    while let Ok(fb) = lyrics_fallback_rx.try_recv() {
-        current_lyrics_fallback = fb;
-    }
-    while let Ok(dir) = lyrics_local_dir_rx.try_recv() {
-        current_lyrics_local_dir = dir;
-    }
     while let Ok(apps) = allowed_apps_rx.try_recv() {
         current_allowed_apps = apps;
     }
@@ -262,9 +231,7 @@ fn smtc_poll_loop(
         update_media_info(
             &manager,
             &info_tx,
-            &current_lyrics_source,
-            current_lyrics_fallback,
-            current_lyrics_local_dir.as_deref(),
+            &lyrics_ws_handle,
             &mut current_allowed_apps,
             true,
         );
@@ -300,72 +267,19 @@ fn smtc_poll_loop(
             last_manager_refresh = Instant::now();
         }
 
+        // Drain WebSocket lyric events
+        while let Ok(event) = lyrics_event_rx.try_recv() {
+            match event {
+                LyricsWsEvent::Connected | LyricsWsEvent::Subscribe => {
+                    lyrics_ws_handle.request_track_lyrics();
+                }
+                LyricsWsEvent::TrackLyrics(track_lyrics) => {
+                    apply_track_lyrics(&info_tx, track_lyrics);
+                }
+            }
+        }
+
         // Drain config channels
-        while let Ok(src) = lyrics_source_rx.try_recv() {
-            if src != current_lyrics_source {
-                current_lyrics_source = src;
-                // Re-fetch lyrics for current song on source change
-                let info = info_tx.borrow();
-                if !info.title.is_empty() {
-                    let title = info.title.clone();
-                    let artist = info.artist.clone();
-                    let duration = info.duration_secs;
-                    let src = current_lyrics_source.clone();
-                    let fb = current_lyrics_fallback;
-                    let info_tx_clone = info_tx.clone();
-                    let local_dir = current_lyrics_local_dir.clone();
-                    drop(info);
-                    tokio::spawn(async move {
-                        if let Some(lyrics) =
-                            fetch_lyrics(&title, &artist, duration, &src, fb, local_dir.as_deref())
-                                .await
-                        {
-                            let current = info_tx_clone.borrow();
-                            if current.title == title && current.artist == artist {
-                                drop(current);
-                                let mut new_info = info_tx_clone.borrow().clone();
-                                new_info.lyrics = Some(lyrics);
-                                let _ = info_tx_clone.send(new_info);
-                            }
-                        }
-                    });
-                }
-            }
-        }
-        while let Ok(fb) = lyrics_fallback_rx.try_recv() {
-            current_lyrics_fallback = fb;
-        }
-        while let Ok(dir) = lyrics_local_dir_rx.try_recv() {
-            if dir != current_lyrics_local_dir {
-                current_lyrics_local_dir = dir;
-                // Re-fetch lyrics for current song when local dir changes
-                let info = info_tx.borrow();
-                if !info.title.is_empty() {
-                    let title = info.title.clone();
-                    let artist = info.artist.clone();
-                    let duration = info.duration_secs;
-                    let src = current_lyrics_source.clone();
-                    let fb = current_lyrics_fallback;
-                    let info_tx_clone = info_tx.clone();
-                    let local_dir = current_lyrics_local_dir.clone();
-                    drop(info);
-                    tokio::spawn(async move {
-                        if let Some(lyrics) =
-                            fetch_lyrics(&title, &artist, duration, &src, fb, local_dir.as_deref())
-                                .await
-                        {
-                            let current = info_tx_clone.borrow();
-                            if current.title == title && current.artist == artist {
-                                drop(current);
-                                let mut new_info = info_tx_clone.borrow().clone();
-                                new_info.lyrics = Some(lyrics);
-                                let _ = info_tx_clone.send(new_info);
-                            }
-                        }
-                    });
-                }
-            }
-        }
         while let Ok(apps) = allowed_apps_rx.try_recv() {
             current_allowed_apps = apps;
         }
@@ -418,9 +332,7 @@ fn smtc_poll_loop(
             update_media_info(
                 &current_manager,
                 &info_tx,
-                &current_lyrics_source,
-                current_lyrics_fallback,
-                current_lyrics_local_dir.as_deref(),
+                &lyrics_ws_handle,
                 &mut current_allowed_apps,
                 true,
             );
@@ -437,9 +349,7 @@ fn smtc_poll_loop(
             update_media_info(
                 &current_manager,
                 &info_tx,
-                &current_lyrics_source,
-                current_lyrics_fallback,
-                current_lyrics_local_dir.as_deref(),
+                &lyrics_ws_handle,
                 &mut current_allowed_apps,
                 do_auto_allow,
             );
@@ -453,9 +363,7 @@ fn smtc_poll_loop(
 fn update_media_info(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     info_tx: &watch::Sender<MediaInfo>,
-    lyrics_source: &str,
-    lyrics_fallback: bool,
-    local_dir: Option<&str>,
+    lyrics_ws_handle: &LyricsWsHandle,
     allowed_apps: &mut Vec<String>,
     auto_allow: bool,
 ) {
@@ -464,7 +372,7 @@ fn update_media_info(
     }
 
     if let Some(session) = get_target_session(manager, allowed_apps) {
-        let _ = fetch_properties(&session, info_tx, lyrics_source, lyrics_fallback, local_dir);
+        let _ = fetch_properties(&session, info_tx, lyrics_ws_handle);
     } else {
         let info = info_tx.borrow();
         if !info.title.is_empty() {
@@ -472,6 +380,73 @@ fn update_media_info(
             let _ = info_tx.send(MediaInfo::default());
         }
     }
+}
+
+fn normalize_match_text(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn text_matches(left: &str, right: &str) -> bool {
+    let left = normalize_match_text(left);
+    let right = normalize_match_text(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right || left.contains(&right) || right.contains(&left)
+}
+
+fn artist_matches(track: &TrackLyrics, media_artist: &str) -> bool {
+    if media_artist.trim().is_empty()
+        || (track.artist.trim().is_empty() && track.artists.is_empty())
+    {
+        return true;
+    }
+    if text_matches(&track.artist, media_artist) {
+        return true;
+    }
+    track
+        .artists
+        .iter()
+        .any(|artist| text_matches(artist, media_artist))
+}
+
+fn apply_track_lyrics(info_tx: &watch::Sender<MediaInfo>, track_lyrics: TrackLyrics) {
+    let current = info_tx.borrow();
+    if current.title.trim().is_empty() {
+        return;
+    }
+    if !text_matches(&track_lyrics.title, &current.title) {
+        log::debug!(
+            "已丢弃不匹配歌词: {:?} {} - {}，当前曲目: {} - {}",
+            track_lyrics.track_id,
+            track_lyrics.title,
+            track_lyrics.artist,
+            current.title,
+            current.artist
+        );
+        return;
+    }
+    if !artist_matches(&track_lyrics, &current.artist) {
+        log::debug!(
+            "已丢弃歌手不匹配歌词: {:?} {} - {}，当前曲目: {} - {}",
+            track_lyrics.track_id,
+            track_lyrics.title,
+            track_lyrics.artist,
+            current.title,
+            current.artist
+        );
+        return;
+    }
+
+    drop(current);
+    let mut new_info = info_tx.borrow().clone();
+    new_info.lyrics = Some(track_lyrics.lyrics);
+    let _ = info_tx.send(new_info);
 }
 
 fn auto_allow_new_apps(
@@ -596,9 +571,7 @@ fn is_music_session(session: &GlobalSystemMediaTransportControlsSession) -> bool
 fn fetch_properties(
     session: &GlobalSystemMediaTransportControlsSession,
     info_tx: &watch::Sender<MediaInfo>,
-    lyrics_source: &str,
-    lyrics_fallback: bool,
-    local_dir: Option<&str>,
+    lyrics_ws_handle: &LyricsWsHandle,
 ) -> windows::core::Result<()> {
     if !is_music_session(session) {
         let info = info_tx.borrow();
@@ -653,7 +626,7 @@ fn fetch_properties(
     let new_title = props.Title()?.to_string();
     let new_artist = props.Artist()?.to_string();
     let new_album = props.AlbumTitle()?.to_string();
-    let mut should_fetch_lyrics = false;
+    let mut should_request_lyrics = false;
     let mut should_fetch_thumbnail = false;
 
     {
@@ -675,7 +648,7 @@ fn fetch_properties(
             info.last_smtc_pos = smtc_pos;
             info.last_update = Instant::now();
             info.last_thumbnail_fetch = Instant::now();
-            should_fetch_lyrics = true;
+            should_request_lyrics = true;
             should_fetch_thumbnail = true;
         } else if (info.is_playing != is_playing
             && info.thumbnail.is_none()
@@ -720,7 +693,7 @@ fn fetch_properties(
         let session_clone = session.clone();
         let title_clone = new_title.clone();
         let artist_clone = new_artist.clone();
-        let is_song_change = should_fetch_lyrics;
+        let is_song_change = should_request_lyrics;
         tokio::task::spawn_blocking(move || {
             if is_song_change {
                 std::thread::sleep(Duration::from_millis(800));
@@ -787,33 +760,8 @@ fn fetch_properties(
         });
     }
 
-    if should_fetch_lyrics {
-        let info_tx_clone = info_tx.clone();
-        let title = new_title.clone();
-        let artist = new_artist.clone();
-        let src = lyrics_source.to_string();
-        let fb = lyrics_fallback;
-        let local_dir = local_dir.map(|s| s.to_string());
-        tokio::spawn(async move {
-            if let Some(lyrics) = fetch_lyrics(
-                &title,
-                &artist,
-                duration_secs,
-                &src,
-                fb,
-                local_dir.as_deref(),
-            )
-            .await
-            {
-                let current = info_tx_clone.borrow();
-                if current.title == title && current.artist == artist {
-                    drop(current);
-                    let mut new_info = info_tx_clone.borrow().clone();
-                    new_info.lyrics = Some(lyrics);
-                    let _ = info_tx_clone.send(new_info);
-                }
-            }
-        });
+    if should_request_lyrics {
+        lyrics_ws_handle.request_track_lyrics();
     }
     Ok(())
 }

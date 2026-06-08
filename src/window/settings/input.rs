@@ -20,9 +20,6 @@ impl SettingsApp {
             if let Some(i) = popup.hit_test_item(mx, my) {
                 let value = popup.values[i].clone();
                 match popup.kind {
-                    PopupKind::LyricsSource => {
-                        self.config.lyrics_source = value;
-                    }
                     PopupKind::Language => {
                         self.config.language = value;
                         set_lang(&self.config.language);
@@ -468,7 +465,6 @@ impl SettingsApp {
                     self.config.check_for_updates,
                     self.config.smtc_enabled,
                     self.config.show_lyrics,
-                    self.config.lyrics_fallback,
                     self.config.lyrics_scroll,
                 ]);
                 changed = true;
@@ -493,11 +489,6 @@ impl SettingsApp {
         width: f32,
         start_y: f32,
     ) {
-        let scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor() as f32)
-            .unwrap_or(1.0);
         let result = hit_test(items, mx, my, start_y, width);
         let mut changed = false;
 
@@ -518,11 +509,6 @@ impl SettingsApp {
                         l if l == tr("show_lyrics") => {
                             self.config.show_lyrics = !self.config.show_lyrics
                         }
-                        l if l == tr("lyrics_fallback") => {
-                            if self.config.show_lyrics {
-                                self.config.lyrics_fallback = !self.config.lyrics_fallback
-                            }
-                        }
                         l if l == tr("lyrics_scroll") => {
                             if self.config.show_lyrics {
                                 self.config.lyrics_scroll = !self.config.lyrics_scroll
@@ -535,48 +521,6 @@ impl SettingsApp {
                 }
                 self.sync_switch_targets();
                 changed = true;
-            }
-            ClickResult::SourceButton(idx) => {
-                let content_w = width;
-                let mut btn_content_y = start_y;
-                for item in items.iter().take(idx) {
-                    btn_content_y += item.height();
-                }
-                let cy = btn_content_y + ROW_HEIGHT / 2.0;
-                let btn_x = SIDEBAR_W + CONTENT_PADDING + content_w - GROUP_INNER_PAD - POPUP_BTN_W;
-                let btn_y = cy - POPUP_BTN_H / 2.0 - self.scroll_y;
-
-                let source = &self.config.lyrics_source;
-                self.popup = Some(PopupState::new(
-                    PopupKind::LyricsSource,
-                    Rect::from_xywh(btn_x, btn_y, POPUP_BTN_W, POPUP_BTN_H),
-                    vec!["163".to_string(), "LRCLIB".to_string()],
-                    vec!["163".to_string(), "lrclib".to_string()],
-                    if source == "163" { 0 } else { 1 },
-                    self.win_w / scale,
-                    self.win_h / scale,
-                ));
-                self.anim.set_with_speed(POPUP_OPACITY_KEY, 1.0, 0.25);
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
-            }
-            ClickResult::FolderSelect(idx) => {
-                if let Some(SettingsItem::RowFolderPicker { label, .. }) = items.get(idx)
-                    && label == &tr("lyrics_local_dir")
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.config.lyrics_local_dir = Some(path.to_string_lossy().into_owned());
-                    changed = true;
-                }
-            }
-            ClickResult::FolderClear(idx) => {
-                if let Some(SettingsItem::RowFolderPicker { label, .. }) = items.get(idx)
-                    && label == &tr("lyrics_local_dir")
-                {
-                    self.config.lyrics_local_dir = None;
-                    changed = true;
-                }
             }
             ClickResult::StepperDec(idx) | ClickResult::StepperInc(idx) => {
                 let is_dec = matches!(result, ClickResult::StepperDec(_));

@@ -39,7 +39,6 @@ const SCROLL_DAMPING: f32 = 16.0;
 
 #[derive(Clone, PartialEq)]
 enum PopupKind {
-    LyricsSource,
     Language,
     Monitor,
     IslandStyle,
@@ -197,7 +196,6 @@ impl SettingsApp {
             config.check_for_updates,
             config.smtc_enabled,
             config.show_lyrics,
-            config.lyrics_fallback,
             config.lyrics_scroll,
         ]);
         Self {
@@ -535,7 +533,6 @@ impl SettingsApp {
     fn build_music_items(&self) -> Vec<SettingsItem> {
         let show_lyrics = self.config.show_lyrics;
         let enabled = self.config.smtc_enabled;
-        let source = &self.config.lyrics_source;
 
         let mut items = vec![
             SettingsItem::PageTitle {
@@ -560,22 +557,11 @@ impl SettingsApp {
                 on: self.config.show_lyrics,
                 enabled: true,
             },
-            SettingsItem::RowSourceSelect {
-                label: tr("lyrics_source"),
-                options: vec![
-                    ("163".to_string(), source == "163"),
-                    ("LRCLIB".to_string(), source == "lrclib"),
-                ],
-                enabled: show_lyrics,
+            SettingsItem::RowLabel {
+                label: tr("lyrics_ws_source"),
             },
-            SettingsItem::RowSwitch {
-                label: tr("lyrics_fallback"),
-                on: if show_lyrics {
-                    self.config.lyrics_fallback
-                } else {
-                    false
-                },
-                enabled: show_lyrics,
+            SettingsItem::RowLabel {
+                label: tr("lyrics_ws_address"),
             },
             SettingsItem::RowStepper {
                 label: tr("lyrics_delay"),
@@ -595,22 +581,6 @@ impl SettingsApp {
                 label: tr("lyrics_scroll_max_width"),
                 value: format!("{}", self.config.lyrics_scroll_max_width as i32),
                 enabled: show_lyrics && self.config.lyrics_scroll,
-            },
-            SettingsItem::RowFolderPicker {
-                label: tr("lyrics_local_dir"),
-                btn_label: tr("folder_select"),
-                clear_label: self
-                    .config
-                    .lyrics_local_dir
-                    .as_ref()
-                    .filter(|p| !p.is_empty())
-                    .map(|_| tr("folder_clear")),
-                current_path: self
-                    .config
-                    .lyrics_local_dir
-                    .clone()
-                    .filter(|p| !p.is_empty()),
-                enabled: show_lyrics,
             },
             SettingsItem::GroupEnd,
             SettingsItem::SectionHeader {
@@ -780,18 +750,12 @@ impl SettingsApp {
             .set_target(8, self.config.check_for_updates);
         self.switch_anim.set_target(9, self.config.smtc_enabled);
         self.switch_anim.set_target(10, self.config.show_lyrics);
-        let fb_on = if self.config.show_lyrics {
-            self.config.lyrics_fallback
-        } else {
-            false
-        };
-        self.switch_anim.set_target(11, fb_on);
         let fw_on = if self.config.show_lyrics {
             self.config.lyrics_scroll
         } else {
             false
         };
-        self.switch_anim.set_target(12, fw_on);
+        self.switch_anim.set_target(11, fw_on);
     }
 
     fn update_detected_apps(&mut self) {
@@ -1230,7 +1194,7 @@ impl SettingsApp {
                 2 => SwitchAnimator::new_with_anims(&self.switch_anim, &[6, 7, 8]),
                 _ => SwitchAnimator::new(&[]),
             },
-            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10, 11, 12]),
+            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10, 11]),
             _ => SwitchAnimator::new(&[]),
         }
     }
