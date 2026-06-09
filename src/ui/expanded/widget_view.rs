@@ -344,7 +344,7 @@ pub fn draw_widget_page(
             let text_x = lyric_area_left + 2.0 * scale - current_scroll_offset;
             draw_text_cached(DrawTextCachedParams {
                 canvas,
-                text: &line_text,
+                text: line_text,
                 x: text_x,
                 y: line_y,
                 size: font_sz,
@@ -353,10 +353,10 @@ pub fn draw_widget_page(
             });
         } else {
             let lw =
-                FontManager::global().measure_text_cached(&line_text, font_sz, FontStyle::normal());
+                FontManager::global().measure_text_cached(line_text, font_sz, FontStyle::normal());
             draw_text_cached(DrawTextCachedParams {
                 canvas,
-                text: &line_text,
+                text: line_text,
                 x: center_x - lw / 2.0,
                 y: line_y,
                 size: font_sz,

@@ -136,7 +136,8 @@ impl From<LyricsFilterScope> for String {
 pub const DEFAULT_LYRICS_FILTER_REGEX: &str = r"^([^：]*)：.*$|^([^:]*):.*$|^([^翻唱]*)翻唱.*$|^([^许可]*)许可.*$|^([^音乐人]*)音乐人.*$|^([^国风]*)国风.*$|^([^纯音乐]*)纯音乐.*$|^([^星曜计划]*)星曜计划.*$";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppConfig {
-    pub global_scale: f32,
+    pub non_expanded_scale: f32,
+    pub expanded_scale: f32,
     pub base_width: f32,
     pub base_height: f32,
     pub expanded_width: f32,
@@ -304,7 +305,8 @@ fn default_mini_controls() -> bool {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            global_scale: 1.0,
+            non_expanded_scale: 1.0,
+            expanded_scale: 1.0,
             base_width: 120.0,
             base_height: 27.0,
             expanded_width: 360.0,

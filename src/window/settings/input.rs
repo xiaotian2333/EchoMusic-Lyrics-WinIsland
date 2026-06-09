@@ -208,15 +208,28 @@ impl SettingsApp {
                     && let SettingsItem::RowStepper { label, .. } = item
                 {
                     let l = label.clone();
-                    if l == tr("global_scale") {
+                    if l == tr("non_expanded_scale") {
                         if is_dec {
-                            self.config.global_scale =
-                                ((self.config.global_scale - 0.05) * 100.0).round() / 100.0;
-                            self.config.global_scale = self.config.global_scale.max(0.5);
+                            self.config.non_expanded_scale =
+                                ((self.config.non_expanded_scale - 0.05) * 100.0).round() / 100.0;
+                            self.config.non_expanded_scale =
+                                self.config.non_expanded_scale.max(0.5);
                         } else {
-                            self.config.global_scale =
-                                ((self.config.global_scale + 0.05) * 100.0).round() / 100.0;
-                            self.config.global_scale = self.config.global_scale.min(5.0);
+                            self.config.non_expanded_scale =
+                                ((self.config.non_expanded_scale + 0.05) * 100.0).round() / 100.0;
+                            self.config.non_expanded_scale =
+                                self.config.non_expanded_scale.min(5.0);
+                        }
+                        changed = true;
+                    } else if l == tr("expanded_scale") {
+                        if is_dec {
+                            self.config.expanded_scale =
+                                ((self.config.expanded_scale - 0.05) * 100.0).round() / 100.0;
+                            self.config.expanded_scale = self.config.expanded_scale.max(0.5);
+                        } else {
+                            self.config.expanded_scale =
+                                ((self.config.expanded_scale + 0.05) * 100.0).round() / 100.0;
+                            self.config.expanded_scale = self.config.expanded_scale.min(5.0);
                         }
                         changed = true;
                     } else if l == tr("base_width") {

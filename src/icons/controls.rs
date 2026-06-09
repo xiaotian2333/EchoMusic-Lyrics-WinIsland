@@ -44,7 +44,7 @@ pub fn draw_control_triangle(
     cy: f32,
     alpha: u8,
     path_scale: f32,
-    global_scale: f32,
+    scale: f32,
     color: Color,
 ) {
     let mut paint = Paint::default();
@@ -57,7 +57,7 @@ pub fn draw_control_triangle(
     if let Some(path) = Path::from_svg(path_data) {
         canvas.save();
         canvas.translate((cx, cy));
-        let s = path_scale * global_scale;
+        let s = path_scale * scale;
         canvas.scale((s, s));
         canvas.translate((-336.0, -320.0));
         canvas.draw_path(&path, &paint);

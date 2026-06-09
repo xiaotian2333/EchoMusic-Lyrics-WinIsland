@@ -817,8 +817,6 @@ pub fn draw_items(params: DrawItemsParams<'_>) {
                         theme.disabled
                     } else if *invalid {
                         Color::from_argb(40, theme.danger.r(), theme.danger.g(), theme.danger.b())
-                    } else if *focused {
-                        theme.card_highlight
                     } else {
                         theme.card_highlight
                     });
@@ -851,9 +849,7 @@ pub fn draw_items(params: DrawItemsParams<'_>) {
                         display.push('|');
                     }
                     let display = truncate_text(fm, &display, 12.0, input_w - 12.0);
-                    p.set_color(if !*enabled {
-                        theme.text_sec
-                    } else if value.is_empty() {
+                    p.set_color(if !*enabled || value.is_empty() {
                         theme.text_sec
                     } else if *invalid {
                         theme.danger

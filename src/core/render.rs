@@ -35,7 +35,8 @@ pub struct LayoutParams {
     pub sigmas: (f32, f32),
     pub expansion_progress: f32,
     pub view_offset: f32,
-    pub global_scale: f32,
+    pub non_expanded_scale: f32,
+    pub expanded_scale: f32,
     pub hide_progress: f32,
     pub dock_position: DockPosition,
 }
@@ -105,7 +106,8 @@ pub fn draw_island(
         sigmas,
         expansion_progress,
         view_offset,
-        global_scale,
+        non_expanded_scale,
+        expanded_scale,
         hide_progress,
         dock_position,
     } = layout;
@@ -171,7 +173,7 @@ pub fn draw_island(
     } else {
         PADDING / 2.0
     };
-    let hidden_peek_h = (5.0 * global_scale).max(3.0);
+    let hidden_peek_h = (5.0 * non_expanded_scale).max(3.0);
     let hide_distance = if dock_bottom {
         (current_h - hidden_peek_h).max(0.0)
     } else {
@@ -280,7 +282,8 @@ pub fn draw_island(
             screen_y,
             current_w as u32,
             current_h as u32,
-            40.0 * global_scale,
+            40.0 * (non_expanded_scale
+                + (expanded_scale - non_expanded_scale) * expansion_progress),
         ) {
             let mut paint = Paint::default();
             paint.set_anti_alias(true);
@@ -383,9 +386,9 @@ pub fn draw_island(
             media,
             music_active,
             view_offset,
-            scale: global_scale,
+            scale: expanded_scale,
             expansion_progress,
-            viz_h_scale: viz_h_scale * global_scale,
+            viz_h_scale: viz_h_scale * expanded_scale,
             use_blur,
             font_size,
             cover_shape: expanded_cover_shape,
@@ -406,7 +409,7 @@ pub fn draw_island(
             current_w,
             current_h,
             alpha,
-            global_scale,
+            expanded_scale,
             media,
             font_size,
             lyrics_delay,
@@ -424,19 +427,19 @@ pub fn draw_island(
         }
         canvas.restore();
     }
-    if mini_alpha_f > 0.01 && current_w > 45.0 * global_scale && music_active {
+    if mini_alpha_f > 0.01 && current_w > 45.0 * non_expanded_scale && music_active {
         let alpha = (mini_alpha_f * 255.0) as u8;
         if let Some(image) = get_cached_media_image(media) {
-            let base_size = 18.0 * global_scale;
+            let base_size = 18.0 * non_expanded_scale;
             let (size, ix, iy) = if mini_cover_shape == "circle" {
                 let s = base_size * 1.15;
-                let x = offset_x + 10.0 * global_scale - (s - base_size) / 2.0;
+                let x = offset_x + 10.0 * non_expanded_scale - (s - base_size) / 2.0;
                 let y = offset_y + (current_h - s) / 2.0;
                 (s, x, y)
             } else {
                 (
                     base_size,
-                    offset_x + 10.0 * global_scale,
+                    offset_x + 10.0 * non_expanded_scale,
                     offset_y + (current_h - base_size) / 2.0,
                 )
             };
@@ -475,8 +478,8 @@ pub fn draw_island(
                 canvas.clip_rrect(
                     RRect::new_rect_xy(
                         Rect::from_xywh(ix, iy, size, size),
-                        5.0 * global_scale,
-                        5.0 * global_scale,
+                        5.0 * non_expanded_scale,
+                        5.0 * non_expanded_scale,
                     ),
                     ClipOp::Intersect,
                     true,
@@ -514,7 +517,7 @@ pub fn draw_island(
             }
         }
         let palette = &palette;
-        let viz_x = offset_x + current_w - 17.0 * global_scale;
+        let viz_x = offset_x + current_w - 17.0 * non_expanded_scale;
         let viz_y = offset_y + current_h / 2.0;
         draw_visualizer(DrawVisualizerParams {
             canvas,
@@ -524,8 +527,8 @@ pub fn draw_island(
             is_playing: media.is_playing,
             palette,
             spectrum: &media.spectrum,
-            w_scale: 0.55 * global_scale,
-            h_scale: viz_h_scale * global_scale,
+            w_scale: 0.55 * non_expanded_scale,
+            h_scale: viz_h_scale * non_expanded_scale,
             smooth_factors: (0.6, 0.08),
         });
 
@@ -536,12 +539,12 @@ pub fn draw_island(
             let ctrl_alpha = (alpha as f32 * lyric_fade_f) as u8;
 
             if ctrl_alpha > 0 {
-                let space_left = offset_x + 30.0 * global_scale;
-                let space_right = offset_x + current_w - 29.0 * global_scale;
+                let space_left = offset_x + 30.0 * non_expanded_scale;
+                let space_right = offset_x + current_w - 29.0 * non_expanded_scale;
                 let center_x = (space_left + space_right) / 2.0;
                 let center_y = offset_y + current_h / 2.0;
 
-                let btn_scale = 0.28 * global_scale;
+                let btn_scale = 0.28 * non_expanded_scale;
 
                 canvas.save();
                 canvas.translate((center_x, center_y));
@@ -554,12 +557,12 @@ pub fn draw_island(
 
             if alpha > 0 {
                 let lyric_font_sz = if font_size > 0.0 {
-                    font_size * 0.8 * global_scale
+                    font_size * 0.8 * non_expanded_scale
                 } else {
-                    12.0 * global_scale
+                    12.0 * non_expanded_scale
                 };
-                let space_left = offset_x + 30.0 * global_scale;
-                let space_right = offset_x + current_w - 29.0 * global_scale;
+                let space_left = offset_x + 30.0 * non_expanded_scale;
+                let space_right = offset_x + current_w - 29.0 * non_expanded_scale;
                 let available_w = space_right - space_left;
                 let scrolling = lyric_scroll_offset > 0.0;
                 let text_x = if scrolling {
@@ -585,7 +588,7 @@ pub fn draw_island(
                             text_color.b(),
                         ));
 
-                        let blur_sigma = lyric_transition * 12.0 * global_scale;
+                        let blur_sigma = lyric_transition * 12.0 * non_expanded_scale;
                         if blur_sigma > 0.1 {
                             text_paint.set_image_filter(image_filters::blur(
                                 (blur_sigma, 0.0),
@@ -595,8 +598,8 @@ pub fn draw_island(
                             ));
                         }
 
-                        let text_y = offset_y + current_h / 2.0 + 4.0 * global_scale
-                            - (10.0 * global_scale * lyric_transition);
+                        let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale
+                            - (10.0 * non_expanded_scale * lyric_transition);
                         let old_lx = if text_centered {
                             let w = FontManager::global().measure_text_cached(
                                 old_lyric,
@@ -629,7 +632,7 @@ pub fn draw_island(
                             text_color.b(),
                         ));
 
-                        let blur_sigma = (1.0 - lyric_transition) * 12.0 * global_scale;
+                        let blur_sigma = (1.0 - lyric_transition) * 12.0 * non_expanded_scale;
                         if blur_sigma > 0.1 {
                             text_paint.set_image_filter(image_filters::blur(
                                 (blur_sigma, 0.0),
@@ -641,8 +644,8 @@ pub fn draw_island(
 
                         let text_y = offset_y
                             + current_h / 2.0
-                            + 4.0 * global_scale
-                            + (10.0 * global_scale * (1.0 - lyric_transition));
+                            + 4.0 * non_expanded_scale
+                            + (10.0 * non_expanded_scale * (1.0 - lyric_transition));
                         let cur_lx = if text_centered {
                             let w = FontManager::global().measure_text_cached(
                                 current_lyric,
@@ -664,7 +667,7 @@ pub fn draw_island(
                         });
                     }
                 } else {
-                    let text_y = offset_y + current_h / 2.0 + 4.0 * global_scale;
+                    let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
                     if lyric_transition < 0.5 && !old_lyric.is_empty() {
                         let mut text_paint = Paint::default();
                         text_paint.set_anti_alias(true);
@@ -778,18 +781,18 @@ pub fn get_mini_control_rects(
     offset_y: f32,
     current_w: f32,
     current_h: f32,
-    global_scale: f32,
+    non_expanded_scale: f32,
 ) -> (
     Option<(f32, f32, f32, f32)>,
     Option<(f32, f32, f32, f32)>,
     Option<(f32, f32, f32, f32)>,
 ) {
-    let space_left = offset_x + 30.0 * global_scale;
-    let space_right = offset_x + current_w - 29.0 * global_scale;
+    let space_left = offset_x + 30.0 * non_expanded_scale;
+    let space_right = offset_x + current_w - 29.0 * non_expanded_scale;
     let center_x = (space_left + space_right) / 2.0;
     let center_y = offset_y + current_h / 2.0;
 
-    let hit_size = 20.0 * global_scale;
+    let hit_size = 20.0 * non_expanded_scale;
 
     let play_rect = (
         center_x - hit_size / 2.0,

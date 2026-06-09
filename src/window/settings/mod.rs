@@ -290,8 +290,13 @@ impl SettingsApp {
                 });
                 items.push(SettingsItem::GroupStart);
                 items.push(SettingsItem::RowStepper {
-                    label: tr("global_scale"),
-                    value: format!("{:.2}", self.config.global_scale),
+                    label: tr("non_expanded_scale"),
+                    value: format!("{:.2}", self.config.non_expanded_scale),
+                    enabled: true,
+                });
+                items.push(SettingsItem::RowStepper {
+                    label: tr("expanded_scale"),
+                    value: format!("{:.2}", self.config.expanded_scale),
                     enabled: true,
                 });
                 items.push(SettingsItem::RowStepper {

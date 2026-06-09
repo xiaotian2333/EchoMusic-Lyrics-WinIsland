@@ -591,24 +591,23 @@ fn fetch_properties(
             should_fetch_thumbnail = true;
         }
         let smtc_changed = smtc_pos != info.last_smtc_pos;
-        let suppress_smtc_sync =
-            if let Some((target_pos, started_at, protect_duration)) = *pending_seek {
-                let diff_with_target = (smtc_pos as i64 - target_pos as i64).abs();
-                if target_pos == 0 && smtc_pos <= 1000 {
-                    *pending_seek = None;
-                    false
-                } else if target_pos > 0 && diff_with_target <= 2000 {
-                    *pending_seek = None;
-                    false
-                } else if started_at.elapsed() <= protect_duration {
-                    true
-                } else {
-                    *pending_seek = None;
-                    false
-                }
-            } else {
+        let suppress_smtc_sync = if let Some((target_pos, started_at, protect_duration)) =
+            *pending_seek
+        {
+            let diff_with_target = (smtc_pos as i64 - target_pos as i64).abs();
+            if (target_pos == 0 && smtc_pos <= 1000) || (target_pos > 0 && diff_with_target <= 2000)
+            {
+                *pending_seek = None;
                 false
-            };
+            } else if started_at.elapsed() <= protect_duration {
+                true
+            } else {
+                *pending_seek = None;
+                false
+            }
+        } else {
+            false
+        };
 
         let should_sync = !song_changed
             && !suppress_smtc_sync

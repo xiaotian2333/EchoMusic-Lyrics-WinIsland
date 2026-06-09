@@ -106,9 +106,9 @@ impl Default for App {
             visible: true,
             border_weights: [0.0; 4],
             target_border_weights: [0.0; 4],
-            spring_w: Spring::new(config.base_width * config.global_scale),
-            spring_h: Spring::new(config.base_height * config.global_scale),
-            spring_r: Spring::new((config.base_height * config.global_scale) / 2.0),
+            spring_w: Spring::new(config.base_width * config.non_expanded_scale),
+            spring_h: Spring::new(config.base_height * config.non_expanded_scale),
+            spring_r: Spring::new((config.base_height * config.non_expanded_scale) / 2.0),
             spring_view: Spring::new(0.0),
             smtc: SmtcListener::new(),
             audio: AudioProcessor::new(),
@@ -274,6 +274,24 @@ impl App {
         }
     }
 
+    fn compute_os_size(config: &AppConfig) -> (u32, u32) {
+        let expanded_w = config.expanded_width.max(450.0) * config.expanded_scale;
+        let expanded_h = config.expanded_height * config.expanded_scale;
+        let non_expanded_w = config
+            .base_width
+            .max(config.base_width + 35.0)
+            .max(config.lyrics_scroll_max_width)
+            .max(450.0)
+            * config.non_expanded_scale;
+        let non_expanded_h =
+            (config.base_height * config.non_expanded_scale).max(24.0 * config.non_expanded_scale);
+
+        (
+            (expanded_w.max(non_expanded_w) + PADDING).ceil() as u32,
+            (expanded_h.max(non_expanded_h) + PADDING).ceil() as u32,
+        )
+    }
+
     fn compute_window_position(
         &self,
         mon_pos: PhysicalPosition<i32>,
@@ -318,7 +336,7 @@ impl App {
             (self.os_w as f64 - self.spring_w.value as f64) / 2.0
         };
 
-        let scale = self.config.global_scale as f64;
+        let scale = self.config.non_expanded_scale as f64;
         let hidden_peek_h = (5.0 * scale).max(3.0);
         let hide_distance = if dock_bottom {
             (self.spring_h.value as f64 - hidden_peek_h).max(0.0)
@@ -409,7 +427,7 @@ impl App {
             let w = self.spring_w.value as f64;
             let h = self.spring_h.value as f64;
             let page_shift = view_val * w;
-            let scale = self.config.global_scale as f64;
+            let scale = self.config.expanded_scale as f64;
 
             if view_val < 0.5 {
                 let media = self.smtc.get_info();
@@ -420,7 +438,7 @@ impl App {
                     island_y as f32,
                     w as f32,
                     h as f32,
-                    self.config.global_scale,
+                    self.config.expanded_scale,
                     &self.config.expanded_cover_shape,
                 );
                 let cx = rel_x as f32 - (page_shift as f32);
@@ -436,7 +454,7 @@ impl App {
                     island_y as f32,
                     w as f32,
                     h as f32,
-                    self.config.global_scale,
+                    self.config.expanded_scale,
                     &self.config.expanded_cover_shape,
                 );
                 if music_on && cx >= px && cx <= px + pw && cy >= py && cy <= py + ph {
@@ -451,7 +469,7 @@ impl App {
                     island_y as f32,
                     w as f32,
                     h as f32,
-                    self.config.global_scale,
+                    self.config.expanded_scale,
                     &self.config.expanded_cover_shape,
                 );
                 if music_on && cx >= nx && cx <= nx + nw && cy >= ny && cy <= ny + nh {
@@ -467,7 +485,7 @@ impl App {
                     w as f32,
                     &media,
                     music_on,
-                    self.config.global_scale,
+                    self.config.expanded_scale,
                     &self.config.expanded_cover_shape,
                 ) && cx >= bar_left
                     && cx <= bar_right
@@ -534,7 +552,7 @@ impl App {
                     current_island_y as f32,
                     w,
                     h,
-                    self.config.global_scale,
+                    self.config.non_expanded_scale,
                 );
 
                 let cx = rel_x as f32;
@@ -654,9 +672,13 @@ impl App {
         }
         let current_config = load_config();
         if current_config != self.config {
-            let old_scale = self.config.global_scale;
+            let old_non_expanded_scale = self.config.non_expanded_scale;
+            let old_expanded_scale = self.config.expanded_scale;
+            let old_base_w = self.config.base_width;
+            let old_base_h = self.config.base_height;
             let old_max_w = self.config.expanded_width;
             let old_max_h = self.config.expanded_height;
+            let old_lyrics_scroll_max_width = self.config.lyrics_scroll_max_width;
             let old_style = self.config.island_style.clone();
             let old_mini_shape = self.config.mini_cover_shape.clone();
             let old_expanded_shape = self.config.expanded_cover_shape.clone();
@@ -694,16 +716,17 @@ impl App {
                 crate::utils::font::FontManager::global().refresh_custom_font();
             }
 
-            let max_w = self.config.expanded_width.max(450.0);
-            let new_os_w = (max_w * self.config.global_scale + PADDING) as u32;
-            let new_os_h =
-                (self.config.expanded_height * self.config.global_scale + PADDING) as u32;
+            let (new_os_w, new_os_h) = Self::compute_os_size(&self.config);
 
             let size_changed = new_os_w != self.os_w
                 || new_os_h != self.os_h
-                || (old_scale - self.config.global_scale).abs() > 0.001
+                || (old_non_expanded_scale - self.config.non_expanded_scale).abs() > 0.001
+                || (old_expanded_scale - self.config.expanded_scale).abs() > 0.001
+                || (old_base_w - self.config.base_width).abs() > 0.1
+                || (old_base_h - self.config.base_height).abs() > 0.1
                 || (old_max_w - self.config.expanded_width).abs() > 0.1
-                || (old_max_h - self.config.expanded_height).abs() > 0.1;
+                || (old_max_h - self.config.expanded_height).abs() > 0.1
+                || (old_lyrics_scroll_max_width - self.config.lyrics_scroll_max_width).abs() > 0.1;
 
             if size_changed {
                 self.os_w = new_os_w;
@@ -770,8 +793,8 @@ impl App {
                     let max_w = self.config.lyrics_scroll_max_width;
                     if natural_w > max_w {
                         let fixed_w = max_w;
-                        let available_text_w = (fixed_w - 59.0) * self.config.global_scale;
-                        let full_text_w = text_w * self.config.global_scale;
+                        let available_text_w = (fixed_w - 59.0) * self.config.non_expanded_scale;
+                        let full_text_w = text_w * self.config.non_expanded_scale;
                         let overflow = full_text_w - available_text_w;
                         if overflow > 0.0 && self.lyric_transition >= 1.0 && !is_paused {
                             if self.lyric_scroll_offset < overflow {
@@ -813,11 +836,11 @@ impl App {
             self.lyric_scroll_offset = 0.0;
             self.config.base_width
         };
-        (if self.expanded {
-            self.config.expanded_width
+        if self.expanded {
+            self.config.expanded_width * self.config.expanded_scale
         } else {
-            target_base_w
-        }) * self.config.global_scale
+            target_base_w * self.config.non_expanded_scale
+        }
     }
 }
 
@@ -826,9 +849,9 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(ControlFlow::Poll);
         if self.window.is_none() {
             Self::set_aumid();
-            let max_w = self.config.expanded_width.max(450.0);
-            self.os_w = (max_w * self.config.global_scale + PADDING) as u32;
-            self.os_h = (self.config.expanded_height * self.config.global_scale + PADDING) as u32;
+            let (os_w, os_h) = Self::compute_os_size(&self.config);
+            self.os_w = os_w;
+            self.os_h = os_h;
             let attrs = Window::default_attributes()
                 .with_title(WINDOW_TITLE)
                 .with_inner_size(PhysicalSize::new(self.os_w, self.os_h))
@@ -973,14 +996,14 @@ impl ApplicationHandler for App {
                         } else {
                             (0.0, 0.0)
                         };
-                        let total_h = (self.config.expanded_height - self.config.base_height)
-                            .abs()
-                            .max(1.0)
-                            * self.config.global_scale;
-                        let dist_h = (self.spring_h.value
-                            - self.config.base_height * self.config.global_scale)
-                            .abs();
-                        let progress = (dist_h / total_h).clamp(0.0, 1.0);
+                        let collapsed_h = self.config.base_height * self.config.non_expanded_scale;
+                        let expanded_h = self.config.expanded_height * self.config.expanded_scale;
+                        let delta_h = expanded_h - collapsed_h;
+                        let progress = if delta_h.abs() < 0.001 {
+                            if self.expanded { 1.0 } else { 0.0 }
+                        } else {
+                            ((self.spring_h.value - collapsed_h) / delta_h).clamp(0.0, 1.0)
+                        };
                         let mut media_info = self.smtc.get_info();
                         if self.seeking_progress && self.seeking_duration_ms > 0 {
                             media_info.position_ms = self.seeking_preview_ms;
@@ -1015,7 +1038,8 @@ impl ApplicationHandler for App {
                                     sigmas,
                                     expansion_progress: progress,
                                     view_offset: self.spring_view.value,
-                                    global_scale: self.config.global_scale,
+                                    non_expanded_scale: self.config.non_expanded_scale,
+                                    expanded_scale: self.config.expanded_scale,
                                     hide_progress: self.spring_hide.value,
                                     dock_position: self.config.dock_position,
                                 },
@@ -1209,13 +1233,13 @@ impl ApplicationHandler for App {
                 self.spring_w.value,
                 &media,
                 music_active,
-                self.config.global_scale,
+                self.config.expanded_scale,
                 &self.config.expanded_cover_shape,
             ) {
                 let page_shift = self.spring_view.value * self.spring_w.value;
                 let cx = rel_x as f32 - page_shift;
                 let cy = rel_y as f32;
-                let margin = 4.0 * self.config.global_scale;
+                let margin = 4.0 * self.config.expanded_scale;
                 cx >= bar_left - margin
                     && cx <= bar_right + margin
                     && cy >= bar_top - margin
@@ -1344,15 +1368,15 @@ impl ApplicationHandler for App {
         }
 
         let target_w = self.compute_lyric_target_width(&window, music_active, is_paused, dt);
-        let target_h = (if self.expanded {
-            self.config.expanded_height
+        let target_h = if self.expanded {
+            self.config.expanded_height * self.config.expanded_scale
         } else {
-            self.config.base_height
-        }) * self.config.global_scale;
+            self.config.base_height * self.config.non_expanded_scale
+        };
         let target_r = if self.expanded {
-            32.0 * self.config.global_scale
+            32.0 * self.config.expanded_scale
         } else {
-            (self.config.base_height * self.config.global_scale) / 2.0
+            (self.config.base_height * self.config.non_expanded_scale) / 2.0
         };
         let target_view = if self.widget_view { 1.0 } else { 0.0 };
         self.spring_w.update_dt(target_w, 0.10, 0.68, dt);

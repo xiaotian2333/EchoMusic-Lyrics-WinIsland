@@ -21,7 +21,8 @@ pub fn load_config() -> AppConfig {
         save_config(&default);
         return default;
     };
-    config.global_scale = config.global_scale.clamp(0.5, 5.0);
+    config.non_expanded_scale = config.non_expanded_scale.clamp(0.5, 5.0);
+    config.expanded_scale = config.expanded_scale.clamp(0.5, 5.0);
     config.base_width = config.base_width.max(40.0);
     config.base_height = config.base_height.max(15.0);
     config.expanded_width = config.expanded_width.max(200.0);
