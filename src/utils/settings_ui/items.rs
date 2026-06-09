@@ -22,6 +22,9 @@ pub const POPUP_ITEM_H: f32 = 28.0;
 pub const POPUP_MENU_R: f32 = 8.0;
 pub const POPUP_MENU_PAD: f32 = 4.0;
 
+pub const CENTER_BUTTON_W: f32 = 160.0;
+pub const CENTER_BUTTON_H: f32 = 30.0;
+
 #[derive(Clone)]
 pub enum SettingsItem {
     PageTitle {
@@ -76,6 +79,10 @@ pub enum SettingsItem {
         label: String,
         color: Color,
     },
+    CenterButton {
+        label: String,
+        enabled: bool,
+    },
     CenterText {
         text: String,
         size: f32,
@@ -96,6 +103,7 @@ impl SettingsItem {
             SettingsItem::SectionHeader { .. } => 30.0,
             SettingsItem::GroupStart | SettingsItem::GroupEnd => 0.0,
             SettingsItem::CenterLink { .. } => 40.0,
+            SettingsItem::CenterButton { .. } => 44.0,
             SettingsItem::CenterText { .. } => 35.0,
             SettingsItem::Spacer { height } => *height,
             SettingsItem::FontPreview { .. } => 70.0,

@@ -640,6 +640,12 @@ impl SettingsApp {
                 size: 14.0,
                 color: theme.text_sec,
             },
+            SettingsItem::Spacer { height: 8.0 },
+            SettingsItem::CenterButton {
+                label: tr("check_updates_now"),
+                enabled: true,
+            },
+            SettingsItem::Spacer { height: 6.0 },
             SettingsItem::CenterText {
                 text: format!("{} {}", tr("created_by"), APP_AUTHOR),
                 size: 14.0,

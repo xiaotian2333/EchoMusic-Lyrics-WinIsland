@@ -965,6 +965,31 @@ pub fn draw_items(params: DrawItemsParams<'_>) {
                     });
                 }
             }
+            SettingsItem::CenterButton { label, enabled } => {
+                let h = item.height();
+                if y + h >= visible_min_y && y <= visible_max_y {
+                    let btn_x = width / 2.0 - CENTER_BUTTON_W / 2.0;
+                    let btn_y = y + (h - CENTER_BUTTON_H) / 2.0;
+                    draw_pill_btn(PillBtnParams {
+                        canvas,
+                        x: btn_x,
+                        y: btn_y,
+                        w: CENTER_BUTTON_W,
+                        h: CENTER_BUTTON_H,
+                        label,
+                        text_color: if *enabled {
+                            Color::WHITE
+                        } else {
+                            theme.text_sec
+                        },
+                        bg_color: if *enabled {
+                            theme.accent
+                        } else {
+                            theme.disabled
+                        },
+                    });
+                }
+            }
             SettingsItem::CenterText { text, size, color } => {
                 let h = item.height();
                 if y + h >= visible_min_y && y <= visible_max_y {

@@ -9,6 +9,7 @@ pub enum ClickResult {
     FontSelect(usize),
     FontReset(usize),
     CenterLink(usize),
+    CenterButton(usize),
     SourceButton(usize),
     TextInput(usize),
     FolderSelect(usize),
@@ -105,6 +106,13 @@ pub fn hit_test(items: &[SettingsItem], mx: f32, my: f32, start_y: f32, width: f
                     && my <= y + 40.0 =>
             {
                 return ClickResult::CenterLink(idx);
+            }
+            SettingsItem::CenterButton { enabled, .. } if *enabled => {
+                let btn_x = width / 2.0 - CENTER_BUTTON_W / 2.0;
+                let btn_y = y + (item.height() - CENTER_BUTTON_H) / 2.0;
+                if in_rect(mx, my, btn_x, btn_y, CENTER_BUTTON_W, CENTER_BUTTON_H) {
+                    return ClickResult::CenterButton(idx);
+                }
             }
             _ => {}
         }

@@ -716,8 +716,22 @@ impl SettingsApp {
         start_y: f32,
     ) {
         let result = hit_test(items, mx, my, start_y, width);
-        if let ClickResult::CenterLink(_) = result {
-            let _ = open::that(APP_HOMEPAGE);
+        match result {
+            ClickResult::CenterButton(idx) => {
+                if let Some(SettingsItem::CenterButton { label, .. }) = items.get(idx)
+                    && label == &tr("check_updates_now")
+                {
+                    crate::utils::updater::check_for_updates_now();
+                }
+            }
+            ClickResult::CenterLink(idx) => {
+                if let Some(SettingsItem::CenterLink { label, .. }) = items.get(idx)
+                    && label == &tr("visit_homepage")
+                {
+                    let _ = open::that(APP_HOMEPAGE);
+                }
+            }
+            _ => {}
         }
     }
 

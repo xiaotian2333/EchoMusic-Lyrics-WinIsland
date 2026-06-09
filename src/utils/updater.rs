@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::UI::WindowsAndMessaging::{
     IDOK, IDYES, MB_ICONINFORMATION, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
 };
@@ -17,6 +18,7 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .build()
         .unwrap()
 });
+static MANUAL_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/xiaotian2333/EchoMusic-Lyrics-WinIsland/releases?per_page=10";
@@ -51,6 +53,13 @@ struct UpdateCandidate {
     download_url: String,
     asset_size: Option<u64>,
     version: [u64; 3],
+}
+
+#[derive(Debug)]
+enum UpdateCheckError {
+    Request,
+    UnsupportedArch,
+    InvalidLocalVersion,
 }
 
 pub fn get_app_dir() -> PathBuf {
@@ -89,11 +98,47 @@ pub fn start_update_checker() {
     });
 }
 
+pub fn check_for_updates_now() {
+    if MANUAL_CHECK_RUNNING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    std::thread::spawn(|| {
+        if let Ok(runtime) = tokio::runtime::Runtime::new() {
+            let app_dir = get_app_dir();
+            runtime.block_on(do_manual_check(&app_dir));
+        }
+        MANUAL_CHECK_RUNNING.store(false, Ordering::Release);
+    });
+}
+
+async fn do_manual_check(app_dir: &Path) {
+    match fetch_latest_update().await {
+        Ok(Some(candidate)) => prompt_update(candidate, app_dir).await,
+        Ok(None) => {
+            show_info_box(tr("update_no_updates_title"), tr("update_no_updates_desc")).await;
+        }
+        Err(_) => {
+            show_info_box(
+                tr("update_check_failed_title"),
+                tr("update_check_failed_desc"),
+            )
+            .await;
+        }
+    }
+}
+
 async fn do_check(app_dir: &Path) {
-    let Some(candidate) = fetch_latest_update().await else {
+    let Ok(Some(candidate)) = fetch_latest_update().await else {
         return;
     };
+    prompt_update(candidate, app_dir).await;
+}
 
+async fn prompt_update(candidate: UpdateCandidate, app_dir: &Path) {
     let title_w: Vec<u16> = format!("{}\0", tr("update_available_title"))
         .encode_utf16()
         .collect();
@@ -125,9 +170,9 @@ async fn do_check(app_dir: &Path) {
     }
 }
 
-async fn fetch_latest_update() -> Option<UpdateCandidate> {
-    let asset_name = expected_asset_name()?;
-    let local_version = parse_version(APP_VERSION)?;
+async fn fetch_latest_update() -> Result<Option<UpdateCandidate>, UpdateCheckError> {
+    let asset_name = expected_asset_name().ok_or(UpdateCheckError::UnsupportedArch)?;
+    let local_version = parse_version(APP_VERSION).ok_or(UpdateCheckError::InvalidLocalVersion)?;
     let resp = HTTP_CLIENT
         .get(GITHUB_RELEASES_API)
         .header(ACCEPT, "application/vnd.github+json")
@@ -135,12 +180,12 @@ async fn fetch_latest_update() -> Option<UpdateCandidate> {
         .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
         .send()
         .await
-        .ok()?;
+        .map_err(|_| UpdateCheckError::Request)?;
     if !resp.status().is_success() {
-        return None;
+        return Err(UpdateCheckError::Request);
     }
 
-    let releases: Vec<GitHubRelease> = resp.json().await.ok()?;
+    let releases: Vec<GitHubRelease> = resp.json().await.map_err(|_| UpdateCheckError::Request)?;
     let mut best: Option<UpdateCandidate> = None;
 
     for release in releases {
@@ -175,7 +220,7 @@ async fn fetch_latest_update() -> Option<UpdateCandidate> {
         }
     }
 
-    best
+    Ok(best)
 }
 
 async fn perform_update(candidate: UpdateCandidate, app_dir: PathBuf) {
@@ -292,21 +337,25 @@ fn user_agent() -> String {
     format!("EchoMusic-Lyrics-WinIsland/{APP_VERSION}")
 }
 
-async fn show_error_box(title: String, text: String) {
+async fn show_info_box(title: String, text: String) {
     let title_w: Vec<u16> = title.add_null().encode_utf16().collect();
     let text_w: Vec<u16> = text.add_null().encode_utf16().collect();
-    // SAFETY: MessageBoxW displays a modal error dialog with the provided
+    // SAFETY: MessageBoxW displays a modal information dialog with the provided
     // null-terminated UTF-16 strings. All pointers are valid for the call duration.
     tokio::task::spawn_blocking(move || unsafe {
         MessageBoxW(
             None,
             PCWSTR(text_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
-            MB_ICONINFORMATION | MB_TOPMOST,
+            MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
         );
     })
     .await
     .ok();
+}
+
+async fn show_error_box(title: String, text: String) {
+    show_info_box(title, text).await;
 }
 
 trait AddNull {
