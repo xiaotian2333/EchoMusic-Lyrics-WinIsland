@@ -202,6 +202,7 @@ impl SettingsApp {
             config.check_for_updates,
             config.show_lyrics,
             config.lyrics_scroll,
+            config.hover_to_hide,
         ]);
         Self {
             window: None,
@@ -502,6 +503,18 @@ impl SettingsApp {
                         enabled: true,
                     });
                 }
+                items.push(SettingsItem::RowSwitch {
+                    label: tr("hover_to_hide"),
+                    on: self.config.hover_to_hide,
+                    enabled: true,
+                });
+                if self.config.hover_to_hide {
+                    items.push(SettingsItem::RowStepper {
+                        label: tr("hover_to_hide_distance"),
+                        value: format!("{:.0}", self.config.hover_to_hide_distance),
+                        enabled: true,
+                    });
+                }
                 items.push(SettingsItem::RowSourceSelect {
                     label: tr("language"),
                     options: vec![
@@ -770,6 +783,7 @@ impl SettingsApp {
         self.switch_anim
             .set_target(8, self.config.check_for_updates);
         self.switch_anim.set_target(9, self.config.show_lyrics);
+        self.switch_anim.set_target(11, self.config.hover_to_hide);
         let fw_on = if self.config.show_lyrics {
             self.config.lyrics_scroll
         } else {
@@ -1180,7 +1194,7 @@ impl SettingsApp {
             0 => match self.active_sub_page {
                 0 => SwitchAnimator::new(&[]),
                 1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[0, 1, 2, 3, 4, 5]),
-                2 => SwitchAnimator::new_with_anims(&self.switch_anim, &[6, 7, 8]),
+                2 => SwitchAnimator::new_with_anims(&self.switch_anim, &[6, 7, 11, 8]),
                 _ => SwitchAnimator::new(&[]),
             },
             1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10]),

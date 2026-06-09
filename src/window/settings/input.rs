@@ -301,6 +301,15 @@ impl SettingsApp {
                                 (self.config.update_check_interval + 1.0).min(24.0);
                         }
                         changed = true;
+                    } else if l == tr("hover_to_hide_distance") {
+                        if is_dec {
+                            self.config.hover_to_hide_distance =
+                                (self.config.hover_to_hide_distance - 10.0).max(50.0);
+                        } else {
+                            self.config.hover_to_hide_distance =
+                                (self.config.hover_to_hide_distance + 10.0).min(300.0);
+                        }
+                        changed = true;
                     }
                 }
             }
@@ -335,6 +344,9 @@ impl SettingsApp {
                             let _ = set_autostart(self.config.auto_start);
                         }
                         l if l == tr("auto_hide") => self.config.auto_hide = !self.config.auto_hide,
+                        l if l == tr("hover_to_hide") => {
+                            self.config.hover_to_hide = !self.config.hover_to_hide
+                        }
                         l if l == tr("check_updates") => {
                             self.config.check_for_updates = !self.config.check_for_updates
                         }
@@ -554,6 +566,7 @@ impl SettingsApp {
                     self.config.check_for_updates,
                     self.config.show_lyrics,
                     self.config.lyrics_scroll,
+                    self.config.hover_to_hide,
                 ]);
                 changed = true;
             }

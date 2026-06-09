@@ -90,6 +90,7 @@ pub struct App {
     is_cursor_suppressed: bool,
     touch_id: Option<u64>,
     touch_pos: PhysicalPosition<f64>,
+    hover_to_hide_enter_at: Option<Instant>,
 }
 
 impl Default for App {
@@ -147,6 +148,7 @@ impl Default for App {
             is_cursor_suppressed: false,
             touch_id: None,
             touch_pos: PhysicalPosition::new(0.0, 0.0),
+            hover_to_hide_enter_at: None,
         }
     }
 }
@@ -1149,7 +1151,9 @@ impl ApplicationHandler for App {
         if self.is_fullscreen_suppressed || self.is_cursor_suppressed {
             let _ = window.set_cursor_hittest(false);
         } else {
-            let _ = window.set_cursor_hittest(is_hovering_visible || is_on_hidden_handle);
+            let clickable = !(self.config.hover_to_hide && self.auto_hidden)
+                && (is_hovering_visible || is_on_hidden_handle);
+            let _ = window.set_cursor_hittest(clickable);
         }
 
         let mut music_active = false;
@@ -1183,27 +1187,69 @@ impl ApplicationHandler for App {
             && !self.expanded
             && !self.is_dragging
             && (!music_active || is_paused_idle);
-        if !self.config.auto_hide {
-            self.auto_hidden = false;
-            self.idle_timer = Instant::now();
-        } else if media.is_playing && self.auto_hidden && !self.manually_hidden {
-            self.auto_hidden = false;
-            self.idle_timer = Instant::now();
-            self.spring_hide.velocity = -0.65;
-        } else if self.auto_hidden {
-            if is_on_hidden_handle || is_hovering_visible {
+        if self.config.hover_to_hide && !self.expanded && !self.manually_hidden {
+            let d = self.config.hover_to_hide_distance as f64;
+            let buffer = d * 0.5;
+            let cursor_in_inner = is_point_in_rect(
+                rel_x as f64,
+                rel_y as f64,
+                offset_x - d,
+                current_island_y - d,
+                self.spring_w.value as f64 + d * 2.0,
+                self.spring_h.value as f64 + d * 2.0,
+            );
+            let cursor_in_outer = is_point_in_rect(
+                rel_x as f64,
+                rel_y as f64,
+                offset_x - d - buffer,
+                current_island_y - d - buffer,
+                self.spring_w.value as f64 + (d + buffer) * 2.0,
+                self.spring_h.value as f64 + (d + buffer) * 2.0,
+            );
+            if !self.auto_hidden {
+                if cursor_in_inner {
+                    self.auto_hidden = true;
+                    self.hover_to_hide_enter_at = None;
+                }
+            } else if !cursor_in_outer {
+                match self.hover_to_hide_enter_at {
+                    None => self.hover_to_hide_enter_at = Some(Instant::now()),
+                    Some(t) if t.elapsed() >= Duration::from_secs_f64(1.5) => {
+                        self.auto_hidden = false;
+                        self.idle_timer = Instant::now();
+                        self.spring_hide.velocity = -0.45;
+                        self.hover_to_hide_enter_at = None;
+                    }
+                    _ => {}
+                }
+            } else {
+                self.hover_to_hide_enter_at = None;
+            }
+        }
+
+        if !self.config.hover_to_hide {
+            if !self.config.auto_hide {
                 self.auto_hidden = false;
                 self.idle_timer = Instant::now();
-                self.spring_hide.velocity = -0.45;
-            } else if !self.expanded && !music_active {
-                // Let idle_timer expire
+            } else if media.is_playing && self.auto_hidden && !self.manually_hidden {
+                self.auto_hidden = false;
+                self.idle_timer = Instant::now();
+                self.spring_hide.velocity = -0.65;
+            } else if self.auto_hidden {
+                if is_on_hidden_handle || is_hovering_visible {
+                    self.auto_hidden = false;
+                    self.idle_timer = Instant::now();
+                    self.spring_hide.velocity = -0.45;
+                } else if !self.expanded && !music_active {
+                    // Let idle_timer expire
+                }
+            } else if is_idle && !self.manually_hidden {
+                if self.idle_timer.elapsed().as_secs_f32() > self.config.auto_hide_delay {
+                    self.auto_hidden = true;
+                }
+            } else if !self.manually_hidden && !is_idle {
+                self.idle_timer = Instant::now();
             }
-        } else if is_idle && !self.manually_hidden {
-            if self.idle_timer.elapsed().as_secs_f32() > self.config.auto_hide_delay {
-                self.auto_hidden = true;
-            }
-        } else if !self.manually_hidden && !is_idle {
-            self.idle_timer = Instant::now();
         }
 
         if self.seeking_progress && (is_left_button_pressed() || self.touch_id.is_some()) {
