@@ -780,9 +780,8 @@ impl App {
         let is_currently_hidden =
             self.auto_hidden || self.manually_hidden || self.spring_hide.value > 0.1;
         let target_base_w = if music_active && !self.expanded && !is_currently_hidden {
-            let has_visible_lyrics = self.config.show_lyrics
-                && (!self.current_lyric_text.is_empty()
-                    || (!self.old_lyric_text.is_empty() && self.lyric_transition < 1.0));
+            let has_visible_lyrics = !self.current_lyric_text.is_empty()
+                || (!self.old_lyric_text.is_empty() && self.lyric_transition < 1.0);
 
             if has_visible_lyrics {
                 if self.config.lyrics_scroll {
@@ -1350,6 +1349,17 @@ impl ApplicationHandler for App {
             if lyric != self.current_lyric_text {
                 self.old_lyric_text = self.current_lyric_text.clone();
                 self.current_lyric_text = lyric.clone();
+                self.lyric_transition = 0.0;
+                self.lyric_scroll_offset = 0.0;
+                self.lyric_scroll_pause = 0.0;
+            }
+        } else if !is_paused && music_active {
+            let fallback = format!("{} - {}", media.title, media.artist);
+            if self.current_lyric_text != fallback {
+                if !self.current_lyric_text.is_empty() {
+                    self.old_lyric_text = self.current_lyric_text.clone();
+                }
+                self.current_lyric_text = fallback;
                 self.lyric_transition = 0.0;
                 self.lyric_scroll_offset = 0.0;
                 self.lyric_scroll_pause = 0.0;
