@@ -9,11 +9,15 @@ use crate::ui::expanded::music_view::{
     set_progress_dragging, set_progress_hover, trigger_cover_flip, trigger_next_click,
     trigger_pause_click, trigger_prev_click,
 };
-use crate::utils::backdrop::{clear_mica_cache, disable_mica};
+use crate::utils::backdrop::clear_mica_cache;
+#[cfg(windows)]
+use crate::utils::backdrop::disable_mica;
 use crate::utils::blur::calculate_blur_sigmas;
 use crate::utils::color::get_island_border_weights;
 use crate::utils::icon::get_app_icon;
-use crate::utils::liquid_glass::{clear_liquid_glass_cache, set_exclude_from_capture};
+use crate::utils::liquid_glass::clear_liquid_glass_cache;
+#[cfg(windows)]
+use crate::utils::liquid_glass::set_exclude_from_capture;
 use crate::utils::mouse::{
     get_global_cursor_pos, is_cursor_hidden, is_foreground_fullscreen, is_left_button_pressed,
     is_point_in_rect,
@@ -43,6 +47,7 @@ use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 #[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
+#[cfg(windows)]
 use winit::raw_window_handle::HasWindowHandle;
 #[cfg(windows)]
 use winit::raw_window_handle::RawWindowHandle;
@@ -890,17 +895,20 @@ impl ApplicationHandler for App {
             let (os_w, os_h) = Self::compute_os_size(&self.config);
             self.os_w = os_w;
             self.os_h = os_h;
-            let attrs = Window::default_attributes()
-                .with_title(WINDOW_TITLE)
-                .with_inner_size(PhysicalSize::new(self.os_w, self.os_h))
-                .with_transparent(true)
-                .with_visible(false)
-                .with_decorations(false)
-                .with_resizable(false)
-                .with_enabled_buttons(WindowButtons::empty())
-                .with_window_level(WindowLevel::AlwaysOnTop)
-                .with_skip_taskbar(true)
-                .with_window_icon(get_app_icon());
+            let attrs = {
+                let attrs = Window::default_attributes()
+                    .with_title(WINDOW_TITLE)
+                    .with_inner_size(PhysicalSize::new(self.os_w, self.os_h))
+                    .with_transparent(true)
+                    .with_visible(false)
+                    .with_decorations(false)
+                    .with_resizable(false)
+                    .with_enabled_buttons(WindowButtons::empty())
+                    .with_window_level(WindowLevel::AlwaysOnTop);
+                #[cfg(windows)]
+                let attrs = attrs.with_skip_taskbar(true);
+                attrs.with_window_icon(get_app_icon())
+            };
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
             #[cfg(windows)]
