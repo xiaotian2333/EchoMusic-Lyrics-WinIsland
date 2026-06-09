@@ -4,9 +4,9 @@ use once_cell::sync::Lazy;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use windows::Win32::UI::WindowsAndMessaging::{
     IDOK, IDYES, MB_ICONINFORMATION, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
 };
@@ -49,7 +49,6 @@ struct GitHubAsset {
 struct UpdateCandidate {
     tag_name: String,
     published_at: Option<String>,
-    asset_name: String,
     download_url: String,
     asset_size: Option<u64>,
     version: [u64; 3],
@@ -62,36 +61,22 @@ enum UpdateCheckError {
     InvalidLocalVersion,
 }
 
-pub fn get_app_dir() -> PathBuf {
-    let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".echomusic-lyrics-winisland");
-    if !path.exists() {
-        let _ = fs::create_dir_all(&path);
-    }
-    path
-}
-
 pub fn start_update_checker() {
     tokio::spawn(async move {
-        let app_dir = get_app_dir();
         let mut last_check = tokio::time::Instant::now();
 
-        // 启动后先检查一次更新。
         if crate::core::persistence::load_config().check_for_updates {
-            do_check(&app_dir).await;
-            last_check = tokio::time::Instant::now();
+            do_check().await;
         }
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
             let config = crate::core::persistence::load_config();
-            if !config.check_for_updates {
-                continue;
-            }
-
-            let interval_secs = config.update_check_interval * 3600.0;
-            if last_check.elapsed().as_secs_f32() >= interval_secs {
-                do_check(&app_dir).await;
+            if config.check_for_updates
+                && last_check.elapsed()
+                    >= Duration::from_secs_f64(config.update_check_interval as f64 * 3600.0)
+            {
+                do_check().await;
                 last_check = tokio::time::Instant::now();
             }
         }
@@ -108,16 +93,15 @@ pub fn check_for_updates_now() {
 
     std::thread::spawn(|| {
         if let Ok(runtime) = tokio::runtime::Runtime::new() {
-            let app_dir = get_app_dir();
-            runtime.block_on(do_manual_check(&app_dir));
+            runtime.block_on(do_manual_check());
         }
         MANUAL_CHECK_RUNNING.store(false, Ordering::Release);
     });
 }
 
-async fn do_manual_check(app_dir: &Path) {
+async fn do_manual_check() {
     match fetch_latest_update().await {
-        Ok(Some(candidate)) => prompt_update(candidate, app_dir).await,
+        Ok(Some(candidate)) => prompt_update(candidate).await,
         Ok(None) => {
             show_info_box(tr("update_no_updates_title"), tr("update_no_updates_desc")).await;
         }
@@ -131,14 +115,14 @@ async fn do_manual_check(app_dir: &Path) {
     }
 }
 
-async fn do_check(app_dir: &Path) {
+async fn do_check() {
     let Ok(Some(candidate)) = fetch_latest_update().await else {
         return;
     };
-    prompt_update(candidate, app_dir).await;
+    prompt_update(candidate).await;
 }
 
-async fn prompt_update(candidate: UpdateCandidate, app_dir: &Path) {
+async fn prompt_update(candidate: UpdateCandidate) {
     let title_w: Vec<u16> = format!("{}\0", tr("update_available_title"))
         .encode_utf16()
         .collect();
@@ -166,7 +150,7 @@ async fn prompt_update(candidate: UpdateCandidate, app_dir: &Path) {
     if let Ok(r) = result
         && (r == IDOK || r == IDYES)
     {
-        perform_update(candidate, app_dir.to_path_buf()).await;
+        perform_update(candidate).await;
     }
 }
 
@@ -206,7 +190,6 @@ async fn fetch_latest_update() -> Result<Option<UpdateCandidate>, UpdateCheckErr
         let candidate = UpdateCandidate {
             tag_name: release.tag_name,
             published_at: release.published_at,
-            asset_name: asset.name.clone(),
             download_url: asset.browser_download_url.clone(),
             asset_size: asset.size,
             version,
@@ -223,7 +206,7 @@ async fn fetch_latest_update() -> Result<Option<UpdateCandidate>, UpdateCheckErr
     Ok(best)
 }
 
-async fn perform_update(candidate: UpdateCandidate, app_dir: PathBuf) {
+async fn perform_update(candidate: UpdateCandidate) {
     let response = match HTTP_CLIENT
         .get(&candidate.download_url)
         .header(USER_AGENT, user_agent())
@@ -264,16 +247,6 @@ async fn perform_update(candidate: UpdateCandidate, app_dir: PathBuf) {
     if fs::write(&new_exe_path, &bytes).is_err() {
         show_error_box(tr("update_failed_title"), tr("update_failed_save")).await;
         return;
-    }
-
-    let local_json_path = app_dir.join("version_info.json");
-    let local_state = serde_json::json!({
-        "tag_name": candidate.tag_name,
-        "published_at": candidate.published_at,
-        "asset_name": candidate.asset_name,
-    });
-    if let Ok(json) = serde_json::to_string_pretty(&local_state) {
-        let _ = fs::write(local_json_path, json);
     }
 
     let current_exe_str = current_exe.to_string_lossy().into_owned();
