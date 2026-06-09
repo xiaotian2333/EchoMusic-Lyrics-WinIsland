@@ -3,6 +3,7 @@ pub mod config;
 pub mod i18n;
 pub mod lyrics;
 pub mod lyrics_ws;
+pub mod media_info;
 pub mod persistence;
 pub mod render;
-pub mod smtc;
+pub mod ws_media;

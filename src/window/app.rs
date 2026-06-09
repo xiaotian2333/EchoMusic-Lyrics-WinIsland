@@ -3,7 +3,7 @@ use crate::core::config::{AppConfig, LyricsFilterScope, PADDING, TOP_OFFSET, WIN
 use crate::core::lyrics::{current_lyric_index, filtered_lyric_text};
 use crate::core::persistence::load_config;
 use crate::core::render::{draw_island, get_mini_control_rects};
-use crate::core::smtc::SmtcListener;
+use crate::core::ws_media::WsMediaListener;
 use crate::ui::expanded::music_view::{
     get_next_btn_rect, get_pause_btn_rect, get_prev_btn_rect, get_progress_bar_rect,
     set_progress_dragging, set_progress_hover, trigger_cover_flip, trigger_next_click,
@@ -43,7 +43,7 @@ pub struct App {
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     tray: Option<TrayManager>,
-    smtc: SmtcListener,
+    media: WsMediaListener,
     audio: AudioProcessor,
     config: AppConfig,
     expanded: bool,
@@ -110,7 +110,7 @@ impl Default for App {
             spring_h: Spring::new(config.base_height * config.non_expanded_scale),
             spring_r: Spring::new((config.base_height * config.non_expanded_scale) / 2.0),
             spring_view: Spring::new(0.0),
-            smtc: SmtcListener::new(),
+            media: WsMediaListener::new(),
             audio: AudioProcessor::new(),
             os_w: 0,
             os_h: 0,
@@ -190,7 +190,10 @@ impl App {
         };
     }
 
-    fn current_filtered_lyric(&mut self, media: &crate::core::smtc::MediaInfo) -> Option<String> {
+    fn current_filtered_lyric(
+        &mut self,
+        media: &crate::core::media_info::MediaInfo,
+    ) -> Option<String> {
         let lyrics = media.lyrics.as_ref()?;
         let raw_pos = if media.is_playing {
             media
@@ -430,7 +433,7 @@ impl App {
             let scale = self.config.expanded_scale as f64;
 
             if view_val < 0.5 {
-                let media = self.smtc.get_info();
+                let media = self.media.get_info();
                 let music_on = !media.title.is_empty();
 
                 let (bx, by, bw, bh) = get_pause_btn_rect(
@@ -445,7 +448,7 @@ impl App {
                 let cy = rel_y as f32;
                 if music_on && cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh {
                     trigger_pause_click(media.is_playing);
-                    self.smtc.request_toggle_play();
+                    self.media.request_toggle_play();
                     return;
                 }
 
@@ -460,7 +463,7 @@ impl App {
                 if music_on && cx >= px && cx <= px + pw && cy >= py && cy <= py + ph {
                     trigger_cover_flip();
                     trigger_prev_click();
-                    self.smtc.request_prev();
+                    self.media.request_prev();
                     return;
                 }
 
@@ -475,7 +478,7 @@ impl App {
                 if music_on && cx >= nx && cx <= nx + nw && cy >= ny && cy <= ny + nh {
                     trigger_cover_flip();
                     trigger_next_click();
-                    self.smtc.request_next();
+                    self.media.request_next();
                     return;
                 }
 
@@ -541,7 +544,7 @@ impl App {
                 self.widget_view = false;
             }
         } else {
-            let media = self.smtc.get_info();
+            let media = self.media.get_info();
             let music_on = !media.title.is_empty();
 
             if music_on && !media.is_playing && self.config.mini_controls {
@@ -565,7 +568,7 @@ impl App {
                     && cy >= py
                     && cy <= py + ph
                 {
-                    self.smtc.request_prev();
+                    self.media.request_prev();
                     hit_control = true;
                 }
                 if !hit_control
@@ -575,7 +578,7 @@ impl App {
                     && cy >= py
                     && cy <= py + ph
                 {
-                    self.smtc.request_toggle_play();
+                    self.media.request_toggle_play();
                     hit_control = true;
                 }
                 if !hit_control
@@ -585,7 +588,7 @@ impl App {
                     && cy >= py
                     && cy <= py + ph
                 {
-                    self.smtc.request_next();
+                    self.media.request_next();
                     hit_control = true;
                 }
                 if hit_control {
@@ -606,7 +609,7 @@ impl App {
         if self.seeking_progress {
             self.seeking_progress = false;
             if self.seeking_duration_ms > 0 {
-                self.smtc.request_seek(self.seeking_preview_ms);
+                self.media.request_seek(self.seeking_preview_ms);
             }
             return;
         }
@@ -1004,7 +1007,7 @@ impl ApplicationHandler for App {
                         } else {
                             ((self.spring_h.value - collapsed_h) / delta_h).clamp(0.0, 1.0)
                         };
-                        let mut media_info = self.smtc.get_info();
+                        let mut media_info = self.media.get_info();
                         if self.seeking_progress && self.seeking_duration_ms > 0 {
                             media_info.position_ms = self.seeking_preview_ms;
                             media_info.last_update = Instant::now();
@@ -1151,7 +1154,7 @@ impl ApplicationHandler for App {
         }
 
         let mut music_active = false;
-        let media = self.smtc.get_info();
+        let media = self.media.get_info();
         if !media.title.is_empty() {
             self.last_media_playing = media.is_playing;
             music_active = true;
@@ -1219,7 +1222,7 @@ impl ApplicationHandler for App {
         } else if self.seeking_progress {
             self.seeking_progress = false;
             if self.seeking_duration_ms > 0 {
-                self.smtc.request_seek(self.seeking_preview_ms);
+                self.media.request_seek(self.seeking_preview_ms);
                 window.request_redraw();
             }
         }

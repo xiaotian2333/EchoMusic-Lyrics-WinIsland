@@ -1,5 +1,5 @@
 use crate::core::config::{DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET};
-use crate::core::smtc::MediaInfo;
+use crate::core::media_info::MediaInfo;
 use crate::icons::controls::draw_play_button;
 use crate::ui::expanded::music_view::{
     DrawMusicPageParams, DrawVisualizerParams, draw_music_page, draw_text_cached, draw_visualizer,

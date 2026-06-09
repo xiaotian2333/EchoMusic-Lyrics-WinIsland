@@ -1,4 +1,4 @@
-use crate::core::smtc::MediaInfo;
+use crate::core::media_info::MediaInfo;
 use crate::icons::arrows::draw_arrow_right;
 use crate::icons::controls::{draw_control_triangle, draw_pause_button, draw_play_button};
 use crate::utils::font::{DrawTextCachedParams, FontManager};

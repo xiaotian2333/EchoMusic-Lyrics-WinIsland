@@ -7,10 +7,27 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum LyricsWsCommand {
     RequestTrackLyrics,
     Seek(u64),
+    Play,
+    Pause,
+    TogglePlay,
+    Next,
+    Prev,
+    GetPlaybackState,
+    RequestMusicData,
+}
+
+#[derive(Clone, Debug)]
+pub enum PlayAction {
+    Play,
+    Pause,
+    Seek,
+    Next,
+    Prev,
 }
 
 #[derive(Clone, Debug)]
@@ -18,6 +35,15 @@ pub enum LyricsWsEvent {
     Connected,
     Subscribe,
     MusicData(MusicData),
+    PlaybackState {
+        position_ms: u64,
+        duration_ms: u64,
+        is_playing: bool,
+    },
+    PlaybackAction {
+        action: PlayAction,
+        position_ms: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -25,6 +51,7 @@ pub struct LyricsWsHandle {
     command_tx: broadcast::Sender<LyricsWsCommand>,
 }
 
+#[allow(dead_code)]
 impl LyricsWsHandle {
     pub fn request_track_lyrics(&self) {
         let _ = self.command_tx.send(LyricsWsCommand::RequestTrackLyrics);
@@ -32,6 +59,34 @@ impl LyricsWsHandle {
 
     pub fn seek(&self, position_ms: u64) {
         let _ = self.command_tx.send(LyricsWsCommand::Seek(position_ms));
+    }
+
+    pub fn play(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::Play);
+    }
+
+    pub fn pause(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::Pause);
+    }
+
+    pub fn toggle_play(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::TogglePlay);
+    }
+
+    pub fn next(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::Next);
+    }
+
+    pub fn prev(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::Prev);
+    }
+
+    pub fn get_playback_state(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::GetPlaybackState);
+    }
+
+    pub fn request_music_data(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::RequestMusicData);
     }
 }
 
@@ -107,6 +162,27 @@ async fn handle_client(
                     Ok(LyricsWsCommand::Seek(position_ms)) => {
                         send_command(&mut ws_write, "seek", Some(json!({ "position_ms": position_ms }))).await?;
                     }
+                    Ok(LyricsWsCommand::Play) => {
+                        send_command(&mut ws_write, "play", None).await?;
+                    }
+                    Ok(LyricsWsCommand::Pause) => {
+                        send_command(&mut ws_write, "pause", None).await?;
+                    }
+                    Ok(LyricsWsCommand::TogglePlay) => {
+                        send_command(&mut ws_write, "toggle_play", None).await?;
+                    }
+                    Ok(LyricsWsCommand::Next) => {
+                        send_command(&mut ws_write, "next", None).await?;
+                    }
+                    Ok(LyricsWsCommand::Prev) => {
+                        send_command(&mut ws_write, "prev", None).await?;
+                    }
+                    Ok(LyricsWsCommand::GetPlaybackState) => {
+                        send_command(&mut ws_write, "get_playback_state", None).await?;
+                    }
+                    Ok(LyricsWsCommand::RequestMusicData) => {
+                        send_command(&mut ws_write, "request_MusicData", None).await?;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -162,11 +238,94 @@ where
                 let _ = event_tx.send(LyricsWsEvent::MusicData(music_data));
             }
         }
+        "command" => {
+            if message.get("source").and_then(|v| v.as_str()) != Some("plugin") {
+                return Ok(());
+            }
+            if let Some(payload) = message.get("payload") {
+                handle_plugin_command(payload, event_tx).await?;
+            }
+        }
         "track_lyrics" => {
             log::debug!("已忽略旧歌词事件 track_lyrics，请使用 MusicData");
         }
         "lyrics" => {
             log::debug!("已忽略旧歌词事件 lyrics，请使用 MusicData");
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn handle_plugin_command(
+    payload: &Value,
+    event_tx: &mpsc::UnboundedSender<LyricsWsEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let action = match payload.get("action").and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+
+    let position_ms = payload
+        .get("data")
+        .and_then(|d| d.get("position_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    match action {
+        "play" => {
+            let _ = event_tx.send(LyricsWsEvent::PlaybackAction {
+                action: PlayAction::Play,
+                position_ms,
+            });
+        }
+        "pause" => {
+            let _ = event_tx.send(LyricsWsEvent::PlaybackAction {
+                action: PlayAction::Pause,
+                position_ms,
+            });
+        }
+        "seek" => {
+            let _ = event_tx.send(LyricsWsEvent::PlaybackAction {
+                action: PlayAction::Seek,
+                position_ms,
+            });
+        }
+        "next" => {
+            let _ = event_tx.send(LyricsWsEvent::PlaybackAction {
+                action: PlayAction::Next,
+                position_ms: 0,
+            });
+        }
+        "prev" => {
+            let _ = event_tx.send(LyricsWsEvent::PlaybackAction {
+                action: PlayAction::Prev,
+                position_ms: 0,
+            });
+        }
+        "position" => {
+            let data = match payload.get("data") {
+                Some(d) => d,
+                None => return Ok(()),
+            };
+            let pos = data
+                .get("position_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let dur = data
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playing = data
+                .get("is_playing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let _ = event_tx.send(LyricsWsEvent::PlaybackState {
+                position_ms: pos,
+                duration_ms: dur,
+                is_playing: playing,
+            });
         }
         _ => {}
     }
@@ -201,6 +360,7 @@ where
     }
     let message = json!({
         "type": "command",
+        "source": "server",
         "payload": payload
     });
     ws_write

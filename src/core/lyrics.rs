@@ -100,7 +100,7 @@ pub fn parse_music_data_payload(payload: &Value) -> Option<MusicData> {
             }
         });
 
-    let mut lyrics = payload
+    let lyrics = payload
         .get("lyrics")?
         .as_array()?
         .iter()
@@ -117,10 +117,7 @@ pub fn parse_music_data_payload(payload: &Value) -> Option<MusicData> {
         })
         .collect::<Vec<_>>();
 
-    if lyrics.is_empty() {
-        return None;
-    }
-
+    let mut lyrics: Vec<LyricLine> = lyrics;
     lyrics.sort_by_key(|line| line.time_ms);
 
     Some(MusicData {
@@ -277,13 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_music_data_payload_rejects_empty_lyrics() {
+    fn parse_music_data_payload_accepts_empty_lyrics() {
         let payload = json!({
             "Metadata": { "title": "歌曲名", "cover_base64": "" },
             "lyrics": []
         });
 
-        assert!(parse_music_data_payload(&payload).is_none());
+        let music_data = parse_music_data_payload(&payload).expect("空歌词 MusicData 应被接受");
+        assert_eq!(music_data.metadata.title, "歌曲名");
+        assert!(music_data.lyrics.is_empty());
     }
 
     #[test]

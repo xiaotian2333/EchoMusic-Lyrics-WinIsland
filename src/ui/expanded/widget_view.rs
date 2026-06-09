@@ -1,6 +1,6 @@
 use crate::core::config::LyricsFilterScope;
 use crate::core::lyrics::current_lyric_index;
-use crate::core::smtc::MediaInfo;
+use crate::core::media_info::MediaInfo;
 use crate::icons::arrows::draw_arrow_left;
 use crate::ui::expanded::music_view::draw_text_cached;
 use crate::utils::font::{DrawTextCachedParams, FontManager};
