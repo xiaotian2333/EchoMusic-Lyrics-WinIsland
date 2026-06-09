@@ -19,23 +19,33 @@ use crate::utils::mouse::{
     is_point_in_rect,
 };
 use crate::utils::physics::Spring;
+#[cfg(not(windows))]
+use crate::window::tray::TrayManager;
+#[cfg(windows)]
 use crate::window::tray::{TrayAction, TrayManager};
 use regex::Regex;
 use softbuffer::{Context, Surface};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows::Win32::Foundation::HWND;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_THICKFRAME,
 };
+#[cfg(windows)]
 use windows::core::PCWSTR;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
+#[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::raw_window_handle::HasWindowHandle;
+#[cfg(windows)]
+use winit::raw_window_handle::RawWindowHandle;
 use winit::window::{Window, WindowButtons, WindowId, WindowLevel};
 
 pub struct App {
@@ -162,6 +172,7 @@ struct IslandLayout {
 }
 
 impl App {
+    #[cfg(windows)]
     fn set_aumid() {
         let aumid = "EchoMusic.Lyrics.WinIsland";
         let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
@@ -171,6 +182,9 @@ impl App {
             let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR::from_raw(wide.as_ptr()));
         }
     }
+
+    #[cfg(not(windows))]
+    fn set_aumid() {}
 
     fn refresh_lyrics_filter_regex(&mut self) {
         if self.lyrics_filter_pattern_cache == self.config.lyrics_filter_regex {
@@ -221,50 +235,66 @@ impl App {
                 .primary_monitor()
                 .or_else(|| window.current_monitor());
         }
-        use windows::Win32::Graphics::Gdi::*;
-        let mut win32_names: Vec<String> = Vec::new();
-        // SAFETY: EnumDisplayDevicesW reads display device info. We provide a zeroed
-        // DISPLAY_DEVICEW with correct cb size. idx increments safely. No mutable global state.
-        unsafe {
-            let mut idx = 0u32;
-            loop {
-                let mut dd: DISPLAY_DEVICEW = std::mem::zeroed();
-                dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-                if EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
-                    if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0 {
-                        let name = String::from_utf16_lossy(&dd.DeviceName)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        win32_names.push(name);
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Gdi::*;
+            let mut win32_names: Vec<String> = Vec::new();
+            // SAFETY: EnumDisplayDevicesW reads display device info. We provide a zeroed
+            // DISPLAY_DEVICEW with correct cb size. idx increments safely. No mutable global state.
+            unsafe {
+                let mut idx = 0u32;
+                loop {
+                    let mut dd: DISPLAY_DEVICEW = std::mem::zeroed();
+                    dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+                    if EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
+                        if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0 {
+                            let name = String::from_utf16_lossy(&dd.DeviceName)
+                                .trim_end_matches('\0')
+                                .to_string();
+                            win32_names.push(name);
+                        }
+                        idx += 1;
+                    } else {
+                        break;
                     }
-                    idx += 1;
-                } else {
-                    break;
                 }
             }
-        }
-        let target_name = win32_names.get(monitor_index as usize);
-        let monitors: Vec<_> = window.available_monitors().collect();
-        if let Some(name) = target_name {
-            for mon in &monitors {
-                if let Some(mon_name) = mon.name()
-                    && (mon_name.contains(name.trim_start_matches("\\\\.\\"))
-                        || name.contains(&mon_name))
-                {
-                    return Some(mon.clone());
+            let target_name = win32_names.get(monitor_index as usize);
+            let monitors: Vec<_> = window.available_monitors().collect();
+            if let Some(name) = target_name {
+                for mon in &monitors {
+                    if let Some(mon_name) = mon.name()
+                        && (mon_name.contains(name.trim_start_matches("\\\\.\\"))
+                            || name.contains(&mon_name))
+                    {
+                        return Some(mon.clone());
+                    }
                 }
             }
+            let idx = monitor_index as usize;
+            if idx < monitors.len() {
+                monitors.get(idx).cloned()
+            } else {
+                window
+                    .primary_monitor()
+                    .or_else(|| window.current_monitor())
+            }
         }
-        let idx = monitor_index as usize;
-        if idx < monitors.len() {
-            monitors.get(idx).cloned()
-        } else {
-            window
-                .primary_monitor()
-                .or_else(|| window.current_monitor())
+        #[cfg(not(windows))]
+        {
+            let monitors: Vec<_> = window.available_monitors().collect();
+            let idx = monitor_index as usize;
+            if idx < monitors.len() {
+                monitors.get(idx).cloned()
+            } else {
+                window
+                    .primary_monitor()
+                    .or_else(|| window.current_monitor())
+            }
         }
     }
 
+    #[cfg(windows)]
     fn enforce_topmost(window: &Window, win_x: i32, win_y: i32, os_w: u32, os_h: u32) {
         if let Ok(handle) = window.window_handle()
             && let RawWindowHandle::Win32(raw) = handle.as_raw()
@@ -273,6 +303,9 @@ impl App {
             crate::utils::win32::set_window_topmost(hwnd, win_x, win_y, os_w as i32, os_h as i32);
         }
     }
+
+    #[cfg(not(windows))]
+    fn enforce_topmost(_window: &Window, _win_x: i32, _win_y: i32, _os_w: u32, _os_h: u32) {}
 
     fn compute_os_size(config: &AppConfig) -> (u32, u32) {
         let expanded_w = config.expanded_width.max(450.0) * config.expanded_scale;
@@ -635,6 +668,7 @@ impl App {
         crate::utils::win32::close_window("EchoMusic-Lyrics-WinIsland Settings");
     }
 
+    #[cfg(windows)]
     fn handle_tray_events(&mut self, window: &Window, event_loop: &ActiveEventLoop) {
         if let Some(tray) = &self.tray
             && let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv()
@@ -666,6 +700,9 @@ impl App {
         }
     }
 
+    #[cfg(not(windows))]
+    fn handle_tray_events(&mut self, _window: &Window, _event_loop: &ActiveEventLoop) {}
+
     fn reload_config_if_changed(&mut self, window: &Window) {
         if !self.frame_count.is_multiple_of(30) {
             return;
@@ -689,6 +726,7 @@ impl App {
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 clear_mica_cache();
                 clear_liquid_glass_cache();
+                #[cfg(windows)]
                 if let Ok(handle) = window.window_handle() {
                     let raw = handle.as_raw();
                     if let RawWindowHandle::Win32(win32_handle) = raw {
@@ -865,6 +903,7 @@ impl ApplicationHandler for App {
                 .with_window_icon(get_app_icon());
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
+            #[cfg(windows)]
             if let Ok(handle) = window.window_handle()
                 && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
             {

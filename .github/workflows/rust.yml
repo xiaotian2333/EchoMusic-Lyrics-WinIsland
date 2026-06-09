@@ -16,116 +16,229 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BUILD_TARGET: x86_64-pc-windows-msvc
-  BUILD_ARCH: AMD64
 
 jobs:
-  build-rust:
-    runs-on: windows-latest
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      cargo_version: ${{ steps.meta.outputs.cargo_version }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Resolve release metadata
-      id: meta
-      shell: pwsh
-      run: |
-        $tag = ""
-        if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.tag_name }}" -ne "") {
-          $tag = "${{ inputs.tag_name }}"
-        } elseif ("${{ github.ref_type }}" -eq "tag") {
-          $tag = "${{ github.ref_name }}"
-        }
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          tag=""
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.tag_name }}" != "" ]]; then
+            tag="${{ inputs.tag_name }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            tag="${{ github.ref_name }}"
+          fi
 
-        if ([string]::IsNullOrWhiteSpace($tag)) {
-          throw "手动触发发布时需要填写 tag_name，或在 v* tag 上运行。"
-        }
-        if ($tag -notlike "v*") {
-          throw "Release tag 必须以 v 开头，当前为 $tag。"
-        }
+          if [[ -z "$tag" ]]; then
+            echo "手动触发发布时需要填写 tag_name，或在 v* tag 上运行。" >&2
+            exit 1
+          fi
+          if [[ "$tag" != v* ]]; then
+            echo "Release tag 必须以 v 开头，当前为 $tag。" >&2
+            exit 1
+          fi
 
-        git fetch --tags --force
-        git rev-parse "$tag" | Out-Null
-        git checkout "$tag"
+          git fetch --tags --force
+          git rev-parse "$tag" >/dev/null
+          git checkout "$tag"
 
-        $cargoVersion = $null
-        foreach ($line in Get-Content Cargo.toml) {
-          if ($line -match '^version\s*=\s*"(.+)"') {
-            $cargoVersion = $Matches[1]
-            break
-          }
-        }
-        if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
-          throw "无法从 Cargo.toml 读取 package.version。"
-        }
+          cargo_version=$(sed -nE 's/^version\s*=\s*"([^"]+)".*/\1/p' Cargo.toml | head -n 1)
+          if [[ -z "$cargo_version" ]]; then
+            echo "无法从 Cargo.toml 读取 package.version。" >&2
+            exit 1
+          fi
 
-        $expectedTag = "v$cargoVersion"
-        if ($tag -ne $expectedTag) {
-          throw "Release tag $tag 与 Cargo.toml 版本 $expectedTag 不一致。"
-        }
+          expected_tag="v$cargo_version"
+          if [[ "$tag" != "$expected_tag" ]]; then
+            echo "Release tag $tag 与 Cargo.toml 版本 $expected_tag 不一致。" >&2
+            exit 1
+          fi
 
-        "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-        "cargo_version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
 
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ env.BUILD_TARGET }}
+  build-release:
+    needs: metadata
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows AMD64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: EchoMusic-Lyrics-WinIsland-Windows-AMD64.exe
+            binary_name: EchoMusic-Lyrics-WinIsland.exe
+          - name: Windows ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset_name: EchoMusic-Lyrics-WinIsland-Windows-ARM64.exe
+            binary_name: EchoMusic-Lyrics-WinIsland.exe
+          - name: macOS AMD64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            asset_name: EchoMusic-Lyrics-WinIsland-macOS-AMD64
+            binary_name: EchoMusic-Lyrics-WinIsland
+          - name: macOS ARM64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            asset_name: EchoMusic-Lyrics-WinIsland-macOS-ARM64
+            binary_name: EchoMusic-Lyrics-WinIsland
+          - name: Linux AMD64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: EchoMusic-Lyrics-WinIsland-Linux-AMD64
+            binary_name: EchoMusic-Lyrics-WinIsland
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_name: EchoMusic-Lyrics-WinIsland-Linux-ARM64
+            binary_name: EchoMusic-Lyrics-WinIsland
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Rust Cache
-      uses: swatinem/rust-cache@v2
+      - name: Checkout release tag
+        shell: bash
+        run: |
+          git fetch --tags --force
+          git checkout "${{ needs.metadata.outputs.tag_name }}"
 
-    - name: Install dependencies
-      run: |
-        choco install ninja
+      - name: Install Windows build dependencies
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
 
-    - name: Build Release
-      run: cargo build --release --verbose --target ${{ env.BUILD_TARGET }}
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja
 
-    - name: Rename release asset
-      shell: pwsh
-      run: |
-        $source = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland.exe"
-        $target = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}.exe"
-        Copy-Item $source $target -Force
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            ninja-build \
+            pkg-config \
+            libgtk-3-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev
 
-    - name: Generate release notes
-      shell: pwsh
-      run: |
-        $tag = "${{ steps.meta.outputs.tag_name }}"
-        $previousTag = $null
-        $previousTagOutput = git describe --tags --match "v*" --abbrev=0 "$tag^" 2>$null
-        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($previousTagOutput)) {
-          $previousTag = $previousTagOutput.Trim()
-        }
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-        "## Changes" | Out-File -FilePath release_notes.md -Encoding utf8
-        "" | Out-File -FilePath release_notes.md -Append -Encoding utf8
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
-        if ($previousTag) {
-          $range = "$previousTag..$tag"
-        } else {
-          $range = $tag
-        }
+      - name: Build release
+        run: cargo build --release --verbose --target ${{ matrix.target }}
 
-        $notes = git log $range --no-merges --pretty=format:"- %s"
-        if ([string]::IsNullOrWhiteSpace($notes)) {
-          "- 无提交记录" | Out-File -FilePath release_notes.md -Append -Encoding utf8
-        } else {
-          $notes | Out-File -FilePath release_notes.md -Append -Encoding utf8
-        }
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:BINARY_NAME" "dist/$env:ASSET_NAME" -Force
 
-    - name: Upload GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.meta.outputs.tag_name }}
-        name: ${{ steps.meta.outputs.tag_name }}
-        draft: false
-        prerelease: false
-        make_latest: true
-        body_path: release_notes.md
-        files: |
-          target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/$BINARY_NAME" "dist/$ASSET_NAME"
+          chmod +x "dist/$ASSET_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish-release:
+    needs:
+      - metadata
+      - build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout release tag
+        shell: bash
+        run: |
+          git fetch --tags --force
+          git checkout "${{ needs.metadata.outputs.tag_name }}"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          tag="${{ needs.metadata.outputs.tag_name }}"
+          previous_tag=$(git describe --tags --match "v*" --abbrev=0 "$tag^" 2>/dev/null || true)
+
+          {
+            echo "## Changes"
+            echo
+            if [[ -n "$previous_tag" ]]; then
+              range="$previous_tag..$tag"
+            else
+              range="$tag"
+            fi
+            notes=$(git log "$range" --no-merges --pretty=format:"- %s")
+            if [[ -z "$notes" ]]; then
+              echo "- 无提交记录"
+            else
+              echo "$notes"
+            fi
+          } > release_notes.md
+
+      - name: Upload GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag_name }}
+          name: ${{ needs.metadata.outputs.tag_name }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          body_path: release_notes.md
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,9 @@
 fn main() {
+    compile_windows_resources();
+}
+
+#[cfg(windows)]
+fn compile_windows_resources() {
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
         let mut res = winres::WindowsResource::new();
 
@@ -38,3 +43,6 @@ fn main() {
         res.compile().unwrap();
     }
 }
+
+#[cfg(not(windows))]
+fn compile_windows_resources() {}

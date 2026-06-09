@@ -2,11 +2,10 @@ name: PR Build & Test
 
 on:
   pull_request:
-    branches: [ "master", "main" ]
+    branches: ["master", "main"]
     paths-ignore:
       - 'Docs/**/*.md'
       - '*.md'
-      - '.github/**'
       - '.ai/**'
       - '.agents/**'
       - 'AGENTS.md'
@@ -20,21 +19,79 @@ env:
 jobs:
   build-and-test:
     if: ${{ !contains(github.event.pull_request.title, '[ci-skip]') && !contains(github.event.pull_request.title, '[docs]') }}
-    runs-on: windows-latest
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            run_tests: true
+          - name: Windows ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            run_tests: true
+          - name: macOS x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            run_tests: true
+          - name: macOS ARM64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            run_tests: true
+          - name: Linux x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            run_tests: true
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            run_tests: true
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Windows build dependencies
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            ninja-build \
+            pkg-config \
+            libgtk-3-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}
 
-      - name: Install dependencies
-        run: choco install ninja
-
-      - name: Build (release)
-        run: cargo build --release --verbose
+      - name: Build release
+        run: cargo build --release --verbose --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --verbose
+        if: matrix.run_tests
+        run: cargo test --verbose --target ${{ matrix.target }}

@@ -10,15 +10,20 @@ use skia_safe::{Color, Paint, Rect, surfaces};
 use softbuffer::{Context, Surface};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows::Win32::Foundation::HWND;
+#[cfg(windows)]
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
+#[cfg(windows)]
 use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
+#[cfg(windows)]
 use windows::core::w;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
+#[cfg(windows)]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowButtons, WindowId};
 
@@ -263,12 +268,15 @@ impl SettingsApp {
         }
     }
 
+    #[cfg(windows)]
     fn apply_titlebar_theme(window: &Window, is_light: bool) {
         if let Ok(handle) = window.window_handle()
             && let RawWindowHandle::Win32(raw) = handle.as_raw()
         {
             let hwnd = HWND(raw.hwnd.get() as _);
             let use_dark: i32 = if is_light { 0 } else { 1 };
+            // SAFETY: DwmSetWindowAttribute sets the dark titlebar flag on a valid HWND.
+            // The value pointer references a stack i32 for the duration of the call.
             unsafe {
                 let _ = DwmSetWindowAttribute(
                     hwnd,
@@ -279,6 +287,9 @@ impl SettingsApp {
             }
         }
     }
+
+    #[cfg(not(windows))]
+    fn apply_titlebar_theme(_window: &Window, _is_light: bool) {}
 
     fn build_general_items(&self) -> Vec<SettingsItem> {
         let mut items: Vec<SettingsItem> = vec![];
@@ -707,9 +718,12 @@ impl SettingsApp {
         self.items_dirty = true;
     }
 
+    #[cfg(windows)]
     fn get_monitor_list(&self) -> Vec<String> {
         use windows::Win32::Graphics::Gdi::*;
         let mut monitors: Vec<String> = Vec::new();
+        // SAFETY: EnumDisplayDevicesW reads display metadata into stack-allocated
+        // DISPLAY_DEVICEW structs. The buffers have correct cb sizes and are not retained.
         unsafe {
             let mut idx = 0u32;
             let mut active_count = 0;
@@ -756,6 +770,12 @@ impl SettingsApp {
             monitors.push("Primary".to_string());
         }
         monitors
+    }
+
+    #[cfg(not(windows))]
+    fn get_monitor_list(&self) -> Vec<String> {
+        // TODO: 后续接入平台显示器 provider；当前设置窗口先提供主显示器占位。
+        vec!["Primary".to_string()]
     }
 
     fn sync_switch_targets(&mut self) {
@@ -1503,6 +1523,7 @@ impl ApplicationHandler for SettingsApp {
 
         let frame_start = Instant::now();
         self.frame_count += 1;
+        #[cfg(windows)]
         if self.frame_count.is_multiple_of(30) {
             // SAFETY: OpenMutexW opens an existing named mutex. The mutex name is a static
             // string literal. CloseHandle is called on the valid handle returned by OpenMutexW.

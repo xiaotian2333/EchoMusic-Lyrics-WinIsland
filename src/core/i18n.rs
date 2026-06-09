@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+#[cfg(windows)]
 use windows::Win32::Globalization::GetUserDefaultLocaleName;
 
 pub struct I18n {
@@ -79,6 +80,7 @@ pub fn tr(key: &str) -> String {
     I18N.read().unwrap().get(key)
 }
 
+#[cfg(windows)]
 fn get_system_lang() -> String {
     let mut buffer = [0u16; 128];
     // SAFETY: GetUserDefaultLocaleName reads the system locale into the provided
@@ -94,4 +96,20 @@ fn get_system_lang() -> String {
         }
     }
     "en".to_string()
+}
+
+#[cfg(not(windows))]
+fn get_system_lang() -> String {
+    let locale = std::env::var("LC_ALL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("LC_MESSAGES").ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("LANG").ok())
+        .unwrap_or_default();
+    if locale.to_ascii_lowercase().starts_with("zh") {
+        "zh".to_string()
+    } else {
+        "en".to_string()
+    }
 }
