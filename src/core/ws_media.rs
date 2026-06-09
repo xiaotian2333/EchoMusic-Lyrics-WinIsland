@@ -139,7 +139,11 @@ fn handle_ws_event(
             lyrics_ws_handle.request_track_lyrics();
         }
         LyricsWsEvent::MusicData(music_data) => {
+            let was_empty = state.title.trim().is_empty();
             apply_music_data(state, info_tx, music_data);
+            if was_empty {
+                lyrics_ws_handle.get_playback_state();
+            }
         }
         LyricsWsEvent::PlaybackState {
             position_ms,
