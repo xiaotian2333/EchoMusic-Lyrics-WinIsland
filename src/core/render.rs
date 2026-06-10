@@ -682,9 +682,9 @@ pub fn draw_island(
                             });
                             for (i, ch) in chars.iter().enumerate() {
                                 let ch_y = if i < char_idx {
-                                    char_base_y - 4.0
+                                    char_base_y - 3.0
                                 } else if i == char_idx {
-                                    char_base_y - 4.0 * anim_progress
+                                    char_base_y - 3.0 * anim_progress
                                 } else {
                                     char_base_y
                                 };
@@ -796,9 +796,9 @@ pub fn draw_island(
                             });
                             for (i, ch) in chars.iter().enumerate() {
                                 let ch_y = if i < char_idx {
-                                    char_base_y - 4.0
+                                    char_base_y - 3.0
                                 } else if i == char_idx {
-                                    char_base_y - 4.0 * anim_progress
+                                    char_base_y - 3.0 * anim_progress
                                 } else {
                                     char_base_y
                                 };

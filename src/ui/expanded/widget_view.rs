@@ -346,7 +346,7 @@ pub fn draw_widget_page(
                     };
                     let mut char_x = start_x;
                     for (ci, ch) in chars.iter().enumerate() {
-                        let ch_y = if ci <= char_idx { char_base_y - 4.0 } else { char_base_y };
+                        let ch_y = if ci <= char_idx { char_base_y - 3.0 } else { char_base_y };
                         let ch_color = if ci <= char_idx { char_color_played } else { char_color_unplayed };
                         let mut ch_paint = Paint::default();
                         ch_paint.set_anti_alias(true);
