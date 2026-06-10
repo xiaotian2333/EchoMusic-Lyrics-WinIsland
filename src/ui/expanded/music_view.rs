@@ -6,8 +6,8 @@ use crate::utils::physics::Spring;
 use crate::utils::scroll::{ScrollDrawParams, ScrollText};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
-    Canvas, Color, Data, FilterMode, FontStyle, Image, MipmapMode, Paint, Point, RRect, Rect,
-    SamplingOptions, TileMode, gradient_shader, image_filters,
+    images, Canvas, Color, Data, FilterMode, FontStyle, Image, ImageInfo, ISize, MipmapMode,
+    Paint, Point, RRect, Rect, SamplingOptions, TileMode, gradient_shader, image_filters,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -185,6 +185,25 @@ pub fn get_cached_media_image(media: &MediaInfo) -> Option<Image> {
     get_cached_media_image_with_key(media).map(|(img, _)| img)
 }
 
+fn bytes_to_skia_image(data: &[u8]) -> Option<Image> {
+    if let Some(image) = Image::from_encoded(Data::new_copy(data)) {
+        return Some(image);
+    }
+    log::warn!("Skia 无法解码封面 ({} bytes)，尝试 image crate 后备", data.len());
+    let img = image::load_from_memory(data).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let raw = rgba.into_raw();
+    let info = ImageInfo::new(
+        ISize::new(w as i32, h as i32),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Unpremul,
+        None,
+    );
+    let pixel_data = Data::new_copy(&raw);
+    images::raster_from_data(&info, pixel_data, (w * 4) as usize)
+}
+
 pub fn get_cached_media_image_with_key(media: &MediaInfo) -> Option<(Image, String)> {
     if media.title.is_empty() {
         return None;
@@ -203,24 +222,13 @@ pub fn get_cached_media_image_with_key(media: &MediaInfo) -> Option<(Image, Stri
             result = Some((img.clone(), key.clone()));
             return;
         }
-        if let Some(ref bytes_arc) = media.thumbnail {
-            let data = Data::new_copy(bytes_arc);
-            if let Some(image) = Image::from_encoded(data) {
-                *cache_mut = Some((cache_key.clone(), image.clone()));
-                result = Some((image, cache_key));
-            }
+        if let Some(ref bytes_arc) = media.thumbnail
+            && let Some(image) = bytes_to_skia_image(bytes_arc)
+        {
+            *cache_mut = Some((cache_key.clone(), image.clone()));
+            result = Some((image, cache_key));
         }
     });
-    if result.is_none() {
-        COVER_FLIP_OLD_IMG.with(|cell| {
-            if let Some(old_img) = cell.borrow().as_ref() {
-                result = Some((
-                    old_img.clone(),
-                    format!("old_cover-{}-{}", media.title, media.album),
-                ));
-            }
-        });
-    }
     result
 }
 
