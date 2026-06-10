@@ -133,8 +133,8 @@ pub fn parse_music_data_payload(payload: &Value) -> Option<MusicData> {
                         .filter_map(|c| {
                             let s = c.get("s")?.as_f64()?;
                             let e = c.get("e")?.as_f64()?;
-                            let t = c.get("t")?.as_str()?.trim().to_string();
-                            if !s.is_finite() || s < 0.0 || !e.is_finite() || e < 0.0 || t.is_empty()
+                            let t = c.get("t")?.as_str()?.to_string();
+                            if !s.is_finite() || s < 0.0 || !e.is_finite() || e < 0.0
                             {
                                 return None;
                             }
