@@ -11,7 +11,7 @@ use crate::ui::expanded::music_view::{
 };
 use crate::utils::backdrop::{clear_mica_cache, disable_mica};
 use crate::utils::blur::calculate_blur_sigmas;
-use crate::utils::color::get_island_border_weights;
+use crate::utils::color::{get_island_border_weights, parse_hex_color};
 use crate::utils::icon::get_app_icon;
 use crate::utils::liquid_glass::{clear_liquid_glass_cache, set_exclude_from_capture};
 use crate::utils::mouse::{
@@ -1030,6 +1030,39 @@ impl ApplicationHandler for App {
                             music_active = true;
                         }
 
+                        let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
+                        let mut char_data = if self.config.lyrics_char_highlight {
+                            media_info.current_character_data(delay_ms)
+                        } else {
+                            None
+                        };
+                        if char_data.is_some()
+                            && self.config.lyrics_filter_scope.filters_desktop()
+                        {
+                            let lyrics = media_info.lyrics.as_ref();
+                            let current_pos = media_info.effective_position_ms(delay_ms);
+                            let is_filtered = lyrics
+                                .and_then(|ly| {
+                                    let idx = current_lyric_index(ly, current_pos)?;
+                                    if self.lyrics_filter_regex_cache
+                                        .as_ref()
+                                        .is_some_and(|r| r.is_match(ly[idx].text.trim()))
+                                    {
+                                        Some(())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .is_some();
+                            if is_filtered {
+                                char_data = None;
+                            }
+                        }
+                        let current_characters = char_data.as_ref().map(|(c, _)| *c);
+                        let current_char_idx = char_data.map(|(_, i)| i);
+                        let char_color_unplayed = parse_hex_color(&self.config.lyrics_char_color_unplayed);
+                        let char_color_played = parse_hex_color(&self.config.lyrics_char_color_played);
+
                         let widget_animating = draw_island(
                             surface,
                             crate::core::render::DrawIslandParams {
@@ -1056,6 +1089,10 @@ impl ApplicationHandler for App {
                                     old_lyric: &self.old_lyric_text,
                                     lyric_transition: self.lyric_transition,
                                     lyric_scroll_offset: self.lyric_scroll_offset,
+                                    current_characters,
+                                    current_char_idx,
+                                    char_color_unplayed,
+                                    char_color_played,
                                 },
                                 window: crate::core::render::WindowParams {
                                     win_x: self.win_x,

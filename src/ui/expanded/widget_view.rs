@@ -1,5 +1,5 @@
 use crate::core::config::LyricsFilterScope;
-use crate::core::lyrics::current_lyric_index;
+use crate::core::lyrics::{current_character_index, current_lyric_index};
 use crate::core::media_info::MediaInfo;
 use crate::icons::arrows::draw_arrow_left;
 use crate::ui::expanded::music_view::draw_text_cached;
@@ -138,6 +138,8 @@ pub fn draw_widget_page(
     lyrics_filter_regex: Option<&regex::Regex>,
     dt: f32,
     text_color: Color,
+    char_color_unplayed: Color,
+    char_color_played: Color,
 ) -> bool {
     let arrow_alpha = alpha;
     if arrow_alpha > 0 {
@@ -329,6 +331,45 @@ pub fn draw_widget_page(
 
         if text_alpha < 0.05 {
             continue;
+        }
+
+        if is_current && !is_old_current && let Some(chars) = lyrics[raw_idx].characters.as_ref() {
+                let current_pos = (raw_pos as i64 + (lyrics_delay * 1000.0) as i64).max(0) as u64;
+                let char_idx = current_character_index(chars, current_pos);
+                if let Some(char_idx) = char_idx {
+                    let total_w: f32 = chars.iter().map(|c| FontManager::global().measure_text_cached(&c.t, font_sz, FontStyle::normal())).sum();
+                    let char_base_y = line_y + 2.0;
+                    let start_x = if should_scroll {
+                        lyric_area_left + 2.0 * scale - current_scroll_offset
+                    } else {
+                        center_x - total_w / 2.0
+                    };
+                    let mut char_x = start_x;
+                    for (ci, ch) in chars.iter().enumerate() {
+                        let ch_y = if ci <= char_idx { char_base_y - 4.0 } else { char_base_y };
+                        let ch_color = if ci <= char_idx { char_color_played } else { char_color_unplayed };
+                        let mut ch_paint = Paint::default();
+                        ch_paint.set_anti_alias(true);
+                        ch_paint.set_color(Color::from_argb(
+                            (text_alpha * 255.0).min(255.0) as u8,
+                            ch_color.r(),
+                            ch_color.g(),
+                            ch_color.b(),
+                        ));
+                        let ch_w = FontManager::global().measure_text_cached(&ch.t, font_sz, FontStyle::normal());
+                        draw_text_cached(DrawTextCachedParams {
+                            canvas,
+                            text: &ch.t,
+                            x: char_x,
+                            y: ch_y,
+                            size: font_sz,
+                            bold: false,
+                            paint: &ch_paint,
+                        });
+                        char_x += ch_w;
+                    }
+                    continue;
+                }
         }
 
         let mut text_paint = Paint::default();

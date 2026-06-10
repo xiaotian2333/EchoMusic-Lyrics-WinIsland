@@ -14,13 +14,28 @@ use skia_safe::Rect;
 
 impl SettingsApp {
     pub(super) fn commit_text_input(&mut self) {
-        if let Some(FocusedTextInput::LyricsFilterRegex) = self.focused_text_input {
-            self.config.lyrics_filter_regex = self.text_input_buffer.clone();
-            if regex::Regex::new(&self.config.lyrics_filter_regex).is_ok() {
+        match self.focused_text_input {
+            Some(FocusedTextInput::FilterRegex) => {
+                self.config.lyrics_filter_regex = self.text_input_buffer.clone();
+                if regex::Regex::new(&self.config.lyrics_filter_regex).is_ok() {
+                    self.focused_text_input = None;
+                    self.text_input_buffer.clear();
+                }
+                save_config(&self.config);
+            }
+            Some(FocusedTextInput::CharColorUnplayed) => {
+                self.config.lyrics_char_color_unplayed = self.text_input_buffer.clone();
                 self.focused_text_input = None;
                 self.text_input_buffer.clear();
+                save_config(&self.config);
             }
-            save_config(&self.config);
+            Some(FocusedTextInput::CharColorPlayed) => {
+                self.config.lyrics_char_color_played = self.text_input_buffer.clone();
+                self.focused_text_input = None;
+                self.text_input_buffer.clear();
+                save_config(&self.config);
+            }
+            None => {}
         }
         self.mark_items_dirty();
         if let Some(win) = &self.window {
@@ -623,6 +638,11 @@ impl SettingsApp {
                                 self.config.lyrics_scroll = !self.config.lyrics_scroll
                             }
                         }
+                        l if l == tr("lyrics_char_highlight") => {
+                            if self.config.show_lyrics {
+                                self.config.lyrics_char_highlight = !self.config.lyrics_char_highlight
+                            }
+                        }
                         _ => {
                             log::warn!(
                                 "EchoMusic-Lyrics-WinIsland: unhandled switch label: {}",
@@ -708,14 +728,28 @@ impl SettingsApp {
             ClickResult::TextInput(idx) => {
                 if let Some(SettingsItem::RowTextInput { label, enabled, .. }) = items.get(idx)
                     && *enabled
-                    && label == &tr("lyrics_filter_regex")
                 {
-                    self.focused_text_input = Some(FocusedTextInput::LyricsFilterRegex);
-                    self.text_input_buffer = self.config.lyrics_filter_regex.clone();
-                    self.popup = None;
-                    self.mark_items_dirty();
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
+                    match label.as_str() {
+                        l if l == tr("lyrics_filter_regex") => {
+                            self.focused_text_input = Some(FocusedTextInput::FilterRegex);
+                            self.text_input_buffer = self.config.lyrics_filter_regex.clone();
+                        }
+                        l if l == tr("lyrics_char_color_unplayed") => {
+                            self.focused_text_input = Some(FocusedTextInput::CharColorUnplayed);
+                            self.text_input_buffer = self.config.lyrics_char_color_unplayed.clone();
+                        }
+                        l if l == tr("lyrics_char_color_played") => {
+                            self.focused_text_input = Some(FocusedTextInput::CharColorPlayed);
+                            self.text_input_buffer = self.config.lyrics_char_color_played.clone();
+                        }
+                        _ => {}
+                    }
+                    if self.focused_text_input.is_some() {
+                        self.popup = None;
+                        self.mark_items_dirty();
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
                     }
                 }
             }

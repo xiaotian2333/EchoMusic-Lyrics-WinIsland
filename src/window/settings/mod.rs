@@ -50,7 +50,9 @@ enum PopupKind {
 }
 
 enum FocusedTextInput {
-    LyricsFilterRegex,
+    FilterRegex,
+    CharColorUnplayed,
+    CharColorPlayed,
 }
 
 struct PopupState {
@@ -203,6 +205,7 @@ impl SettingsApp {
             config.show_lyrics,
             config.lyrics_scroll,
             config.hover_to_hide,
+            config.lyrics_char_highlight,
         ]);
         Self {
             window: None,
@@ -622,7 +625,7 @@ impl SettingsApp {
                 label: tr("lyrics_filter_regex"),
                 value: if matches!(
                     self.focused_text_input,
-                    Some(FocusedTextInput::LyricsFilterRegex)
+                    Some(FocusedTextInput::FilterRegex)
                 ) {
                     self.text_input_buffer.clone()
                 } else {
@@ -634,7 +637,53 @@ impl SettingsApp {
                     && regex::Regex::new(&self.config.lyrics_filter_regex).is_err(),
                 focused: matches!(
                     self.focused_text_input,
-                    Some(FocusedTextInput::LyricsFilterRegex)
+                    Some(FocusedTextInput::FilterRegex)
+                ),
+            },
+            SettingsItem::GroupEnd,
+            SettingsItem::SectionHeader {
+                label: tr("lyrics_char_highlight"),
+            },
+            SettingsItem::GroupStart,
+            SettingsItem::RowSwitch {
+                label: tr("lyrics_char_highlight"),
+                on: self.config.lyrics_char_highlight,
+                enabled: show_lyrics,
+            },
+            SettingsItem::RowTextInput {
+                label: tr("lyrics_char_color_unplayed"),
+                value: if matches!(
+                    self.focused_text_input,
+                    Some(FocusedTextInput::CharColorUnplayed)
+                ) {
+                    self.text_input_buffer.clone()
+                } else {
+                    self.config.lyrics_char_color_unplayed.clone()
+                },
+                placeholder: tr("lyrics_char_color_placeholder"),
+                enabled: show_lyrics && self.config.lyrics_char_highlight,
+                invalid: false,
+                focused: matches!(
+                    self.focused_text_input,
+                    Some(FocusedTextInput::CharColorUnplayed)
+                ),
+            },
+            SettingsItem::RowTextInput {
+                label: tr("lyrics_char_color_played"),
+                value: if matches!(
+                    self.focused_text_input,
+                    Some(FocusedTextInput::CharColorPlayed)
+                ) {
+                    self.text_input_buffer.clone()
+                } else {
+                    self.config.lyrics_char_color_played.clone()
+                },
+                placeholder: tr("lyrics_char_color_placeholder"),
+                enabled: show_lyrics && self.config.lyrics_char_highlight,
+                invalid: false,
+                focused: matches!(
+                    self.focused_text_input,
+                    Some(FocusedTextInput::CharColorPlayed)
                 ),
             },
             SettingsItem::GroupEnd,
@@ -795,6 +844,10 @@ impl SettingsApp {
             false
         };
         self.switch_anim.set_target(10, fw_on);
+        self.switch_anim.set_target(
+            12,
+            self.config.show_lyrics && self.config.lyrics_char_highlight,
+        );
     }
 
     fn draw(&mut self) {
@@ -1202,7 +1255,7 @@ impl SettingsApp {
                 2 => SwitchAnimator::new_with_anims(&self.switch_anim, &[6, 7, 11, 8]),
                 _ => SwitchAnimator::new(&[]),
             },
-            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10]),
+            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10, 12]),
             _ => SwitchAnimator::new(&[]),
         }
     }

@@ -202,6 +202,12 @@ pub struct AppConfig {
     pub auto_gate: bool,
     #[serde(default = "default_mini_controls")]
     pub mini_controls: bool,
+    #[serde(default = "default_lyrics_char_highlight")]
+    pub lyrics_char_highlight: bool,
+    #[serde(default = "default_lyrics_char_color_unplayed")]
+    pub lyrics_char_color_unplayed: String,
+    #[serde(default = "default_lyrics_char_color_played")]
+    pub lyrics_char_color_played: String,
 }
 
 fn default_island_style() -> String {
@@ -320,6 +326,18 @@ fn default_mini_controls() -> bool {
     false
 }
 
+fn default_lyrics_char_highlight() -> bool {
+    true
+}
+
+fn default_lyrics_char_color_unplayed() -> String {
+    "auto".to_string()
+}
+
+fn default_lyrics_char_color_played() -> String {
+    "auto".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -360,6 +378,9 @@ impl Default for AppConfig {
             audio_gate: true,
             auto_gate: true,
             mini_controls: false,
+            lyrics_char_highlight: true,
+            lyrics_char_color_unplayed: "auto".to_string(),
+            lyrics_char_color_played: "auto".to_string(),
         }
     }
 }

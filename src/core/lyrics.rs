@@ -3,10 +3,18 @@ use std::sync::Arc;
 
 const MAX_COVER_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LyricCharacter {
+    pub s: u64,
+    pub e: u64,
+    pub t: String,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct LyricLine {
     pub time_ms: u64,
     pub text: String,
+    pub characters: Option<Vec<LyricCharacter>>,
 }
 
 pub fn current_lyric_index(lyrics: &[LyricLine], current_pos: u64) -> Option<usize> {
@@ -17,6 +25,15 @@ pub fn current_lyric_index(lyrics: &[LyricLine], current_pos: u64) -> Option<usi
         Ok(idx) => Some(idx),
         Err(idx) => idx.checked_sub(1),
     }
+}
+
+pub fn current_character_index(characters: &[LyricCharacter], current_pos: u64) -> Option<usize> {
+    if characters.is_empty() {
+        return None;
+    }
+    characters
+        .iter()
+        .rposition(|c| current_pos >= c.s)
 }
 
 pub fn filtered_lyric_text<F>(
@@ -110,9 +127,31 @@ pub fn parse_music_data_payload(payload: &Value) -> Option<MusicData> {
             if !time_ms.is_finite() || time_ms < 0.0 {
                 return None;
             }
+            let characters = line.get("characters").and_then(|v| v.as_array()).map(
+                |arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            let s = c.get("s")?.as_f64()?;
+                            let e = c.get("e")?.as_f64()?;
+                            let t = c.get("t")?.as_str()?.trim().to_string();
+                            if !s.is_finite() || s < 0.0 || !e.is_finite() || e < 0.0 || t.is_empty()
+                            {
+                                return None;
+                            }
+                            Some(LyricCharacter {
+                                s: s.round() as u64,
+                                e: e.round() as u64,
+                                t,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .filter(|chars: &Vec<LyricCharacter>| !chars.is_empty());
             Some(LyricLine {
                 time_ms: time_ms.round() as u64,
                 text,
+                characters,
             })
         })
         .collect::<Vec<_>>();
@@ -270,7 +309,40 @@ mod tests {
             Some(&[1, 2, 3, 4][..])
         );
         assert_eq!(music_data.lyrics[0].time_ms, 3430);
+        assert_eq!(music_data.lyrics[0].characters, None);
         assert_eq!(music_data.lyrics[1].time_ms, 15620);
+    }
+
+    #[test]
+    fn parse_music_data_payload_with_characters() {
+        let payload = json!({
+            "Metadata": { "title": "歌曲名", "cover_base64": "" },
+            "lyrics": [
+                {
+                    "time_ms": 3430,
+                    "text": "第一句歌词",
+                    "characters": [
+                        { "s": 3430, "e": 3550, "t": "第" },
+                        { "s": 3550, "e": 3670, "t": "一" },
+                        { "s": 3670, "e": 3790, "t": "句" }
+                    ]
+                },
+                {
+                    "time_ms": 15620,
+                    "text": "第二句歌词"
+                }
+            ]
+        });
+
+        let music_data = parse_music_data_payload(&payload).expect("应能解析带逐字的 MusicData");
+        let line0 = &music_data.lyrics[0];
+        let chars = line0.characters.as_ref().expect("应有逐字数据");
+        assert_eq!(chars.len(), 3);
+        assert_eq!(chars[0].s, 3430);
+        assert_eq!(chars[0].e, 3550);
+        assert_eq!(chars[0].t, "第");
+        assert_eq!(chars[2].t, "句");
+        assert!(music_data.lyrics[1].characters.is_none());
     }
 
     #[test]

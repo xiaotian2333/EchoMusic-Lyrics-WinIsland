@@ -1,4 +1,5 @@
 use crate::core::config::{DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET};
+use crate::core::lyrics::LyricCharacter;
 use crate::core::media_info::MediaInfo;
 use crate::icons::controls::draw_play_button;
 use crate::ui::expanded::music_view::{
@@ -23,6 +24,8 @@ use winit::window::Window;
 thread_local! {
     static SK_SURFACE: RefCell<Option<SkSurface>> = const { RefCell::new(None) };
     static MINI_COVER_ROTATION: RefCell<f32> = const { RefCell::new(0.0) };
+    static CHAR_LIFT_ANIM: RefCell<f32> = const { RefCell::new(1.0) };
+    static LAST_CHAR_IDX: RefCell<Option<usize>> = const { RefCell::new(None) };
 
 }
 
@@ -51,6 +54,10 @@ pub struct LyricsParams<'a> {
     pub old_lyric: &'a str,
     pub lyric_transition: f32,
     pub lyric_scroll_offset: f32,
+    pub current_characters: Option<&'a [LyricCharacter]>,
+    pub current_char_idx: Option<usize>,
+    pub char_color_unplayed: Option<Color>,
+    pub char_color_played: Option<Color>,
 }
 
 pub struct WindowParams {
@@ -120,6 +127,10 @@ pub fn draw_island(
         old_lyric,
         lyric_transition,
         lyric_scroll_offset,
+        current_characters,
+        current_char_idx,
+        char_color_unplayed,
+        char_color_played,
     } = lyrics;
     let WindowParams {
         win_x,
@@ -360,6 +371,15 @@ pub fn draw_island(
         ]
     };
 
+    let resolved_char_unplayed = char_color_unplayed.unwrap_or(text_color);
+    let resolved_char_played = char_color_played.unwrap_or_else(|| {
+        palette
+            .first()
+            .filter(|c| !(c.r() >= 250 && c.g() >= 250 && c.b() >= 250))
+            .copied()
+            .unwrap_or(text_color)
+    });
+
     let viz_h_scale = 0.45 + (1.0 - 0.45) * expansion_progress;
 
     let mut widget_animating = false;
@@ -417,6 +437,8 @@ pub fn draw_island(
             lyrics_filter_regex,
             dt,
             text_color,
+            resolved_char_unplayed,
+            resolved_char_played,
         );
         canvas.restore();
 
@@ -625,46 +647,96 @@ pub fn draw_island(
                         let mut text_paint = Paint::default();
                         text_paint.set_anti_alias(true);
                         let fade_alpha = (alpha as f32 * lyric_transition) as u8;
-                        text_paint.set_color(Color::from_argb(
-                            fade_alpha,
-                            text_color.r(),
-                            text_color.g(),
-                            text_color.b(),
-                        ));
 
                         let blur_sigma = (1.0 - lyric_transition) * 12.0 * non_expanded_scale;
-                        if blur_sigma > 0.1 {
-                            text_paint.set_image_filter(image_filters::blur(
-                                (blur_sigma, 0.0),
-                                None,
-                                None,
-                                None,
-                            ));
-                        }
+                        let blur_filter = if blur_sigma > 0.1 {
+                            image_filters::blur((blur_sigma, 0.0), None, None, None)
+                        } else {
+                            None
+                        };
 
                         let text_y = offset_y
                             + current_h / 2.0
                             + 4.0 * non_expanded_scale
                             + (10.0 * non_expanded_scale * (1.0 - lyric_transition));
-                        let cur_lx = if text_centered {
-                            let w = FontManager::global().measure_text_cached(
-                                current_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            text_x - w / 2.0
+
+                        if let (Some(chars), Some(char_idx)) = (current_characters, current_char_idx) {
+                            let total_w: f32 = chars.iter().map(|c| FontManager::global().measure_text_cached(&c.t, lyric_font_sz, skia_safe::FontStyle::normal())).sum();
+                            let start_x = if text_centered { text_x - total_w / 2.0 } else { text_x };
+                            let char_base_y = text_y + 2.0;
+                            let mut char_x = start_x;
+                            let anim_progress = CHAR_LIFT_ANIM.with(|cell| {
+                                LAST_CHAR_IDX.with(|last| {
+                                    let mut last = last.borrow_mut();
+                                    if *last != Some(char_idx) {
+                                        *last = Some(char_idx);
+                                        cell.replace(0.0);
+                                    }
+                                });
+                                let val = *cell.borrow();
+                                if val < 1.0 {
+                                    *cell.borrow_mut() += 8.0 * dt / 60.0;
+                                    if *cell.borrow() > 1.0 { *cell.borrow_mut() = 1.0; }
+                                }
+                                *cell.borrow()
+                            });
+                            for (i, ch) in chars.iter().enumerate() {
+                                let ch_y = if i < char_idx {
+                                    char_base_y - 4.0
+                                } else if i == char_idx {
+                                    char_base_y - 4.0 * anim_progress
+                                } else {
+                                    char_base_y
+                                };
+                                let ch_color = if i <= char_idx { resolved_char_played } else { resolved_char_unplayed };
+                                let mut ch_paint = Paint::default();
+                                ch_paint.set_anti_alias(true);
+                                ch_paint.set_color(Color::from_argb(fade_alpha, ch_color.r(), ch_color.g(), ch_color.b()));
+                                if let Some(ref filter) = blur_filter {
+                                    ch_paint.set_image_filter(filter.clone());
+                                }
+                                let ch_w = FontManager::global().measure_text_cached(&ch.t, lyric_font_sz, skia_safe::FontStyle::normal());
+                                draw_text_cached(DrawTextCachedParams {
+                                    canvas,
+                                    text: &ch.t,
+                                    x: char_x,
+                                    y: ch_y,
+                                    size: lyric_font_sz,
+                                    bold: false,
+                                    paint: &ch_paint,
+                                });
+                                char_x += ch_w;
+                            }
                         } else {
-                            text_x
-                        };
-                        draw_text_cached(DrawTextCachedParams {
-                            canvas,
-                            text: current_lyric,
-                            x: cur_lx,
-                            y: text_y,
-                            size: lyric_font_sz,
-                            bold: false,
-                            paint: &text_paint,
-                        });
+                            text_paint.set_color(Color::from_argb(
+                                fade_alpha,
+                                text_color.r(),
+                                text_color.g(),
+                                text_color.b(),
+                            ));
+                            if let Some(ref filter) = blur_filter {
+                                text_paint.set_image_filter(filter.clone());
+                            }
+                            let cur_lx = if text_centered {
+                                let w = FontManager::global().measure_text_cached(
+                                    current_lyric,
+                                    lyric_font_sz,
+                                    skia_safe::FontStyle::normal(),
+                                );
+                                text_x - w / 2.0
+                            } else {
+                                text_x
+                            };
+                            draw_text_cached(DrawTextCachedParams {
+                                canvas,
+                                text: current_lyric,
+                                x: cur_lx,
+                                y: text_y,
+                                size: lyric_font_sz,
+                                bold: false,
+                                paint: &text_paint,
+                            });
+                        }
                     }
                 } else {
                     let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
@@ -699,35 +771,82 @@ pub fn draw_island(
                             paint: &text_paint,
                         });
                     } else if lyric_transition >= 0.5 && !current_lyric.is_empty() {
-                        let mut text_paint = Paint::default();
-                        text_paint.set_anti_alias(true);
                         let progress = (lyric_transition - 0.5) * 2.0;
                         let fade_alpha = (alpha as f32 * progress) as u8;
-                        text_paint.set_color(Color::from_argb(
-                            fade_alpha,
-                            text_color.r(),
-                            text_color.g(),
-                            text_color.b(),
-                        ));
-                        let cur_lx2 = if text_centered {
-                            let w = FontManager::global().measure_text_cached(
-                                current_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            text_x - w / 2.0
+
+                        if let (Some(chars), Some(char_idx)) = (current_characters, current_char_idx) {
+                            let total_w: f32 = chars.iter().map(|c| FontManager::global().measure_text_cached(&c.t, lyric_font_sz, skia_safe::FontStyle::normal())).sum();
+                            let start_x = if text_centered { text_x - total_w / 2.0 } else { text_x };
+                            let char_base_y = text_y + 2.0;
+                            let mut char_x = start_x;
+                            let anim_progress = CHAR_LIFT_ANIM.with(|cell| {
+                                LAST_CHAR_IDX.with(|last| {
+                                    let mut last = last.borrow_mut();
+                                    if *last != Some(char_idx) {
+                                        *last = Some(char_idx);
+                                        cell.replace(0.0);
+                                    }
+                                });
+                                let val = *cell.borrow();
+                                if val < 1.0 {
+                                    *cell.borrow_mut() += 8.0 * dt / 60.0;
+                                    if *cell.borrow() > 1.0 { *cell.borrow_mut() = 1.0; }
+                                }
+                                *cell.borrow()
+                            });
+                            for (i, ch) in chars.iter().enumerate() {
+                                let ch_y = if i < char_idx {
+                                    char_base_y - 4.0
+                                } else if i == char_idx {
+                                    char_base_y - 4.0 * anim_progress
+                                } else {
+                                    char_base_y
+                                };
+                                let ch_color = if i <= char_idx { resolved_char_played } else { resolved_char_unplayed };
+                                let mut ch_paint = Paint::default();
+                                ch_paint.set_anti_alias(true);
+                                ch_paint.set_color(Color::from_argb(fade_alpha, ch_color.r(), ch_color.g(), ch_color.b()));
+                                let ch_w = FontManager::global().measure_text_cached(&ch.t, lyric_font_sz, skia_safe::FontStyle::normal());
+                                draw_text_cached(DrawTextCachedParams {
+                                    canvas,
+                                    text: &ch.t,
+                                    x: char_x,
+                                    y: ch_y,
+                                    size: lyric_font_sz,
+                                    bold: false,
+                                    paint: &ch_paint,
+                                });
+                                char_x += ch_w;
+                            }
                         } else {
-                            text_x
-                        };
-                        draw_text_cached(DrawTextCachedParams {
-                            canvas,
-                            text: current_lyric,
-                            x: cur_lx2,
-                            y: text_y,
-                            size: lyric_font_sz,
-                            bold: false,
-                            paint: &text_paint,
-                        });
+                            let mut text_paint = Paint::default();
+                            text_paint.set_anti_alias(true);
+                            text_paint.set_color(Color::from_argb(
+                                fade_alpha,
+                                text_color.r(),
+                                text_color.g(),
+                                text_color.b(),
+                            ));
+                            let cur_lx2 = if text_centered {
+                                let w = FontManager::global().measure_text_cached(
+                                    current_lyric,
+                                    lyric_font_sz,
+                                    skia_safe::FontStyle::normal(),
+                                );
+                                text_x - w / 2.0
+                            } else {
+                                text_x
+                            };
+                            draw_text_cached(DrawTextCachedParams {
+                                canvas,
+                                text: current_lyric,
+                                x: cur_lx2,
+                                y: text_y,
+                                size: lyric_font_sz,
+                                bold: false,
+                                paint: &text_paint,
+                            });
+                        }
                     }
                 }
                 canvas.restore();
