@@ -246,6 +246,9 @@ fn apply_music_data(
         if let Some(ref cover) = metadata.cover {
             state.thumbnail = Some(cover.clone());
             state.thumbnail_hash = hash_thumbnail_bytes(cover);
+        } else {
+            state.thumbnail = None;
+            state.thumbnail_hash = 0;
         }
         let _ = info_tx.send(state.clone());
         return;
@@ -289,6 +292,9 @@ fn apply_music_data(
             state.thumbnail = Some(cover.clone());
             state.thumbnail_hash = hash;
         }
+    } else {
+        state.thumbnail = None;
+        state.thumbnail_hash = 0;
     }
 
     let _ = info_tx.send(state.clone());

@@ -1201,18 +1201,23 @@ impl ApplicationHandler for App {
             let title_changed = media.title != self.last_media_title;
             let thumbnail_changed = media.thumbnail_hash != self.last_media_thumbnail_hash;
             if title_changed {
-                let should_flip_cover = media.thumbnail_hash != 0 && thumbnail_changed;
                 self.last_media_title = media.title.clone();
                 self.last_media_thumbnail_hash = media.thumbnail_hash;
-                if should_flip_cover {
-                    crate::ui::expanded::music_view::trigger_cover_flip();
+                if thumbnail_changed {
+                    if media.thumbnail_hash != 0 {
+                        crate::ui::expanded::music_view::trigger_cover_flip();
+                    } else {
+                        crate::ui::expanded::music_view::clear_cover_cache();
+                    }
+                    crate::utils::backdrop::clear_dynamic_bg_cache();
+                    window.request_redraw();
                 }
-                crate::utils::backdrop::clear_dynamic_bg_cache();
-                window.request_redraw();
             } else if thumbnail_changed {
                 self.last_media_thumbnail_hash = media.thumbnail_hash;
                 if media.thumbnail_hash != 0 {
                     crate::ui::expanded::music_view::trigger_cover_flip();
+                } else {
+                    crate::ui::expanded::music_view::clear_cover_cache();
                 }
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 window.request_redraw();
