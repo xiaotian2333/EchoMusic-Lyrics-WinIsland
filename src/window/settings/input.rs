@@ -310,6 +310,17 @@ impl SettingsApp {
                                 (self.config.hover_to_hide_distance + 10.0).min(300.0);
                         }
                         changed = true;
+                    } else if l == tr("hover_to_hide_delay") {
+                        if is_dec {
+                            self.config.hover_to_hide_delay =
+                                ((self.config.hover_to_hide_delay * 10.0 - 1.0).round() / 10.0)
+                                    .max(0.2);
+                        } else {
+                            self.config.hover_to_hide_delay =
+                                ((self.config.hover_to_hide_delay * 10.0 + 1.0).round() / 10.0)
+                                    .min(3.0);
+                        }
+                        changed = true;
                     }
                 }
             }

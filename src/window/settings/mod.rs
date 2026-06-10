@@ -514,6 +514,11 @@ impl SettingsApp {
                         value: format!("{:.0}", self.config.hover_to_hide_distance),
                         enabled: true,
                     });
+                    items.push(SettingsItem::RowStepper {
+                        label: tr("hover_to_hide_delay"),
+                        value: format!("{:.1}", self.config.hover_to_hide_delay),
+                        enabled: true,
+                    });
                 }
                 items.push(SettingsItem::RowSourceSelect {
                     label: tr("language"),

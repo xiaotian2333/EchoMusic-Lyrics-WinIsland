@@ -1214,7 +1214,7 @@ impl ApplicationHandler for App {
             } else if !cursor_in_outer {
                 match self.hover_to_hide_enter_at {
                     None => self.hover_to_hide_enter_at = Some(Instant::now()),
-                    Some(t) if t.elapsed() >= Duration::from_secs_f64(1.5) => {
+                    Some(t) if t.elapsed() >= Duration::from_secs_f64(self.config.hover_to_hide_delay as f64) => {
                         self.auto_hidden = false;
                         self.idle_timer = Instant::now();
                         self.spring_hide.velocity = -0.45;
