@@ -25,6 +25,10 @@ const GITHUB_RELEASES_API: &str =
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const ASSET_PREFIX: &str = "EchoMusic-Lyrics-WinIsland";
 
+const MIRROR_BASE: &str = "https://gh-mirror.928233.xyz";
+const MIRROR_REPO_API: &str =
+    "https://gh-mirror.928233.xyz/api/repos/xiaotian2333/EchoMusic-Lyrics-WinIsland";
+
 #[derive(Deserialize, Debug, Clone)]
 struct GitHubRelease {
     tag_name: String,
@@ -45,6 +49,25 @@ struct GitHubAsset {
     size: Option<u64>,
 }
 
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+struct MirrorRepoResponse {
+    latest_tag: Option<String>,
+    #[serde(default)]
+    latest_prerelease_tag: Option<String>,
+    status: Option<String>,
+    #[serde(default)]
+    assets: Vec<MirrorAsset>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+struct MirrorAsset {
+    name: String,
+    size: Option<String>,
+    url: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct UpdateCandidate {
     tag_name: String,
@@ -52,6 +75,7 @@ struct UpdateCandidate {
     download_url: String,
     asset_size: Option<u64>,
     version: [u64; 3],
+    mirror_download_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -157,6 +181,69 @@ async fn prompt_update(candidate: UpdateCandidate) {
 async fn fetch_latest_update() -> Result<Option<UpdateCandidate>, UpdateCheckError> {
     let asset_name = expected_asset_name().ok_or(UpdateCheckError::UnsupportedArch)?;
     let local_version = parse_version(APP_VERSION).ok_or(UpdateCheckError::InvalidLocalVersion)?;
+
+    if let Ok(candidate) = fetch_from_mirror(&asset_name, local_version).await {
+        return Ok(candidate);
+    }
+
+    fetch_from_github(&asset_name, local_version).await
+}
+
+async fn fetch_from_mirror(
+    asset_name: &str,
+    local_version: [u64; 3],
+) -> Result<Option<UpdateCandidate>, UpdateCheckError> {
+    let resp = HTTP_CLIENT
+        .get(MIRROR_REPO_API)
+        .header(USER_AGENT, user_agent())
+        .send()
+        .await
+        .map_err(|_| UpdateCheckError::Request)?;
+    if !resp.status().is_success() {
+        return Err(UpdateCheckError::Request);
+    }
+
+    let repo: MirrorRepoResponse = resp.json().await.map_err(|_| UpdateCheckError::Request)?;
+    if repo.status.as_deref() != Some("ok") {
+        return Err(UpdateCheckError::Request);
+    }
+
+    let tag = match &repo.latest_tag {
+        Some(tag) if parse_version(tag).is_some() => tag.clone(),
+        _ => return Err(UpdateCheckError::Request),
+    };
+    let version = parse_version(&tag).unwrap();
+    if version <= local_version {
+        return Ok(None);
+    }
+
+    let Some(asset) = repo.assets.iter().find(|a| a.name == asset_name) else {
+        return Err(UpdateCheckError::Request);
+    };
+    let Some(url) = &asset.url else {
+        return Err(UpdateCheckError::Request);
+    };
+
+    let mirror_url = format!("{}{}", MIRROR_BASE, url);
+    let github_url = format!(
+        "https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland/releases/download/{}/{}",
+        tag, asset_name
+    );
+
+    Ok(Some(UpdateCandidate {
+        tag_name: tag,
+        published_at: None,
+        download_url: github_url,
+        asset_size: None,
+        version,
+        mirror_download_url: Some(mirror_url),
+    }))
+}
+
+async fn fetch_from_github(
+    asset_name: &str,
+    local_version: [u64; 3],
+) -> Result<Option<UpdateCandidate>, UpdateCheckError> {
     let resp = HTTP_CLIENT
         .get(GITHUB_RELEASES_API)
         .header(ACCEPT, "application/vnd.github+json")
@@ -187,12 +274,18 @@ async fn fetch_latest_update() -> Result<Option<UpdateCandidate>, UpdateCheckErr
             continue;
         }
 
+        let mirror_url = format!(
+            "{}/github/xiaotian2333/EchoMusic-Lyrics-WinIsland/releases/download/{}/{}",
+            MIRROR_BASE, release.tag_name, asset_name
+        );
+
         let candidate = UpdateCandidate {
             tag_name: release.tag_name,
             published_at: release.published_at,
             download_url: asset.browser_download_url.clone(),
             asset_size: asset.size,
             version,
+            mirror_download_url: Some(mirror_url),
         };
         let should_replace = match &best {
             Some(current) => candidate.version > current.version,
@@ -207,25 +300,33 @@ async fn fetch_latest_update() -> Result<Option<UpdateCandidate>, UpdateCheckErr
 }
 
 async fn perform_update(candidate: UpdateCandidate) {
-    let response = match HTTP_CLIENT
-        .get(&candidate.download_url)
-        .header(USER_AGENT, user_agent())
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => resp,
-        _ => {
-            show_error_box(tr("update_failed_title"), tr("update_failed_dl")).await;
-            return;
-        }
-    };
+    let mut dl_urls: Vec<String> = Vec::new();
+    if let Some(ref url) = candidate.mirror_download_url {
+        dl_urls.push(url.clone());
+    }
+    dl_urls.push(candidate.download_url.clone());
 
-    let bytes = match response.bytes().await {
-        Ok(b) => b.to_vec(),
-        Err(_) => {
-            show_error_box(tr("update_failed_title"), tr("update_failed_dl")).await;
-            return;
+    let mut bytes: Option<Vec<u8>> = None;
+    for url in &dl_urls {
+        match HTTP_CLIENT
+            .get(url)
+            .header(USER_AGENT, user_agent())
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(b) = resp.bytes().await {
+                    bytes = Some(b.to_vec());
+                    break;
+                }
+            }
+            _ => continue,
         }
+    }
+
+    let Some(bytes) = bytes else {
+        show_error_box(tr("update_failed_title"), tr("update_failed_dl")).await;
+        return;
     };
     if let Some(expected_size) = candidate.asset_size
         && expected_size > 0
