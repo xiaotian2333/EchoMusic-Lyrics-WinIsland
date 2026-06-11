@@ -140,6 +140,7 @@ pub fn draw_widget_page(
     text_color: Color,
     char_color_unplayed: Color,
     char_color_played: Color,
+    char_highlight: bool,
 ) -> bool {
     let arrow_alpha = alpha;
     if arrow_alpha > 0 {
@@ -333,7 +334,7 @@ pub fn draw_widget_page(
             continue;
         }
 
-        if is_current && !is_old_current && let Some(chars) = lyrics[raw_idx].characters.as_ref() {
+        if char_highlight && is_current && !is_old_current && let Some(chars) = lyrics[raw_idx].characters.as_ref() {
                 let current_pos = (raw_pos as i64 + (lyrics_delay * 1000.0) as i64).max(0) as u64;
                 let char_idx = current_character_index(chars, current_pos);
                 if let Some(char_idx) = char_idx {

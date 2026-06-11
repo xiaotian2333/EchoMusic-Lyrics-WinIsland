@@ -1093,6 +1093,7 @@ impl ApplicationHandler for App {
                                     current_char_idx,
                                     char_color_unplayed,
                                     char_color_played,
+                                    char_highlight: self.config.lyrics_char_highlight,
                                 },
                                 window: crate::core::render::WindowParams {
                                     win_x: self.win_x,

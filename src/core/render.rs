@@ -58,6 +58,7 @@ pub struct LyricsParams<'a> {
     pub current_char_idx: Option<usize>,
     pub char_color_unplayed: Option<Color>,
     pub char_color_played: Option<Color>,
+    pub char_highlight: bool,
 }
 
 pub struct WindowParams {
@@ -131,6 +132,7 @@ pub fn draw_island(
         current_char_idx,
         char_color_unplayed,
         char_color_played,
+        char_highlight,
     } = lyrics;
     let WindowParams {
         win_x,
@@ -439,6 +441,7 @@ pub fn draw_island(
             text_color,
             resolved_char_unplayed,
             resolved_char_played,
+            char_highlight,
         );
         canvas.restore();
 
