@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EchoMusic-Lyrics-WinIsland",
+  "version": "1.1.7",
+  "identifier": "io.github.xiaotian2333.echomusic-lyrics-winisland",
+  "build": {
+    "frontendDist": "settings-ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "settings",
+        "title": "EchoMusic-Lyrics-WinIsland Settings",
+        "width": 666,
+        "height": 666,
+        "minWidth": 666,
+        "minHeight": 666,
+        "resizable": true,
+        "decorations": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": [
+      "resources/icon.png",
+      "resources/icon-dark.ico"
+    ]
+  }
+}

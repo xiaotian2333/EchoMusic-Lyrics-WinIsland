@@ -12,17 +12,6 @@ type TextGroups = Vec<TextGroup>;
 type TextCacheValue = (f32, TextGroups);
 type TextCacheMap = HashMap<u64, TextCacheValue>;
 
-pub struct DrawTextInRectParams<'a> {
-    pub canvas: &'a Canvas,
-    pub text: &'a str,
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub size: f32,
-    pub bold: bool,
-    pub paint: &'a Paint,
-}
-
 pub struct DrawTextCachedParams<'a> {
     pub canvas: &'a Canvas,
     pub text: &'a str,
@@ -75,15 +64,6 @@ fn style_to_key(style: FontStyle) -> u32 {
 
 fn needs_synthetic_bold(tf: &Typeface, style: FontStyle) -> bool {
     *style.weight() >= 600 && *tf.font_style().weight() < 600
-}
-
-fn make_font(tf: Typeface, size: f32, style: FontStyle) -> Font {
-    let embolden = needs_synthetic_bold(&tf, style);
-    let mut font = Font::from_typeface(tf, size);
-    if embolden {
-        font.set_embolden(true);
-    }
-    font
 }
 
 fn get_custom_typeface() -> Option<Typeface> {
@@ -201,99 +181,6 @@ fn compute_text_groups(text: &str, size: f32, style: FontStyle) -> (f32, TextGro
 impl FontManager {
     pub fn global() -> &'static FontManager {
         GLOBAL_FONT_MANAGER.get_or_init(|| FontManager { _marker: () })
-    }
-
-    pub fn get_font(&self, size: f32, bold: bool) -> Font {
-        let style = if bold {
-            FontStyle::bold()
-        } else {
-            FontStyle::normal()
-        };
-        if let Some(tf) = get_custom_typeface() {
-            return make_font(tf, size, style);
-        }
-        let typeface = FONT_MGR.with(|mgr| {
-            mgr.match_family_style("Microsoft YaHei", style)
-                .or_else(|| mgr.match_family_style("Segoe UI", style))
-                .unwrap_or_else(|| mgr.legacy_make_typeface(None, style).unwrap())
-        });
-        make_font(typeface, size, style)
-    }
-
-    pub fn draw_text_with_custom_font(
-        &self,
-        canvas: &Canvas,
-        text: &str,
-        pos: (f32, f32),
-        size: f32,
-        bold: bool,
-        paint: &Paint,
-    ) {
-        let style = if bold {
-            FontStyle::bold()
-        } else {
-            FontStyle::normal()
-        };
-        if let Some(tf) = get_custom_typeface() {
-            let font = make_font(tf, size, style);
-            canvas.draw_str(text, pos, &font, paint);
-        } else {
-            let font = self.get_font(size, bold);
-            canvas.draw_str(text, pos, &font, paint);
-        }
-    }
-
-    pub fn draw_text_with_default_font(
-        &self,
-        canvas: &Canvas,
-        text: &str,
-        pos: (f32, f32),
-        size: f32,
-        bold: bool,
-        paint: &Paint,
-    ) {
-        let style = if bold {
-            FontStyle::bold()
-        } else {
-            FontStyle::normal()
-        };
-        let typeface = FONT_MGR.with(|mgr| {
-            mgr.match_family_style("Microsoft YaHei", style)
-                .or_else(|| mgr.match_family_style("Segoe UI", style))
-                .unwrap_or_else(|| mgr.legacy_make_typeface(None, style).unwrap())
-        });
-        let font = make_font(typeface, size, style);
-        canvas.draw_str(text, pos, &font, paint);
-    }
-
-    pub fn draw_text_in_rect(&self, params: DrawTextInRectParams<'_>) {
-        let font = self.get_font(params.size, params.bold);
-        let (_, rect) = font.measure_str(params.text, None);
-        if rect.width() <= params.w {
-            params.canvas.draw_str(
-                params.text,
-                (params.x + (params.w - rect.width()) / 2.0, params.y),
-                &font,
-                params.paint,
-            );
-        } else {
-            let mut truncated = String::new();
-            let mut current_w = 0.0;
-            let (ellipsis_w, _) = font.measure_str("...", None);
-            let max_w = params.w - ellipsis_w;
-            for c in params.text.chars() {
-                let (cw, _) = font.measure_str(c.to_string(), None);
-                if current_w + cw > max_w {
-                    break;
-                }
-                current_w += cw;
-                truncated.push(c);
-            }
-            truncated.push_str("...");
-            params
-                .canvas
-                .draw_str(&truncated, (params.x, params.y), &font, params.paint);
-        }
     }
 
     pub fn measure_text_cached(&self, text: &str, size: f32, style: FontStyle) -> f32 {

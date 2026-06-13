@@ -1,1663 +1,393 @@
-use crate::core::config::{APP_AUTHOR, APP_VERSION, AppConfig, DockPosition, LyricsFilterScope};
-use crate::core::i18n::{current_lang, tr};
-use crate::utils::anim::AnimPool;
-use crate::utils::color::*;
-use crate::utils::font::{DrawTextCachedParams, FontManager};
-use crate::utils::icon::get_app_icon;
-use crate::utils::settings_ui::items::*;
-use crate::utils::settings_ui::*;
-use skia_safe::{Color, Paint, Rect, surfaces};
-use softbuffer::{Context, Surface};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
+use std::collections::HashMap;
+use std::thread;
+use std::time::Duration;
+
+use serde::Serialize;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
 use windows::core::w;
-use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowButtons, WindowId};
 
-pub mod input;
+use crate::core::config::{APP_AUTHOR, APP_HOMEPAGE, APP_VERSION, AppConfig};
+use crate::core::i18n::{current_lang, init_i18n, tr};
+use crate::core::persistence::{load_config, save_config};
+use crate::utils::autostart::set_autostart;
+use crate::utils::font::FontManager;
 
-const WIN_W: f32 = 666.0;
-const WIN_H: f32 = 666.0;
-const SIDEBAR_W: f32 = 180.0;
-const SIDEBAR_ROW_H: f32 = 32.0;
-const CONTENT_START_Y: f32 = 10.0;
-const SUB_TAB_H: f32 = 40.0;
-const SUB_TAB_START_Y: f32 = 50.0;
+const SETTINGS_TITLE: &str = "EchoMusic-Lyrics-WinIsland Settings";
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../resources/icon.png");
+const APP_ICON_DARK_PNG: &[u8] = include_bytes!("../../../resources/icon-dark.png");
 
-const POPUP_OPACITY_KEY: u64 = 1;
-const SIDEBAR_KEY_BASE: u64 = 1_000;
-const SCROLL_STIFFNESS: f32 = 55.0;
-const SCROLL_DAMPING: f32 = 16.0;
+const TRANSLATION_KEYS: &[&str] = &[
+    "tab_general",
+    "tab_music",
+    "tab_about",
+    "section_appearance",
+    "section_effects",
+    "settings_theme",
+    "theme_system",
+    "theme_light",
+    "theme_dark",
+    "mini_cover_shape",
+    "expanded_cover_shape",
+    "shape_square",
+    "shape_circle",
+    "section_behavior",
+    "section_updates",
+    "section_lyrics",
+    "non_expanded_scale",
+    "expanded_scale",
+    "base_width",
+    "base_height",
+    "expanded_width",
+    "expanded_height",
+    "position_x_offset",
+    "position_y_offset",
+    "dock_position",
+    "dock_position_top_center",
+    "dock_position_top_left",
+    "dock_position_top_right",
+    "dock_position_bottom_center",
+    "dock_position_bottom_left",
+    "dock_position_bottom_right",
+    "monitor",
+    "font_size",
+    "adaptive_border",
+    "motion_blur",
+    "cover_rotate",
+    "audio_gate",
+    "auto_gate",
+    "section_experimental",
+    "mini_controls",
+    "font_preview_sample",
+    "island_style",
+    "style_default",
+    "style_glass",
+    "style_mica",
+    "style_dynamic",
+    "style_liquid_glass",
+    "custom_font",
+    "font_select",
+    "font_reset",
+    "font_preview_default",
+    "font_preview_custom",
+    "start_boot",
+    "auto_hide",
+    "check_updates",
+    "update_interval",
+    "language",
+    "lang_name",
+    "hide_delay",
+    "hover_to_hide",
+    "hover_to_hide_distance",
+    "hover_to_hide_delay",
+    "reset_defaults",
+    "visit_homepage",
+    "created_by",
+    "music_settings_title",
+    "show_lyrics",
+    "lyrics_ws_source",
+    "lyrics_ws_address",
+    "lyrics_delay",
+    "lyrics_scroll",
+    "lyrics_scroll_max_width",
+    "lyrics_filter_scope",
+    "lyrics_filter_off",
+    "lyrics_filter_desktop",
+    "lyrics_filter_all",
+    "lyrics_filter_regex",
+    "lyrics_filter_regex_placeholder",
+    "lyrics_filter_invalid_regex",
+    "lyrics_char_highlight",
+    "lyrics_char_color_unplayed",
+    "lyrics_char_color_played",
+    "lyrics_char_color_placeholder",
+    "folder_select",
+    "folder_clear",
+    "delete",
+    "update_available_title",
+    "update_available_desc",
+    "check_updates_now",
+    "update_no_updates_title",
+    "update_no_updates_desc",
+    "update_check_failed_title",
+    "update_check_failed_desc",
+    "update_failed_title",
+    "update_failed_dl",
+    "update_failed_save",
+    "tray_show",
+    "tray_hide",
+    "tray_settings",
+    "tray_restart",
+    "tray_exit",
+];
 
-#[derive(Clone, PartialEq)]
-enum PopupKind {
-    Language,
-    Monitor,
-    IslandStyle,
-    DockPositionPopup,
-    SettingsTheme,
-    MiniCoverShape,
-    ExpandedCoverShape,
-    LyricsFilterScope,
+#[derive(Serialize)]
+struct AppInfo {
+    version: &'static str,
+    author: &'static str,
+    homepage: &'static str,
+    icon_png: Vec<u8>,
+    icon_dark_png: Vec<u8>,
 }
 
-enum FocusedTextInput {
-    FilterRegex,
-    CharColorUnplayed,
-    CharColorPlayed,
-}
-
-struct PopupState {
-    kind: PopupKind,
-    #[allow(dead_code)]
-    button_rect: Rect,
-    menu_rect: Rect,
-    options: Vec<String>,
-    values: Vec<String>,
-    selected_idx: usize,
-    hover_idx: Option<usize>,
-}
-
-impl PopupState {
-    fn new(
-        kind: PopupKind,
-        button_rect: Rect,
-        options: Vec<String>,
-        values: Vec<String>,
-        selected_idx: usize,
-        _win_w: f32,
-        win_h: f32,
-    ) -> Self {
-        let item_count = options.len() as f32;
-        let menu_h = POPUP_MENU_PAD * 2.0 + item_count * POPUP_ITEM_H;
-
-        let fm = FontManager::global();
-        let mut max_text_w: f32 = button_rect.width();
-        for opt in &options {
-            let w = fm.measure_text_cached(opt, 12.0, skia_safe::FontStyle::normal());
-            let needed = w + 36.0;
-            if needed > max_text_w {
-                max_text_w = needed;
-            }
-        }
-
-        let menu_w = max_text_w;
-        let right_edge = button_rect.right;
-
-        let fits_below = button_rect.bottom + 2.0 + menu_h <= win_h;
-        let fits_right = right_edge - menu_w >= 0.0;
-
-        let menu_y = if fits_below {
-            button_rect.bottom + 2.0
-        } else {
-            (button_rect.top - menu_h - 2.0).max(0.0)
-        };
-
-        let menu_x = if fits_right {
-            right_edge - menu_w
-        } else {
-            button_rect.left
-        };
-
-        let menu_rect = Rect::from_xywh(menu_x, menu_y, menu_w, menu_h);
-
-        Self {
-            kind,
-            button_rect,
-            menu_rect,
-            options,
-            values,
-            selected_idx,
-            hover_idx: None,
-        }
-    }
-
-    fn menu_rect(&self) -> Rect {
-        self.menu_rect
-    }
-
-    fn item_rect(&self, idx: usize) -> Rect {
-        let menu = self.menu_rect;
-        Rect::from_xywh(
-            menu.left + POPUP_MENU_PAD,
-            menu.top + POPUP_MENU_PAD + idx as f32 * POPUP_ITEM_H,
-            menu.width() - POPUP_MENU_PAD * 2.0,
-            POPUP_ITEM_H,
-        )
-    }
-
-    fn hit_test_item(&self, mx: f32, my: f32) -> Option<usize> {
-        let menu = self.menu_rect;
-        if mx < menu.left || mx > menu.right || my < menu.top || my > menu.bottom {
-            return None;
-        }
-        let inner_top = menu.top + POPUP_MENU_PAD;
-        let inner_bottom = menu.bottom - POPUP_MENU_PAD;
-        if my < inner_top || my > inner_bottom {
-            return None;
-        }
-        let rel_y = my - inner_top;
-        let idx = (rel_y / POPUP_ITEM_H).floor() as i32;
-        if idx < 0 {
-            return None;
-        }
-        let idx = idx as usize;
-        if idx >= self.options.len() {
-            return None;
-        }
-        Some(idx)
-    }
-}
-
-pub struct SettingsApp {
-    window: Option<Arc<Window>>,
-    surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+#[derive(Serialize)]
+struct SettingsState {
     config: AppConfig,
-    active_page: usize,
-    active_sub_page: usize,
-    sub_tab_hover: i32,
-    switch_anim: SwitchAnimator,
-    anim: AnimPool,
-    logical_mouse_pos: (f32, f32),
-    last_hover_mouse_pos: (f32, f32),
-    frame_count: u64,
-    scroll_y: f32,
-    target_scroll_y: f32,
-    scroll_vel_y: f32,
-    last_frame_time: Instant,
-    sidebar_hover: i32,
-    popup: Option<PopupState>,
-    hover_row: Option<usize>,
-    total_rows: usize,
-    is_light: bool,
-    cached_items: Vec<SettingsItem>,
-    items_dirty: bool,
-    cached_content_height: f32,
-    cached_max_scroll: f32,
-    cached_row_tops: Vec<f32>,
-    cached_row_heights: Vec<f32>,
-    win_w: f32,
-    win_h: f32,
-    focused_text_input: Option<FocusedTextInput>,
-    text_input_buffer: String,
+    current_lang: String,
+    translations: HashMap<String, String>,
+    monitors: Vec<String>,
+    app: AppInfo,
+    lyrics_filter_regex_valid: bool,
 }
 
-impl SettingsApp {
-    pub fn new(config: AppConfig) -> Self {
-        let switch_anim = SwitchAnimator::new(&[
-            config.adaptive_border,
-            config.motion_blur,
-            config.cover_rotate,
-            config.audio_gate,
-            config.auto_gate,
-            config.mini_controls,
-            config.auto_start,
-            config.auto_hide,
-            config.check_for_updates,
-            config.show_lyrics,
-            config.lyrics_scroll,
-            config.hover_to_hide,
-            config.lyrics_char_highlight,
-        ]);
-        Self {
-            window: None,
-            surface: None,
-            config,
-            active_page: 0,
-            active_sub_page: 0,
-            sub_tab_hover: -1,
-            switch_anim,
-            anim: AnimPool::new(),
-            logical_mouse_pos: (0.0, 0.0),
-            last_hover_mouse_pos: (-1.0, -1.0),
-            frame_count: 0,
-            scroll_y: 0.0,
-            target_scroll_y: 0.0,
-            scroll_vel_y: 0.0,
-            last_frame_time: Instant::now(),
-            sidebar_hover: -1,
-            popup: None,
-            hover_row: None,
-            total_rows: 0,
-            is_light: false,
-            cached_items: Vec::new(),
-            items_dirty: true,
-            cached_content_height: 0.0,
-            cached_max_scroll: 0.0,
-            cached_row_tops: Vec::new(),
-            cached_row_heights: Vec::new(),
-            win_w: WIN_W,
-            win_h: WIN_H,
-            focused_text_input: None,
-            text_input_buffer: String::new(),
-        }
-    }
-
-    fn theme(&self) -> SettingsTheme {
-        if self.is_light {
-            light_settings_theme()
-        } else {
-            dark_settings_theme()
-        }
-    }
-
-    fn update_theme(&mut self) {
-        self.is_light = match self.config.settings_theme.as_str() {
-            "light" => true,
-            "dark" => false,
-            _ => {
-                if let Some(win) = &self.window {
-                    win.theme() == Some(winit::window::Theme::Light)
-                } else {
-                    false
-                }
-            }
-        };
-        if let Some(win) = &self.window {
-            Self::apply_titlebar_theme(win, self.is_light);
-            win.request_redraw();
-        }
-    }
-
-    fn apply_titlebar_theme(window: &Window, is_light: bool) {
-        if let Ok(handle) = window.window_handle()
-            && let RawWindowHandle::Win32(raw) = handle.as_raw()
-        {
-            let hwnd = HWND(raw.hwnd.get() as _);
-            let use_dark: i32 = if is_light { 0 } else { 1 };
-            unsafe {
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWINDOWATTRIBUTE(20),
-                    &use_dark as *const _ as *const _,
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
-        }
-    }
-
-    fn build_general_items(&self) -> Vec<SettingsItem> {
-        let mut items: Vec<SettingsItem> = vec![];
-
-        match self.active_sub_page {
-            0 => {
-                items.push(SettingsItem::SectionHeader {
-                    label: tr("section_appearance"),
-                });
-                items.push(SettingsItem::GroupStart);
-                items.push(SettingsItem::RowStepper {
-                    label: tr("non_expanded_scale"),
-                    value: format!("{:.2}", self.config.non_expanded_scale),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("expanded_scale"),
-                    value: format!("{:.2}", self.config.expanded_scale),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("base_width"),
-                    value: self.config.base_width.to_string(),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("base_height"),
-                    value: self.config.base_height.to_string(),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("expanded_width"),
-                    value: self.config.expanded_width.to_string(),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("expanded_height"),
-                    value: self.config.expanded_height.to_string(),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("position_x_offset"),
-                    value: self.config.position_x_offset.to_string(),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("position_y_offset"),
-                    value: self.config.position_y_offset.to_string(),
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowStepper {
-                    label: tr("font_size"),
-                    value: format!("{:.0}", self.config.font_size),
-                    enabled: true,
-                });
-                {
-                    let monitors = self.get_monitor_list();
-                    let selected_idx =
-                        (self.config.monitor_index as usize).min(monitors.len().saturating_sub(1));
-                    let options: Vec<(String, bool)> = monitors
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| (name.clone(), i == selected_idx))
-                        .collect();
-                    items.push(SettingsItem::RowSourceSelect {
-                        label: tr("monitor"),
-                        options,
-                        enabled: true,
-                    });
-                }
-                {
-                    let dp = self.config.dock_position;
-                    items.push(SettingsItem::RowSourceSelect {
-                        label: tr("dock_position"),
-                        options: vec![
-                            (
-                                tr("dock_position_top_center"),
-                                dp == DockPosition::TopCenter,
-                            ),
-                            (tr("dock_position_top_left"), dp == DockPosition::TopLeft),
-                            (tr("dock_position_top_right"), dp == DockPosition::TopRight),
-                            (
-                                tr("dock_position_bottom_center"),
-                                dp == DockPosition::BottomCenter,
-                            ),
-                            (
-                                tr("dock_position_bottom_left"),
-                                dp == DockPosition::BottomLeft,
-                            ),
-                            (
-                                tr("dock_position_bottom_right"),
-                                dp == DockPosition::BottomRight,
-                            ),
-                        ],
-                        enabled: true,
-                    });
-                }
-                items.push(SettingsItem::GroupEnd);
-            }
-            1 => {
-                items.push(SettingsItem::SectionHeader {
-                    label: tr("section_effects"),
-                });
-                items.push(SettingsItem::GroupStart);
-                items.push(SettingsItem::RowSourceSelect {
-                    label: tr("settings_theme"),
-                    options: vec![
-                        (tr("theme_system"), self.config.settings_theme == "system"),
-                        (tr("theme_light"), self.config.settings_theme == "light"),
-                        (tr("theme_dark"), self.config.settings_theme == "dark"),
-                    ],
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSourceSelect {
-                    label: tr("mini_cover_shape"),
-                    options: vec![
-                        (tr("shape_square"), self.config.mini_cover_shape == "square"),
-                        (tr("shape_circle"), self.config.mini_cover_shape == "circle"),
-                    ],
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSourceSelect {
-                    label: tr("expanded_cover_shape"),
-                    options: vec![
-                        (
-                            tr("shape_square"),
-                            self.config.expanded_cover_shape == "square",
-                        ),
-                        (
-                            tr("shape_circle"),
-                            self.config.expanded_cover_shape == "circle",
-                        ),
-                    ],
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("adaptive_border"),
-                    on: self.config.adaptive_border,
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("motion_blur"),
-                    on: self.config.motion_blur,
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("cover_rotate"),
-                    on: self.config.cover_rotate,
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("audio_gate"),
-                    on: self.config.audio_gate,
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("auto_gate"),
-                    on: self.config.auto_gate,
-                    enabled: self.config.audio_gate,
-                });
-                items.push(SettingsItem::GroupEnd);
-                items.push(SettingsItem::SectionHeader {
-                    label: tr("section_experimental"),
-                });
-                items.push(SettingsItem::GroupStart);
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("mini_controls"),
-                    on: self.config.mini_controls,
-                    enabled: true,
-                });
-                items.push(SettingsItem::GroupEnd);
-                items.push(SettingsItem::Spacer { height: 16.0 });
-                items.push(SettingsItem::GroupStart);
-                items.push(SettingsItem::RowSourceSelect {
-                    label: tr("island_style"),
-                    options: vec![
-                        (tr("style_default"), self.config.island_style == "default"),
-                        (tr("style_glass"), self.config.island_style == "glass"),
-                        (tr("style_mica"), self.config.island_style == "mica"),
-                        (tr("style_dynamic"), self.config.island_style == "dynamic"),
-                        (
-                            tr("style_liquid_glass"),
-                            self.config.island_style == "liquid_glass",
-                        ),
-                    ],
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowFontPicker {
-                    label: tr("custom_font"),
-                    btn_label: tr("font_select"),
-                    reset_label: if self.config.custom_font_path.is_some() {
-                        Some(tr("font_reset"))
-                    } else {
-                        None
-                    },
-                });
-                items.push(SettingsItem::FontPreview {
-                    has_custom_font: self.config.custom_font_path.is_some(),
-                });
-                items.push(SettingsItem::GroupEnd);
-            }
-            2 => {
-                items.push(SettingsItem::SectionHeader {
-                    label: tr("section_behavior"),
-                });
-                items.push(SettingsItem::GroupStart);
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("start_boot"),
-                    on: self.config.auto_start,
-                    enabled: true,
-                });
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("auto_hide"),
-                    on: self.config.auto_hide,
-                    enabled: true,
-                });
-                if self.config.auto_hide {
-                    items.push(SettingsItem::RowStepper {
-                        label: tr("hide_delay"),
-                        value: format!("{:.0}", self.config.auto_hide_delay),
-                        enabled: true,
-                    });
-                }
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("hover_to_hide"),
-                    on: self.config.hover_to_hide,
-                    enabled: true,
-                });
-                if self.config.hover_to_hide {
-                    items.push(SettingsItem::RowStepper {
-                        label: tr("hover_to_hide_distance"),
-                        value: format!("{:.0}", self.config.hover_to_hide_distance),
-                        enabled: true,
-                    });
-                    items.push(SettingsItem::RowStepper {
-                        label: tr("hover_to_hide_delay"),
-                        value: format!("{:.1}", self.config.hover_to_hide_delay),
-                        enabled: true,
-                    });
-                }
-                items.push(SettingsItem::RowSourceSelect {
-                    label: tr("language"),
-                    options: vec![
-                        ("English".to_string(), current_lang() == "en"),
-                        ("中文".to_string(), current_lang() == "zh"),
-                    ],
-                    enabled: true,
-                });
-                items.push(SettingsItem::GroupEnd);
-
-                items.push(SettingsItem::SectionHeader {
-                    label: tr("section_updates"),
-                });
-                items.push(SettingsItem::GroupStart);
-                items.push(SettingsItem::RowSwitch {
-                    label: tr("check_updates"),
-                    on: self.config.check_for_updates,
-                    enabled: true,
-                });
-                if self.config.check_for_updates {
-                    items.push(SettingsItem::RowStepper {
-                        label: tr("update_interval"),
-                        value: format!("{:.0}", self.config.update_check_interval),
-                        enabled: true,
-                    });
-                }
-                items.push(SettingsItem::GroupEnd);
-
-                items.push(SettingsItem::Spacer { height: 10.0 });
-                items.push(SettingsItem::CenterLink {
-                    label: tr("reset_defaults"),
-                    color: self.theme().danger,
-                });
-            }
-            _ => {}
-        }
-        items
-    }
-
-    fn build_music_items(&self) -> Vec<SettingsItem> {
-        let show_lyrics = self.config.show_lyrics;
-
-        vec![
-            SettingsItem::PageTitle {
-                text: tr("tab_music"),
-            },
-            SettingsItem::SectionHeader {
-                label: tr("section_lyrics"),
-            },
-            SettingsItem::GroupStart,
-            SettingsItem::RowSwitch {
-                label: tr("show_lyrics"),
-                on: self.config.show_lyrics,
-                enabled: true,
-            },
-            SettingsItem::RowLabel {
-                label: tr("lyrics_ws_source"),
-            },
-            SettingsItem::RowLabel {
-                label: tr("lyrics_ws_address"),
-            },
-            SettingsItem::RowStepper {
-                label: tr("lyrics_delay"),
-                value: format!("{:.1}", self.config.lyrics_delay),
-                enabled: show_lyrics,
-            },
-            SettingsItem::RowSwitch {
-                label: tr("lyrics_scroll"),
-                on: if show_lyrics {
-                    self.config.lyrics_scroll
-                } else {
-                    false
-                },
-                enabled: show_lyrics,
-            },
-            SettingsItem::RowStepper {
-                label: tr("lyrics_scroll_max_width"),
-                value: format!("{}", self.config.lyrics_scroll_max_width as i32),
-                enabled: show_lyrics && self.config.lyrics_scroll,
-            },
-            SettingsItem::RowSourceSelect {
-                label: tr("lyrics_filter_scope"),
-                options: vec![
-                    (
-                        tr("lyrics_filter_off"),
-                        self.config.lyrics_filter_scope == LyricsFilterScope::Off,
-                    ),
-                    (
-                        tr("lyrics_filter_desktop"),
-                        self.config.lyrics_filter_scope == LyricsFilterScope::Desktop,
-                    ),
-                    (
-                        tr("lyrics_filter_all"),
-                        self.config.lyrics_filter_scope == LyricsFilterScope::All,
-                    ),
-                ],
-                enabled: show_lyrics,
-            },
-            SettingsItem::RowTextInput {
-                label: tr("lyrics_filter_regex"),
-                value: if matches!(self.focused_text_input, Some(FocusedTextInput::FilterRegex)) {
-                    self.text_input_buffer.clone()
-                } else {
-                    self.config.lyrics_filter_regex.clone()
-                },
-                placeholder: tr("lyrics_filter_regex_placeholder"),
-                enabled: show_lyrics && self.config.lyrics_filter_scope != LyricsFilterScope::Off,
-                invalid: !self.config.lyrics_filter_regex.trim().is_empty()
-                    && regex::Regex::new(&self.config.lyrics_filter_regex).is_err(),
-                focused: matches!(self.focused_text_input, Some(FocusedTextInput::FilterRegex)),
-            },
-            SettingsItem::GroupEnd,
-            SettingsItem::SectionHeader {
-                label: tr("lyrics_char_highlight"),
-            },
-            SettingsItem::GroupStart,
-            SettingsItem::RowSwitch {
-                label: tr("lyrics_char_highlight"),
-                on: self.config.lyrics_char_highlight,
-                enabled: show_lyrics,
-            },
-            SettingsItem::RowTextInput {
-                label: tr("lyrics_char_color_unplayed"),
-                value: if matches!(
-                    self.focused_text_input,
-                    Some(FocusedTextInput::CharColorUnplayed)
-                ) {
-                    self.text_input_buffer.clone()
-                } else {
-                    self.config.lyrics_char_color_unplayed.clone()
-                },
-                placeholder: tr("lyrics_char_color_placeholder"),
-                enabled: show_lyrics && self.config.lyrics_char_highlight,
-                invalid: false,
-                focused: matches!(
-                    self.focused_text_input,
-                    Some(FocusedTextInput::CharColorUnplayed)
-                ),
-            },
-            SettingsItem::RowTextInput {
-                label: tr("lyrics_char_color_played"),
-                value: if matches!(
-                    self.focused_text_input,
-                    Some(FocusedTextInput::CharColorPlayed)
-                ) {
-                    self.text_input_buffer.clone()
-                } else {
-                    self.config.lyrics_char_color_played.clone()
-                },
-                placeholder: tr("lyrics_char_color_placeholder"),
-                enabled: show_lyrics && self.config.lyrics_char_highlight,
-                invalid: false,
-                focused: matches!(
-                    self.focused_text_input,
-                    Some(FocusedTextInput::CharColorPlayed)
-                ),
-            },
-            SettingsItem::GroupEnd,
-        ]
-    }
-
-    fn build_about_items(&self) -> Vec<SettingsItem> {
-        let theme = self.theme();
-        vec![
-            SettingsItem::PageTitle {
-                text: tr("tab_about"),
-            },
-            SettingsItem::Spacer { height: 20.0 },
-            SettingsItem::CenterText {
-                text: "EchoMusic-Lyrics-WinIsland".to_string(),
-                size: 28.0,
-                color: theme.text_pri,
-            },
-            SettingsItem::CenterText {
-                text: format!("Version {}", APP_VERSION),
-                size: 14.0,
-                color: theme.text_sec,
-            },
-            SettingsItem::Spacer { height: 8.0 },
-            SettingsItem::CenterButton {
-                label: tr("check_updates_now"),
-                enabled: true,
-            },
-            SettingsItem::Spacer { height: 6.0 },
-            SettingsItem::CenterText {
-                text: format!("{} {}", tr("created_by"), APP_AUTHOR),
-                size: 14.0,
-                color: theme.text_sec,
-            },
-            SettingsItem::Spacer { height: 10.0 },
-            SettingsItem::CenterLink {
-                label: tr("visit_homepage"),
-                color: theme.accent,
-            },
-        ]
-    }
-
-    fn build_current_items(&self) -> Vec<SettingsItem> {
-        match self.active_page {
-            0 => self.build_general_items(),
-            1 => self.build_music_items(),
-            2 => self.build_about_items(),
-            _ => vec![],
-        }
-    }
-
-    fn rebuild_items_cache(&mut self) {
-        self.cached_items = self.build_current_items();
-        let content_start_y = if self.active_page == 0 {
-            SUB_TAB_START_Y + SUB_TAB_H + CONTENT_START_Y
-        } else {
-            CONTENT_START_Y
-        };
-        self.cached_content_height = content_height(&self.cached_items, content_start_y);
-        let scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor() as f32)
-            .unwrap_or(1.0);
-        let view_h = self.win_h / scale;
-        self.cached_max_scroll = (self.cached_content_height - view_h + 20.0).max(0.0);
-        self.cached_row_tops.clear();
-        self.cached_row_heights.clear();
-        let mut y = content_start_y;
-        for item in &self.cached_items {
-            if item.is_row() {
-                self.cached_row_tops.push(y);
-                self.cached_row_heights.push(item.height());
-            }
-            y += item.height();
-        }
-        self.total_rows = self.cached_row_tops.len();
-        self.items_dirty = false;
-    }
-
-    fn ensure_items_cache(&mut self) {
-        if self.items_dirty {
-            self.rebuild_items_cache();
-        }
-    }
-
-    fn mark_items_dirty(&mut self) {
-        self.items_dirty = true;
-    }
-
-    fn get_monitor_list(&self) -> Vec<String> {
-        use windows::Win32::Graphics::Gdi::*;
-        let mut monitors: Vec<String> = Vec::new();
-        unsafe {
-            let mut idx = 0u32;
-            let mut active_count = 0;
-            loop {
-                let mut dd: DISPLAY_DEVICEW = std::mem::zeroed();
-                dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-                if EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
-                    if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0 {
-                        active_count += 1;
-                        let name = String::from_utf16_lossy(&dd.DeviceName)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        let mut dm: DISPLAY_DEVICEW = std::mem::zeroed();
-                        dm.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-                        let mut label = if EnumDisplayDevicesW(
-                            windows::core::PCWSTR(dd.DeviceName.as_ptr()),
-                            0,
-                            &mut dm,
-                            0,
-                        )
-                        .as_bool()
-                        {
-                            let friendly = String::from_utf16_lossy(&dm.DeviceString)
-                                .trim_end_matches('\0')
-                                .to_string();
-                            if friendly.is_empty() {
-                                name.clone()
-                            } else {
-                                friendly
-                            }
-                        } else {
-                            name.clone()
-                        };
-                        label = format!("Display {}: {}", active_count, label);
-                        monitors.push(label);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
-        }
-        if monitors.is_empty() {
-            monitors.push("Primary".to_string());
-        }
-        monitors
-    }
-
-    fn sync_switch_targets(&mut self) {
-        self.switch_anim.set_target(0, self.config.adaptive_border);
-        self.switch_anim.set_target(1, self.config.motion_blur);
-        self.switch_anim.set_target(2, self.config.cover_rotate);
-        self.switch_anim.set_target(3, self.config.audio_gate);
-        self.switch_anim.set_target(4, self.config.auto_gate);
-        self.switch_anim.set_target(5, self.config.mini_controls);
-        self.switch_anim.set_target(6, self.config.auto_start);
-        self.switch_anim.set_target(7, self.config.auto_hide);
-        self.switch_anim
-            .set_target(8, self.config.check_for_updates);
-        self.switch_anim.set_target(9, self.config.show_lyrics);
-        self.switch_anim.set_target(11, self.config.hover_to_hide);
-        let fw_on = if self.config.show_lyrics {
-            self.config.lyrics_scroll
-        } else {
-            false
-        };
-        self.switch_anim.set_target(10, fw_on);
-        self.switch_anim.set_target(
-            12,
-            self.config.show_lyrics && self.config.lyrics_char_highlight,
-        );
-    }
-
-    fn draw(&mut self) {
-        let Some(win) = self.window.as_ref() else {
-            return;
-        };
-        let (p_w, p_h, scale) = {
-            let size = win.inner_size();
-            (
-                size.width as i32,
-                size.height as i32,
-                win.scale_factor() as f32,
-            )
-        };
-        if p_w <= 0 || p_h <= 0 {
-            return;
-        }
-
-        self.ensure_items_cache();
-        let theme = self.theme();
-        let win_w = self.win_w / scale;
-        let win_h = self.win_h / scale;
-        let anim = self.get_page_anim();
-
-        let mut surface = match self.surface.take() {
-            Some(s) => s,
-            None => return,
-        };
-
-        {
-            let mut buffer = match surface.buffer_mut() {
-                Ok(b) => b,
-                Err(_) => {
-                    self.surface = Some(surface);
-                    return;
-                }
-            };
-            let info = skia_safe::ImageInfo::new(
-                skia_safe::ISize::new(p_w, p_h),
-                skia_safe::ColorType::BGRA8888,
-                skia_safe::AlphaType::Premul,
-                None,
-            );
-            let dst_row_bytes = (p_w * 4) as usize;
-            let u8_buffer: &mut [u8] = bytemuck::cast_slice_mut(&mut buffer);
-            let expected_size = (p_w * p_h * 4) as usize;
-            let actual_size = u8_buffer.len();
-            if actual_size != expected_size {
-                return;
-            }
-            let mut sk_surface = match surfaces::wrap_pixels(&info, u8_buffer, dst_row_bytes, None)
-            {
-                Some(s) => s,
-                None => {
-                    return;
-                }
-            };
-
-            let canvas = sk_surface.canvas();
-            canvas.reset_matrix();
-            canvas.clear(theme.win_bg);
-            canvas.scale((scale, scale));
-
-            self.draw_sidebar(canvas, &theme);
-
-            let content_w = win_w - SIDEBAR_W;
-            self.draw_sub_tabs(canvas, &theme, content_w);
-
-            let content_start_y = if self.active_page == 0 {
-                SUB_TAB_START_Y + SUB_TAB_H + CONTENT_START_Y
-            } else {
-                CONTENT_START_Y
-            };
-
-            self.target_scroll_y = self.target_scroll_y.clamp(0.0, self.cached_max_scroll);
-
-            let clip_start_y = if self.active_page == 0 {
-                SUB_TAB_START_Y + SUB_TAB_H
-            } else {
-                0.0
-            };
-
-            canvas.save();
-            canvas.clip_rect(
-                Rect::from_xywh(SIDEBAR_W, clip_start_y, content_w, win_h - clip_start_y),
-                skia_safe::ClipOp::Intersect,
-                true,
-            );
-            canvas.translate((SIDEBAR_W, -self.scroll_y));
-            draw_items(DrawItemsParams {
-                canvas,
-                items: &self.cached_items,
-                start_y: content_start_y,
-                width: content_w,
-                anims: &anim,
-                hover_anims: &self.anim,
-                theme: &theme,
-                visible_min_y: self.scroll_y,
-                visible_max_y: self.scroll_y + win_h,
-            });
-            canvas.restore();
-
-            let ch = self.cached_content_height;
-            let view_h = win_h;
-            if ch > view_h {
-                let bar_h = (view_h / ch) * view_h;
-                let bar_y = (self.scroll_y / (ch - view_h)) * (view_h - bar_h);
-                let mut p = Paint::default();
-                p.set_anti_alias(true);
-                p.set_color(Color::from_argb(60, 255, 255, 255));
-                canvas.draw_round_rect(
-                    Rect::from_xywh(win_w - 6.0, bar_y, 4.0, bar_h),
-                    2.0,
-                    2.0,
-                    &p,
-                );
-            }
-
-            self.draw_popup(canvas, &theme);
-            let _ = buffer.present();
-        }
-
-        self.surface = Some(surface);
-    }
-
-    fn draw_sidebar(&self, canvas: &skia_safe::Canvas, theme: &SettingsTheme) {
-        let fm = FontManager::global();
-        let mut paint = Paint::default();
-        paint.set_anti_alias(true);
-
-        paint.set_color(theme.sidebar_bg);
-        canvas.draw_rect(Rect::from_xywh(0.0, 0.0, SIDEBAR_W, self.win_h), &paint);
-
-        let mut sep = Paint::default();
-        sep.set_anti_alias(true);
-        sep.set_color(theme.separator);
-        sep.set_stroke_width(0.5);
-        sep.set_style(skia_safe::paint::Style::Stroke);
-        canvas.draw_line((SIDEBAR_W, 0.0), (SIDEBAR_W, self.win_h), &sep);
-
-        let pages = [tr("tab_general"), tr("tab_music"), tr("tab_about")];
-        let start_y = 20.0;
-
-        for (i, label) in pages.iter().enumerate() {
-            let row_y = start_y + i as f32 * (SIDEBAR_ROW_H + 2.0);
-            let row_x = SIDEBAR_PAD;
-            let row_w = SIDEBAR_W - SIDEBAR_PAD * 2.0;
-
-            if self.active_page == i {
-                paint.set_color(theme.sidebar_sel);
-                canvas.draw_round_rect(
-                    Rect::from_xywh(row_x, row_y, row_w, SIDEBAR_ROW_H),
-                    SIDEBAR_SEL_RADIUS,
-                    SIDEBAR_SEL_RADIUS,
-                    &paint,
-                );
-                paint.set_color(theme.text_pri);
-            } else {
-                let hover_val = self.anim.get(SIDEBAR_KEY_BASE + i as u64);
-                if hover_val > 0.005 {
-                    let base = theme.sidebar_hover;
-                    let alpha = (base.a() as f32 * hover_val) as u8;
-                    paint.set_color(Color::from_argb(alpha, base.r(), base.g(), base.b()));
-                    canvas.draw_round_rect(
-                        Rect::from_xywh(row_x, row_y, row_w, SIDEBAR_ROW_H),
-                        SIDEBAR_SEL_RADIUS,
-                        SIDEBAR_SEL_RADIUS,
-                        &paint,
-                    );
-                }
-                paint.set_color(theme.text_sec);
-            }
-
-            fm.draw_text_cached(DrawTextCachedParams {
-                canvas,
-                text: label,
-                x: row_x + 12.0,
-                y: row_y + 21.0,
-                size: 13.0,
-                bold: false,
-                paint: &paint,
-            });
-        }
-    }
-
-    fn draw_sub_tabs(&self, canvas: &skia_safe::Canvas, theme: &SettingsTheme, content_w: f32) {
-        if self.active_page != 0 {
-            return;
-        }
-
-        let fm = FontManager::global();
-        let tabs = [
-            tr("section_appearance"),
-            tr("section_effects"),
-            tr("section_behavior"),
-        ];
-        let tab_w = content_w / tabs.len() as f32;
-        let start_x = SIDEBAR_W;
-
-        let mut paint = Paint::default();
-        paint.set_anti_alias(true);
-
-        paint.set_color(theme.text_pri);
-        fm.draw_text_cached(DrawTextCachedParams {
-            canvas,
-            text: &tr("tab_general"),
-            x: SIDEBAR_W + CONTENT_PADDING,
-            y: 35.0,
-            size: 20.0,
-            bold: true,
-            paint: &paint,
-        });
-
-        let mut sep = Paint::default();
-        sep.set_anti_alias(true);
-        sep.set_color(theme.separator);
-        sep.set_stroke_width(0.5);
-        sep.set_style(skia_safe::paint::Style::Stroke);
-        canvas.draw_line(
-            (SIDEBAR_W, SUB_TAB_START_Y + SUB_TAB_H),
-            (SIDEBAR_W + content_w, SUB_TAB_START_Y + SUB_TAB_H),
-            &sep,
-        );
-
-        for (i, label) in tabs.iter().enumerate() {
-            let tab_x = start_x + i as f32 * tab_w;
-            let is_active = self.active_sub_page == i;
-            let is_hover = self.sub_tab_hover == i as i32;
-
-            paint.set_color(if is_active || is_hover {
-                theme.text_pri
-            } else {
-                theme.text_sec
-            });
-
-            let label_w = FontManager::global().measure_text_cached(
-                label,
-                13.0,
-                skia_safe::FontStyle::normal(),
-            );
-            let text_x = tab_x + (tab_w - label_w) / 2.0;
-            let text_y = SUB_TAB_START_Y + SUB_TAB_H / 2.0 + 5.0;
-            fm.draw_text_cached(DrawTextCachedParams {
-                canvas,
-                text: label,
-                x: text_x,
-                y: text_y,
-                size: 13.0,
-                bold: false,
-                paint: &paint,
-            });
-
-            if is_active {
-                let underline_pad = 4.0;
-                let underline_x = text_x - underline_pad;
-                let underline_w = label_w + underline_pad * 2.0;
-                let underline_y = SUB_TAB_START_Y + SUB_TAB_H - 2.0;
-                paint.set_style(skia_safe::paint::Style::Fill);
-                canvas.draw_rect(
-                    Rect::from_xywh(underline_x, underline_y, underline_w, 2.0),
-                    &paint,
-                );
-            }
-        }
-    }
-
-    fn draw_popup(&self, canvas: &skia_safe::Canvas, theme: &SettingsTheme) {
-        let popup = match &self.popup {
-            Some(p) => p,
-            None => return,
-        };
-        let opacity = self.anim.get(POPUP_OPACITY_KEY);
-        if opacity < 0.005 {
-            return;
-        }
-        let fm = FontManager::global();
-        let menu = popup.menu_rect();
-
-        let mut shadow = Paint::default();
-        shadow.set_anti_alias(true);
-        shadow.set_color(Color::from_argb((60.0 * opacity) as u8, 0, 0, 0));
-        canvas.draw_round_rect(
-            Rect::from_xywh(
-                menu.left - 1.0,
-                menu.top + 2.0,
-                menu.width() + 2.0,
-                menu.height() + 2.0,
-            ),
-            POPUP_MENU_R,
-            POPUP_MENU_R,
-            &shadow,
-        );
-
-        let mut paint = Paint::default();
-        paint.set_anti_alias(true);
-        paint.set_color(Color::from_argb(
-            (255.0 * opacity) as u8,
-            theme.popup_bg.r(),
-            theme.popup_bg.g(),
-            theme.popup_bg.b(),
-        ));
-        canvas.draw_round_rect(menu, POPUP_MENU_R, POPUP_MENU_R, &paint);
-
-        let mut border = Paint::default();
-        border.set_anti_alias(true);
-        border.set_color(Color::from_argb(
-            (40.0 * opacity) as u8,
-            theme.popup_border.r(),
-            theme.popup_border.g(),
-            theme.popup_border.b(),
-        ));
-        border.set_style(skia_safe::paint::Style::Stroke);
-        border.set_stroke_width(0.5);
-        canvas.draw_round_rect(menu, POPUP_MENU_R, POPUP_MENU_R, &border);
-
-        let text_alpha = (255.0 * opacity) as u8;
-        for (i, opt_label) in popup.options.iter().enumerate() {
-            let item_rect = popup.item_rect(i);
-
-            if popup.hover_idx == Some(i) {
-                let a = theme.accent.a() as f32 * opacity;
-                paint.set_color(Color::from_argb(
-                    a as u8,
-                    theme.accent.r(),
-                    theme.accent.g(),
-                    theme.accent.b(),
-                ));
-                paint.set_style(skia_safe::paint::Style::Fill);
-                canvas.draw_round_rect(item_rect, 4.0, 4.0, &paint);
-            }
-
-            paint.set_color(Color::from_argb(
-                text_alpha,
-                theme.text_pri.r(),
-                theme.text_pri.g(),
-                theme.text_pri.b(),
-            ));
-            paint.set_style(skia_safe::paint::Style::Fill);
-            fm.draw_text_cached(DrawTextCachedParams {
-                canvas,
-                text: opt_label,
-                x: item_rect.left + 8.0,
-                y: item_rect.top + 19.0,
-                size: 12.0,
-                bold: false,
-                paint: &paint,
-            });
-
-            if i == popup.selected_idx {
-                let check_base = if popup.hover_idx == Some(i) {
-                    theme.text_pri
-                } else {
-                    theme.accent
-                };
-                paint.set_color(Color::from_argb(
-                    text_alpha,
-                    check_base.r(),
-                    check_base.g(),
-                    check_base.b(),
-                ));
-                paint.set_style(skia_safe::paint::Style::Stroke);
-                paint.set_stroke_width(2.0);
-                let cx = item_rect.right - 14.0;
-                let cy = item_rect.top + POPUP_ITEM_H / 2.0;
-                let svg = format!(
-                    "M {} {} L {} {} L {} {}",
-                    cx - 4.0,
-                    cy,
-                    cx - 1.0,
-                    cy + 3.0,
-                    cx + 4.0,
-                    cy - 3.0,
-                );
-                if let Some(path) = skia_safe::Path::from_svg(&svg) {
-                    canvas.draw_path(&path, &paint);
-                }
-                paint.set_style(skia_safe::paint::Style::Fill);
-            }
-
-            if i < popup.options.len() - 1 {
-                let mut sep = Paint::default();
-                sep.set_anti_alias(true);
-                sep.set_color(Color::from_argb(
-                    (30.0 * opacity) as u8,
-                    theme.separator.r(),
-                    theme.separator.g(),
-                    theme.separator.b(),
-                ));
-                sep.set_stroke_width(0.5);
-                sep.set_style(skia_safe::paint::Style::Stroke);
-                canvas.draw_line(
-                    (item_rect.left, item_rect.bottom),
-                    (item_rect.right, item_rect.bottom),
-                    &sep,
-                );
-            }
-        }
-    }
-
-    fn get_page_anim(&self) -> SwitchAnimator {
-        match self.active_page {
-            0 => match self.active_sub_page {
-                0 => SwitchAnimator::new(&[]),
-                1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[0, 1, 2, 3, 4, 5]),
-                2 => SwitchAnimator::new_with_anims(&self.switch_anim, &[6, 7, 11, 8]),
-                _ => SwitchAnimator::new(&[]),
-            },
-            1 => SwitchAnimator::new_with_anims(&self.switch_anim, &[9, 10, 12]),
-            _ => SwitchAnimator::new(&[]),
-        }
-    }
+#[tauri::command]
+fn get_settings_state() -> Result<SettingsState, String> {
+    Ok(build_state(load_config()))
 }
 
-impl ApplicationHandler for SettingsApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let monitor = event_loop
-            .primary_monitor()
-            .or_else(|| event_loop.available_monitors().next());
-        let (win_x, win_y) = if let Some(m) = &monitor {
-            let screen_size = m.size();
-            let scale_factor = m.scale_factor();
-            let screen_w = screen_size.width as f64 / scale_factor;
-            let screen_h = screen_size.height as f64 / scale_factor;
-            let win_w = WIN_W as f64;
-            let win_h = WIN_H as f64;
-            ((screen_w - win_w) / 2.0, (screen_h - win_h) / 2.0)
-        } else {
-            (100.0, 100.0)
-        };
+#[tauri::command]
+fn save_settings_config(mut config: AppConfig) -> Result<SettingsState, String> {
+    let old_config = load_config();
+    normalize_config(&mut config);
+    apply_config_side_effects(&old_config, &config);
+    save_config(&config);
+    Ok(build_state(config))
+}
 
-        let attrs = Window::default_attributes()
-            .with_title("EchoMusic-Lyrics-WinIsland Settings")
-            .with_inner_size(LogicalSize::new(WIN_W as f64, WIN_H as f64))
-            .with_min_inner_size(LogicalSize::new(WIN_W as f64, WIN_H as f64))
-            .with_position(LogicalPosition::new(win_x, win_y))
-            .with_resizable(true)
-            .with_enabled_buttons(WindowButtons::CLOSE | WindowButtons::MINIMIZE)
-            .with_window_icon(get_app_icon());
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        self.window = Some(window.clone());
-        let context = Context::new(window.clone()).unwrap();
-        let mut surface = Surface::new(&context, window.clone()).unwrap();
-        let size = window.inner_size();
-        self.win_w = size.width as f32;
-        self.win_h = size.height as f32;
-        resize_surface(&mut surface, size.width, size.height);
-        self.surface = Some(surface);
-        self.update_theme();
+#[tauri::command]
+fn reset_settings() -> Result<SettingsState, String> {
+    let config = AppConfig::default();
+    init_i18n(&config.language);
+    FontManager::global().refresh_custom_font();
+    save_config(&config);
+    Ok(build_state(config))
+}
+
+#[tauri::command]
+fn select_font_file() -> Result<SettingsState, String> {
+    let mut config = load_config();
+    if let Some(path) = rfd::FileDialog::new()
+        .add_filter("Fonts", &["ttf", "otf"])
+        .pick_file()
+    {
+        config.custom_font_path = Some(path.to_string_lossy().into_owned());
+        FontManager::global().refresh_custom_font();
+        save_config(&config);
     }
+    Ok(build_state(config))
+}
 
-    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => _el.exit(),
-            WindowEvent::ThemeChanged(theme) if self.config.settings_theme == "system" => {
-                self.is_light = theme == winit::window::Theme::Light;
-                if let Some(win) = &self.window {
-                    Self::apply_titlebar_theme(win, self.is_light);
-                    win.request_redraw();
-                }
-            }
-            WindowEvent::Resized(new_size) => {
-                self.win_w = new_size.width as f32;
-                self.win_h = new_size.height as f32;
-                if let Some(surface) = &mut self.surface {
-                    resize_surface(surface, new_size.width, new_size.height);
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::ScaleFactorChanged { .. } => {
-                if let (Some(win), Some(surface)) = (&self.window, &mut self.surface) {
-                    let size = win.inner_size();
-                    resize_surface(surface, size.width, size.height);
-                    win.request_redraw();
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if self.focused_text_input.is_some() {
-                    match event.logical_key {
-                        Key::Named(NamedKey::Enter) => self.commit_text_input(),
-                        Key::Named(NamedKey::Escape) => self.cancel_text_input(),
-                        Key::Named(NamedKey::Backspace) => self.pop_text_input_char(),
-                        _ => {
-                            if let Some(text) = event.text {
-                                for ch in text.chars() {
-                                    self.push_text_input_char(ch);
-                                }
-                            }
-                        }
-                    }
-                    return;
-                }
-                match event.logical_key {
-                    Key::Named(NamedKey::F11) => {}
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        if self.active_page == 0 {
-                            if self.active_sub_page > 0 {
-                                self.active_sub_page -= 1;
-                                self.scroll_y = 0.0;
-                                self.target_scroll_y = 0.0;
-                                self.scroll_vel_y = 0.0;
-                                self.mark_items_dirty();
-                                if let Some(win) = &self.window {
-                                    win.request_redraw();
-                                }
-                            }
-                        } else if self.active_page > 0 {
-                            self.active_page -= 1;
-                            self.scroll_y = 0.0;
-                            self.target_scroll_y = 0.0;
-                            self.scroll_vel_y = 0.0;
-                            self.mark_items_dirty();
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
-                        }
-                    }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        if self.active_page == 0 {
-                            if self.active_sub_page < 2 {
-                                self.active_sub_page += 1;
-                                self.scroll_y = 0.0;
-                                self.target_scroll_y = 0.0;
-                                self.scroll_vel_y = 0.0;
-                                self.mark_items_dirty();
-                                if let Some(win) = &self.window {
-                                    win.request_redraw();
-                                }
-                            }
-                        } else if self.active_page < 2 {
-                            self.active_page += 1;
-                            self.scroll_y = 0.0;
-                            self.target_scroll_y = 0.0;
-                            self.scroll_vel_y = 0.0;
-                            self.mark_items_dirty();
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let scale = self
-                    .window
-                    .as_ref()
-                    .map(|w| w.scale_factor() as f32)
-                    .unwrap_or(1.0);
-                let new_pos = (position.x as f32 / scale, position.y as f32 / scale);
-                let mouse_moved = (new_pos.0 - self.last_hover_mouse_pos.0).abs() > 0.5
-                    || (new_pos.1 - self.last_hover_mouse_pos.1).abs() > 0.5;
-                self.logical_mouse_pos = new_pos;
+#[tauri::command]
+fn reset_font() -> Result<SettingsState, String> {
+    let mut config = load_config();
+    config.custom_font_path = None;
+    FontManager::global().refresh_custom_font();
+    save_config(&config);
+    Ok(build_state(config))
+}
 
-                if let Some(popup) = &mut self.popup {
-                    let (pmx, pmy) = self.logical_mouse_pos;
-                    let new_hover = popup.hit_test_item(pmx, pmy);
-                    if new_hover != popup.hover_idx {
-                        popup.hover_idx = new_hover;
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
-                    }
-                }
+#[tauri::command]
+fn check_updates_now() -> Result<(), String> {
+    crate::utils::updater::check_for_updates_now();
+    Ok(())
+}
 
-                if mouse_moved {
-                    self.last_hover_mouse_pos = new_pos;
-                    let (mx, my) = self.logical_mouse_pos;
-                    let mut new_hover: i32 = -1;
-                    if mx < SIDEBAR_W {
-                        let start_y = 20.0;
-                        for i in 0..3 {
-                            let row_y = start_y + i as f32 * (SIDEBAR_ROW_H + 2.0);
-                            if my >= row_y
-                                && my <= row_y + SIDEBAR_ROW_H
-                                && (SIDEBAR_PAD..=SIDEBAR_W - SIDEBAR_PAD).contains(&mx)
-                            {
-                                new_hover = i;
-                            }
-                        }
-                    }
-                    if new_hover != self.sidebar_hover {
-                        self.sidebar_hover = new_hover;
-                        for idx in 0..3 {
-                            if idx == new_hover as usize {
-                                self.anim.set(SIDEBAR_KEY_BASE + idx as u64, 1.0);
-                            } else {
-                                self.anim.set(SIDEBAR_KEY_BASE + idx as u64, 0.0);
-                            }
-                        }
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
-                    }
-
-                    let scale = self
-                        .window
-                        .as_ref()
-                        .map(|w| w.scale_factor() as f32)
-                        .unwrap_or(1.0);
-                    let content_w = self.win_w / scale - SIDEBAR_W;
-
-                    if self.active_page == 0
-                        && mx >= SIDEBAR_W
-                        && (SUB_TAB_START_Y..=SUB_TAB_START_Y + SUB_TAB_H).contains(&my)
-                    {
-                        let tabs = [
-                            tr("section_appearance"),
-                            tr("section_effects"),
-                            tr("section_behavior"),
-                        ];
-                        let tab_count = tabs.len() as i32;
-                        let tab_w = content_w / tab_count as f32;
-                        let rel_x = mx - SIDEBAR_W;
-                        let tab_idx = (rel_x / tab_w) as i32;
-                        let new_sub_hover = if tab_idx >= 0 && tab_idx < tab_count {
-                            tab_idx
-                        } else {
-                            -1
-                        };
-                        if new_sub_hover != self.sub_tab_hover {
-                            self.sub_tab_hover = new_sub_hover;
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
-                        }
-                    } else if self.sub_tab_hover != -1 {
-                        self.sub_tab_hover = -1;
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
-                    }
-
-                    if mx >= SIDEBAR_W {
-                        let content_x = mx - SIDEBAR_W;
-                        let content_y = my + self.scroll_y;
-                        let mut new_row: Option<usize> = None;
-                        self.ensure_items_cache();
-                        if content_x >= CONTENT_PADDING && content_x <= content_w - CONTENT_PADDING
-                        {
-                            let idx = match self
-                                .cached_row_tops
-                                .binary_search_by(|y| y.total_cmp(&content_y))
-                            {
-                                Ok(i) => Some(i),
-                                Err(0) => None,
-                                Err(i) => Some(i - 1),
-                            };
-                            if let Some(i) = idx
-                                && content_y <= self.cached_row_tops[i] + self.cached_row_heights[i]
-                            {
-                                new_row = Some(i);
-                            }
-                        }
-                        if new_row != self.hover_row {
-                            if let Some(old) = self.hover_row {
-                                self.anim.set(HOVER_ROW_KEY_BASE + old as u64, 0.0);
-                            }
-                            if let Some(new) = new_row {
-                                self.anim.set(HOVER_ROW_KEY_BASE + new as u64, 1.0);
-                            }
-                            self.hover_row = new_row;
-                        }
-                    } else if self.hover_row.is_some() {
-                        if let Some(old) = self.hover_row {
-                            self.anim.set(HOVER_ROW_KEY_BASE + old as u64, 0.0);
-                        }
-                        self.hover_row = None;
-                    }
-                }
-
-                let cursor = if self.get_hover_state() {
-                    winit::window::CursorIcon::Pointer
-                } else {
-                    winit::window::CursorIcon::Default
-                };
-                if let Some(win) = &self.window {
-                    win.set_cursor(cursor);
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if self.popup.is_some() {
-                    self.popup = None;
-                    self.anim.set_with_speed(POPUP_OPACITY_KEY, 0.0, 0.3);
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
-                    return;
-                }
-                let (mx, _) = self.logical_mouse_pos;
-                if mx >= SIDEBAR_W {
-                    let diff = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y * 40.0,
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
-                    };
-                    self.target_scroll_y =
-                        (self.target_scroll_y - diff).clamp(0.0, self.cached_max_scroll);
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.handle_click();
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left,
-                ..
-            } => {}
-            WindowEvent::RedrawRequested => self.draw(),
-            _ => (),
-        }
-    }
-
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-        if self.window.is_none() {
-            return;
-        }
-
-        let frame_start = Instant::now();
-        self.frame_count += 1;
-        if self.frame_count.is_multiple_of(30) {
-            // SAFETY: OpenMutexW opens an existing named mutex. The mutex name is a static
-            // string literal. CloseHandle is called on the valid handle returned by OpenMutexW.
-            unsafe {
-                let h = OpenMutexW(
-                    MUTEX_ALL_ACCESS,
-                    false,
-                    w!("Local\\EchoMusic_Lyrics_WinIsland_SingleInstance_Mutex"),
-                );
-                if let Ok(handle) = h {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
-                } else {
-                    _el.exit();
-                    return;
-                }
-            }
-        }
-        let has_anim = self.switch_anim.is_animating() || self.anim.is_animating();
-        let has_popup = self.popup.is_some();
-        let is_scrolling = (self.target_scroll_y - self.scroll_y).abs() > 0.1;
-
-        if !has_anim && !has_popup && !is_scrolling {
-            return;
-        }
-
-        let mut redraw = self.switch_anim.tick();
-        if self.anim.tick() {
-            redraw = true;
-        }
-
-        self.ensure_items_cache();
-        let max_scroll = self.cached_max_scroll;
-        self.target_scroll_y = self.target_scroll_y.clamp(0.0, max_scroll);
-
-        let dt = self
-            .last_frame_time
-            .elapsed()
-            .as_secs_f32()
-            .clamp(0.001, 0.05);
-        self.last_frame_time = Instant::now();
-
-        let diff = self.target_scroll_y - self.scroll_y;
-        let accel = diff * SCROLL_STIFFNESS - self.scroll_vel_y * SCROLL_DAMPING;
-        self.scroll_vel_y += accel * dt;
-        self.scroll_y += self.scroll_vel_y * dt;
-
-        if self.scroll_y < 0.0 {
-            self.scroll_y = 0.0;
-            self.scroll_vel_y = 0.0;
-        } else if self.scroll_y > max_scroll {
-            self.scroll_y = max_scroll;
-            self.scroll_vel_y = 0.0;
-        }
-
-        if diff.abs() > 0.05 || self.scroll_vel_y.abs() > 0.05 {
-            redraw = true;
-        } else if (self.scroll_y - self.target_scroll_y).abs() > f32::EPSILON {
-            self.scroll_y = self.target_scroll_y;
-            self.scroll_vel_y = 0.0;
-        }
-
-        if redraw {
-            if let Some(win) = &self.window {
-                win.request_redraw();
-            }
-            let target = Duration::from_millis(16);
-            let elapsed = frame_start.elapsed();
-            if elapsed < target {
-                std::thread::sleep(target - elapsed);
-            }
-        }
-    }
+#[tauri::command]
+fn open_homepage() -> Result<(), String> {
+    open::that(APP_HOMEPAGE).map_err(|err| err.to_string())
 }
 
 pub fn run_settings(config: AppConfig) {
-    let el = EventLoop::new().unwrap();
-    let mut app = SettingsApp::new(config);
-    el.run_app(&mut app).unwrap();
+    init_i18n(&config.language);
+
+    tauri::Builder::default()
+        .setup(|app| {
+            watch_main_instance(app.handle().clone());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_settings_state,
+            save_settings_config,
+            reset_settings,
+            select_font_file,
+            reset_font,
+            check_updates_now,
+            open_homepage,
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to run Tauri settings window");
 }
 
 pub fn bring_settings_to_front() {
-    crate::utils::win32::bring_window_to_front("EchoMusic-Lyrics-WinIsland Settings");
+    crate::utils::win32::bring_window_to_front(SETTINGS_TITLE);
 }
 
-fn resize_surface(surface: &mut Surface<Arc<Window>, Arc<Window>>, width: u32, height: u32) {
-    if let (Some(w), Some(h)) = (
-        std::num::NonZeroU32::new(width),
-        std::num::NonZeroU32::new(height),
-    ) {
-        let _ = surface.resize(w, h);
+fn build_state(config: AppConfig) -> SettingsState {
+    SettingsState {
+        lyrics_filter_regex_valid: regex::Regex::new(&config.lyrics_filter_regex).is_ok(),
+        config,
+        current_lang: current_lang(),
+        translations: translation_map(),
+        monitors: get_monitor_list(),
+        app: AppInfo {
+            version: APP_VERSION,
+            author: APP_AUTHOR,
+            homepage: APP_HOMEPAGE,
+            icon_png: APP_ICON_PNG.to_vec(),
+            icon_dark_png: APP_ICON_DARK_PNG.to_vec(),
+        },
     }
+}
+
+fn translation_map() -> HashMap<String, String> {
+    TRANSLATION_KEYS
+        .iter()
+        .map(|key| ((*key).to_string(), tr(key)))
+        .collect()
+}
+
+fn normalize_config(config: &mut AppConfig) {
+    config.non_expanded_scale = round_to(config.non_expanded_scale, 0.01).clamp(0.5, 5.0);
+    config.expanded_scale = round_to(config.expanded_scale, 0.01).clamp(0.5, 5.0);
+    config.base_width = config.base_width.max(40.0);
+    config.base_height = config.base_height.max(15.0);
+    config.expanded_width = config.expanded_width.max(200.0);
+    config.expanded_height = config.expanded_height.max(100.0);
+    config.font_size = config.font_size.clamp(0.0, 30.0);
+    config.auto_hide_delay = config.auto_hide_delay.clamp(1.0, 60.0);
+    config.hover_to_hide_distance = config.hover_to_hide_distance.clamp(50.0, 300.0);
+    config.hover_to_hide_delay = round_to(config.hover_to_hide_delay, 0.1).clamp(0.2, 3.0);
+    config.update_check_interval = config.update_check_interval.clamp(1.0, 24.0);
+    config.lyrics_delay = round_to_f64(config.lyrics_delay, 0.1).clamp(-10.0, 10.0);
+    config.lyrics_scroll_max_width = config.lyrics_scroll_max_width.clamp(100.0, 500.0);
+
+    if !matches!(config.language.as_str(), "auto" | "en" | "zh") {
+        config.language = AppConfig::default().language;
+    }
+    if !matches!(config.settings_theme.as_str(), "system" | "light" | "dark") {
+        config.settings_theme = AppConfig::default().settings_theme;
+    }
+    if !matches!(
+        config.island_style.as_str(),
+        "default" | "glass" | "mica" | "dynamic" | "liquid_glass"
+    ) {
+        config.island_style = AppConfig::default().island_style;
+    }
+    if !matches!(config.mini_cover_shape.as_str(), "square" | "circle") {
+        config.mini_cover_shape = AppConfig::default().mini_cover_shape;
+    }
+    if !matches!(config.expanded_cover_shape.as_str(), "square" | "circle") {
+        config.expanded_cover_shape = AppConfig::default().expanded_cover_shape;
+    }
+}
+
+fn round_to(value: f32, step: f32) -> f32 {
+    (value / step).round() * step
+}
+
+fn round_to_f64(value: f64, step: f64) -> f64 {
+    (value / step).round() * step
+}
+
+fn apply_config_side_effects(old_config: &AppConfig, config: &AppConfig) {
+    if old_config.language != config.language {
+        init_i18n(&config.language);
+    }
+    if old_config.auto_start != config.auto_start
+        && let Err(err) = set_autostart(config.auto_start)
+    {
+        log::warn!("EchoMusic-Lyrics-WinIsland: failed to update autostart: {err}");
+    }
+    if old_config.custom_font_path != config.custom_font_path {
+        FontManager::global().refresh_custom_font();
+    }
+}
+
+fn watch_main_instance(app_handle: tauri::AppHandle) {
+    thread::spawn(move || {
+        loop {
+            if !main_instance_exists() {
+                app_handle.exit(0);
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+fn main_instance_exists() -> bool {
+    // SAFETY: OpenMutexW 只按静态名称打开已存在的互斥体；成功后立即关闭句柄。
+    unsafe {
+        match OpenMutexW(
+            MUTEX_ALL_ACCESS,
+            false,
+            w!("Local\\EchoMusic_Lyrics_WinIsland_SingleInstance_Mutex"),
+        ) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn get_monitor_list() -> Vec<String> {
+    use windows::Win32::Graphics::Gdi::{
+        DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICEW, EnumDisplayDevicesW,
+    };
+
+    let mut monitors: Vec<String> = Vec::new();
+
+    // SAFETY: EnumDisplayDevicesW 使用栈上初始化的 DISPLAY_DEVICEW 结构体并按文档设置 cb 字段；
+    // 设备名来自上一轮系统调用返回的固定缓冲区，调用期间保持有效。
+    unsafe {
+        let mut idx = 0u32;
+        let mut active_count = 0;
+        loop {
+            let mut display_device: DISPLAY_DEVICEW = std::mem::zeroed();
+            display_device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if !EnumDisplayDevicesW(None, idx, &mut display_device, 0).as_bool() {
+                break;
+            }
+
+            if (display_device.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0 {
+                active_count += 1;
+                let name = String::from_utf16_lossy(&display_device.DeviceName)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let mut monitor_device: DISPLAY_DEVICEW = std::mem::zeroed();
+                monitor_device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+                let mut label = if EnumDisplayDevicesW(
+                    windows::core::PCWSTR(display_device.DeviceName.as_ptr()),
+                    0,
+                    &mut monitor_device,
+                    0,
+                )
+                .as_bool()
+                {
+                    let friendly = String::from_utf16_lossy(&monitor_device.DeviceString)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    if friendly.is_empty() {
+                        name.clone()
+                    } else {
+                        friendly
+                    }
+                } else {
+                    name.clone()
+                };
+                label = format!("Display {active_count}: {label}");
+                monitors.push(label);
+            }
+
+            idx += 1;
+        }
+    }
+
+    if monitors.is_empty() {
+        monitors.push("Primary".to_string());
+    }
+
+    monitors
 }

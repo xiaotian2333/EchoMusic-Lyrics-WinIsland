@@ -12,14 +12,32 @@
 
 ## 构建项目
 
+### 环境要求
+
 - **Rust** 环境
 - **Cargo**
+- **Node.js** (构建设置页前端)
+
+### 构建步骤
 
 ```cmd
 git clone https://github.com/xiaotian2333/EchoMusic-Lyrics-WinIsland.git
 
 cd EchoMusic-Lyrics-WinIsland
+```
 
+**1. 编译设置页前端**
+
+```cmd
+cd settings-ui
+npm install
+npm run build
+cd ..
+```
+
+**2. 编译 Rust 后端**
+
+```cmd
 cargo build --release
 ```
 

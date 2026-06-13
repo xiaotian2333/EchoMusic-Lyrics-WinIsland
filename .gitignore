@@ -1,4 +1,5 @@
 /target
+/gen
 .idea/
 /.claude/
 /.planning/

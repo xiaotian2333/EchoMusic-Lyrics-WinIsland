@@ -67,10 +67,6 @@ pub fn init_i18n(config_lang: &str) {
     I18N.write().unwrap().load(&target_lang);
 }
 
-pub fn set_lang(lang: &str) {
-    I18N.write().unwrap().load(lang);
-}
-
 pub fn current_lang() -> String {
     I18N.read().unwrap().current_lang.clone()
 }
