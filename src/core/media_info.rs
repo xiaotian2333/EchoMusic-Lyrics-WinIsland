@@ -1,4 +1,6 @@
-use crate::core::lyrics::{LyricCharacter, LyricLine, current_character_index, current_lyric_index};
+use crate::core::lyrics::{
+    LyricCharacter, LyricLine, current_character_index, current_lyric_index,
+};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -67,10 +69,7 @@ impl MediaInfo {
         (raw_pos as i64 + delay_ms).max(0) as u64
     }
 
-    pub fn current_character_data(
-        &self,
-        delay_ms: i64,
-    ) -> Option<(&[LyricCharacter], usize)> {
+    pub fn current_character_data(&self, delay_ms: i64) -> Option<(&[LyricCharacter], usize)> {
         let lyrics = self.lyrics.as_ref()?;
         let current_pos = self.effective_position_ms(delay_ms);
         let line_idx = current_lyric_index(lyrics, current_pos)?;

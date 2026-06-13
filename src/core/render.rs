@@ -663,9 +663,24 @@ pub fn draw_island(
                             + 4.0 * non_expanded_scale
                             + (10.0 * non_expanded_scale * (1.0 - lyric_transition));
 
-                        if let (Some(chars), Some(char_idx)) = (current_characters, current_char_idx) {
-                            let total_w: f32 = chars.iter().map(|c| FontManager::global().measure_text_cached(&c.t, lyric_font_sz, skia_safe::FontStyle::normal())).sum();
-                            let start_x = if text_centered { text_x - total_w / 2.0 } else { text_x };
+                        if let (Some(chars), Some(char_idx)) =
+                            (current_characters, current_char_idx)
+                        {
+                            let total_w: f32 = chars
+                                .iter()
+                                .map(|c| {
+                                    FontManager::global().measure_text_cached(
+                                        &c.t,
+                                        lyric_font_sz,
+                                        skia_safe::FontStyle::normal(),
+                                    )
+                                })
+                                .sum();
+                            let start_x = if text_centered {
+                                text_x - total_w / 2.0
+                            } else {
+                                text_x
+                            };
                             let char_base_y = text_y + 2.0;
                             let mut char_x = start_x;
                             let anim_progress = CHAR_LIFT_ANIM.with(|cell| {
@@ -679,7 +694,9 @@ pub fn draw_island(
                                 let val = *cell.borrow();
                                 if val < 1.0 {
                                     *cell.borrow_mut() += 8.0 * dt / 60.0;
-                                    if *cell.borrow() > 1.0 { *cell.borrow_mut() = 1.0; }
+                                    if *cell.borrow() > 1.0 {
+                                        *cell.borrow_mut() = 1.0;
+                                    }
                                 }
                                 *cell.borrow()
                             });
@@ -691,14 +708,27 @@ pub fn draw_island(
                                 } else {
                                     char_base_y
                                 };
-                                let ch_color = if i <= char_idx { resolved_char_played } else { resolved_char_unplayed };
+                                let ch_color = if i <= char_idx {
+                                    resolved_char_played
+                                } else {
+                                    resolved_char_unplayed
+                                };
                                 let mut ch_paint = Paint::default();
                                 ch_paint.set_anti_alias(true);
-                                ch_paint.set_color(Color::from_argb(fade_alpha, ch_color.r(), ch_color.g(), ch_color.b()));
+                                ch_paint.set_color(Color::from_argb(
+                                    fade_alpha,
+                                    ch_color.r(),
+                                    ch_color.g(),
+                                    ch_color.b(),
+                                ));
                                 if let Some(ref filter) = blur_filter {
                                     ch_paint.set_image_filter(filter.clone());
                                 }
-                                let ch_w = FontManager::global().measure_text_cached(&ch.t, lyric_font_sz, skia_safe::FontStyle::normal());
+                                let ch_w = FontManager::global().measure_text_cached(
+                                    &ch.t,
+                                    lyric_font_sz,
+                                    skia_safe::FontStyle::normal(),
+                                );
                                 draw_text_cached(DrawTextCachedParams {
                                     canvas,
                                     text: &ch.t,
@@ -777,9 +807,24 @@ pub fn draw_island(
                         let progress = (lyric_transition - 0.5) * 2.0;
                         let fade_alpha = (alpha as f32 * progress) as u8;
 
-                        if let (Some(chars), Some(char_idx)) = (current_characters, current_char_idx) {
-                            let total_w: f32 = chars.iter().map(|c| FontManager::global().measure_text_cached(&c.t, lyric_font_sz, skia_safe::FontStyle::normal())).sum();
-                            let start_x = if text_centered { text_x - total_w / 2.0 } else { text_x };
+                        if let (Some(chars), Some(char_idx)) =
+                            (current_characters, current_char_idx)
+                        {
+                            let total_w: f32 = chars
+                                .iter()
+                                .map(|c| {
+                                    FontManager::global().measure_text_cached(
+                                        &c.t,
+                                        lyric_font_sz,
+                                        skia_safe::FontStyle::normal(),
+                                    )
+                                })
+                                .sum();
+                            let start_x = if text_centered {
+                                text_x - total_w / 2.0
+                            } else {
+                                text_x
+                            };
                             let char_base_y = text_y + 2.0;
                             let mut char_x = start_x;
                             let anim_progress = CHAR_LIFT_ANIM.with(|cell| {
@@ -793,7 +838,9 @@ pub fn draw_island(
                                 let val = *cell.borrow();
                                 if val < 1.0 {
                                     *cell.borrow_mut() += 8.0 * dt / 60.0;
-                                    if *cell.borrow() > 1.0 { *cell.borrow_mut() = 1.0; }
+                                    if *cell.borrow() > 1.0 {
+                                        *cell.borrow_mut() = 1.0;
+                                    }
                                 }
                                 *cell.borrow()
                             });
@@ -805,11 +852,24 @@ pub fn draw_island(
                                 } else {
                                     char_base_y
                                 };
-                                let ch_color = if i <= char_idx { resolved_char_played } else { resolved_char_unplayed };
+                                let ch_color = if i <= char_idx {
+                                    resolved_char_played
+                                } else {
+                                    resolved_char_unplayed
+                                };
                                 let mut ch_paint = Paint::default();
                                 ch_paint.set_anti_alias(true);
-                                ch_paint.set_color(Color::from_argb(fade_alpha, ch_color.r(), ch_color.g(), ch_color.b()));
-                                let ch_w = FontManager::global().measure_text_cached(&ch.t, lyric_font_sz, skia_safe::FontStyle::normal());
+                                ch_paint.set_color(Color::from_argb(
+                                    fade_alpha,
+                                    ch_color.r(),
+                                    ch_color.g(),
+                                    ch_color.b(),
+                                ));
+                                let ch_w = FontManager::global().measure_text_cached(
+                                    &ch.t,
+                                    lyric_font_sz,
+                                    skia_safe::FontStyle::normal(),
+                                );
                                 draw_text_cached(DrawTextCachedParams {
                                     canvas,
                                     text: &ch.t,

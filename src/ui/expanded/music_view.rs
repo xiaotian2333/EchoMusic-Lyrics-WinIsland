@@ -6,8 +6,8 @@ use crate::utils::physics::Spring;
 use crate::utils::scroll::{ScrollDrawParams, ScrollText};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
-    images, Canvas, Color, Data, FilterMode, FontStyle, Image, ImageInfo, ISize, MipmapMode,
-    Paint, Point, RRect, Rect, SamplingOptions, TileMode, gradient_shader, image_filters,
+    Canvas, Color, Data, FilterMode, FontStyle, ISize, Image, ImageInfo, MipmapMode, Paint, Point,
+    RRect, Rect, SamplingOptions, TileMode, gradient_shader, image_filters, images,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -189,7 +189,10 @@ fn bytes_to_skia_image(data: &[u8]) -> Option<Image> {
     if let Some(image) = Image::from_encoded(Data::new_copy(data)) {
         return Some(image);
     }
-    log::warn!("Skia 无法解码封面 ({} bytes)，尝试 image crate 后备", data.len());
+    log::warn!(
+        "Skia 无法解码封面 ({} bytes)，尝试 image crate 后备",
+        data.len()
+    );
     let img = image::load_from_memory(data).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();

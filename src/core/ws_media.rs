@@ -18,6 +18,7 @@ pub struct WsMediaListener {
     info_rx: watch::Receiver<MediaInfo>,
     seek_tx: mpsc::UnboundedSender<u64>,
     playback_tx: mpsc::UnboundedSender<PlaybackCommand>,
+    lyrics_ws_handle: LyricsWsHandle,
     _cancel_token: CancellationToken,
 }
 
@@ -48,6 +49,7 @@ impl WsMediaListener {
             info_rx,
             seek_tx,
             playback_tx,
+            lyrics_ws_handle: lyrics_ws_handle.clone(),
             _cancel_token: cancel_token,
         }
     }
@@ -70,6 +72,10 @@ impl WsMediaListener {
 
     pub fn request_prev(&self) {
         let _ = self.playback_tx.send(PlaybackCommand::Prev);
+    }
+
+    pub fn broadcast_config_snapshot(&self) {
+        self.lyrics_ws_handle.broadcast_config_snapshot();
     }
 }
 

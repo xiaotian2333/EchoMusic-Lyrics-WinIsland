@@ -640,7 +640,8 @@ impl SettingsApp {
                         }
                         l if l == tr("lyrics_char_highlight") => {
                             if self.config.show_lyrics {
-                                self.config.lyrics_char_highlight = !self.config.lyrics_char_highlight
+                                self.config.lyrics_char_highlight =
+                                    !self.config.lyrics_char_highlight
                             }
                         }
                         _ => {

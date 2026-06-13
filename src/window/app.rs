@@ -721,6 +721,8 @@ impl App {
                 crate::utils::font::FontManager::global().refresh_custom_font();
             }
 
+            self.media.broadcast_config_snapshot();
+
             let (new_os_w, new_os_h) = Self::compute_os_size(&self.config);
 
             let size_changed = new_os_w != self.os_w
@@ -1036,15 +1038,15 @@ impl ApplicationHandler for App {
                         } else {
                             None
                         };
-                        if char_data.is_some()
-                            && self.config.lyrics_filter_scope.filters_desktop()
+                        if char_data.is_some() && self.config.lyrics_filter_scope.filters_desktop()
                         {
                             let lyrics = media_info.lyrics.as_ref();
                             let current_pos = media_info.effective_position_ms(delay_ms);
                             let is_filtered = lyrics
                                 .and_then(|ly| {
                                     let idx = current_lyric_index(ly, current_pos)?;
-                                    if self.lyrics_filter_regex_cache
+                                    if self
+                                        .lyrics_filter_regex_cache
                                         .as_ref()
                                         .is_some_and(|r| r.is_match(ly[idx].text.trim()))
                                     {
@@ -1060,8 +1062,10 @@ impl ApplicationHandler for App {
                         }
                         let current_characters = char_data.as_ref().map(|(c, _)| *c);
                         let current_char_idx = char_data.map(|(_, i)| i);
-                        let char_color_unplayed = parse_hex_color(&self.config.lyrics_char_color_unplayed);
-                        let char_color_played = parse_hex_color(&self.config.lyrics_char_color_played);
+                        let char_color_unplayed =
+                            parse_hex_color(&self.config.lyrics_char_color_unplayed);
+                        let char_color_played =
+                            parse_hex_color(&self.config.lyrics_char_color_played);
 
                         let widget_animating = draw_island(
                             surface,
@@ -1257,7 +1261,10 @@ impl ApplicationHandler for App {
             } else if !cursor_in_outer {
                 match self.hover_to_hide_enter_at {
                     None => self.hover_to_hide_enter_at = Some(Instant::now()),
-                    Some(t) if t.elapsed() >= Duration::from_secs_f64(self.config.hover_to_hide_delay as f64) => {
+                    Some(t)
+                        if t.elapsed()
+                            >= Duration::from_secs_f64(self.config.hover_to_hide_delay as f64) =>
+                    {
                         self.auto_hidden = false;
                         self.idle_timer = Instant::now();
                         self.spring_hide.velocity = -0.45;

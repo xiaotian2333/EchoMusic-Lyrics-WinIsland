@@ -1,4 +1,7 @@
+use crate::core::config::APP_HOMEPAGE;
 use crate::core::lyrics::{MusicData, parse_music_data_payload};
+use crate::core::persistence;
+use crate::utils::font::FontManager;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -19,6 +22,7 @@ pub enum LyricsWsCommand {
     Prev,
     GetPlaybackState,
     RequestMusicData,
+    ConfigSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +92,10 @@ impl LyricsWsHandle {
     pub fn request_music_data(&self) {
         let _ = self.command_tx.send(LyricsWsCommand::RequestMusicData);
     }
+
+    pub fn broadcast_config_snapshot(&self) {
+        let _ = self.command_tx.send(LyricsWsCommand::ConfigSnapshot);
+    }
 }
 
 pub fn start_lyrics_ws_server(
@@ -128,9 +136,10 @@ async fn run_server(
                 };
                 let client_event_tx = event_tx.clone();
                 let command_rx = command_tx.subscribe();
+                let client_command_tx = command_tx.clone();
                 let client_cancel = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_client(stream, client_event_tx, command_rx, client_cancel).await {
+                    if let Err(err) = handle_client(stream, client_event_tx, client_command_tx, command_rx, client_cancel).await {
                         log::warn!("歌词 WebSocket 客户端 {} 已断开: {}", addr, err);
                     }
                 });
@@ -142,6 +151,7 @@ async fn run_server(
 async fn handle_client(
     stream: tokio::net::TcpStream,
     event_tx: mpsc::UnboundedSender<LyricsWsEvent>,
+    command_tx: broadcast::Sender<LyricsWsCommand>,
     mut command_rx: broadcast::Receiver<LyricsWsCommand>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -150,6 +160,8 @@ async fn handle_client(
 
     let _ = event_tx.send(LyricsWsEvent::Connected);
     send_request_track_lyrics(&mut ws_write).await?;
+    // 连接后立即推送全量配置，使插件设置面板显示当前值
+    send_config_snapshot(&mut ws_write).await?;
 
     loop {
         tokio::select! {
@@ -183,6 +195,9 @@ async fn handle_client(
                     Ok(LyricsWsCommand::RequestMusicData) => {
                         send_command(&mut ws_write, "request_MusicData", None).await?;
                     }
+                    Ok(LyricsWsCommand::ConfigSnapshot) => {
+                        send_config_snapshot(&mut ws_write).await?;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -196,7 +211,7 @@ async fn handle_client(
                     break;
                 }
                 if message.is_text() {
-                    handle_text_message(message.to_text()?, &event_tx, &mut ws_write).await?;
+                    handle_text_message(message.to_text()?, &event_tx, &command_tx, &mut ws_write).await?;
                 }
             }
         }
@@ -208,6 +223,7 @@ async fn handle_client(
 async fn handle_text_message<S>(
     text: &str,
     event_tx: &mpsc::UnboundedSender<LyricsWsEvent>,
+    command_tx: &broadcast::Sender<LyricsWsCommand>,
     ws_write: &mut S,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -238,12 +254,52 @@ where
                 let _ = event_tx.send(LyricsWsEvent::MusicData(music_data));
             }
         }
+        "config_update" => {
+            let path = message
+                .get("payload")
+                .and_then(|p| p.get("path").and_then(|v| v.as_str()));
+            let value = message.get("payload").and_then(|p| p.get("value"));
+            if let (Some(path), Some(value)) = (path, value)
+                && path != "custom_font_path"
+            {
+                apply_config_field(path, value);
+                let _ = command_tx.send(LyricsWsCommand::ConfigSnapshot);
+            }
+        }
         "command" => {
             if message.get("source").and_then(|v| v.as_str()) != Some("plugin") {
                 return Ok(());
             }
             if let Some(payload) = message.get("payload") {
-                handle_plugin_command(payload, event_tx).await?;
+                match payload.get("action").and_then(|v| v.as_str()) {
+                    Some("get_config") => {
+                        send_config_snapshot(ws_write).await?;
+                    }
+                    Some("open_font_picker") => {
+                        let path = tokio::task::spawn_blocking(|| {
+                            rfd::FileDialog::new()
+                                .add_filter("Fonts", &["ttf", "otf"])
+                                .pick_file()
+                                .map(|p| p.to_string_lossy().into_owned())
+                        })
+                        .await
+                        .unwrap_or(None);
+                        if let Some(path) = path {
+                            apply_config_field("custom_font_path", &Value::String(path));
+                            FontManager::global().refresh_custom_font();
+                            let _ = command_tx.send(LyricsWsCommand::ConfigSnapshot);
+                        }
+                    }
+                    Some("check_updates_now") => {
+                        crate::utils::updater::check_for_updates_now();
+                    }
+                    Some("open_homepage") => {
+                        let _ = open::that(APP_HOMEPAGE);
+                    }
+                    _ => {
+                        handle_plugin_command(payload, event_tx).await?;
+                    }
+                }
             }
         }
         "track_lyrics" => {
@@ -341,6 +397,38 @@ where
     <S as Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     send_command(ws_write, "request_track_lyrics", None).await
+}
+
+async fn send_config_snapshot<S>(
+    ws_write: &mut S,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: Sink<Message> + Unpin,
+    <S as Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let config = persistence::load_config();
+    if let Ok(payload) = serde_json::to_value(&config) {
+        let message = json!({
+            "type": "config_snapshot",
+            "payload": payload
+        });
+        ws_write
+            .send(Message::Text(message.to_string().into()))
+            .await?;
+    }
+    Ok(())
+}
+
+fn apply_config_field(path: &str, value: &Value) {
+    let config = persistence::load_config();
+    if let Ok(mut val) = serde_json::to_value(&config)
+        && let Some(obj) = val.as_object_mut()
+    {
+        obj.insert(path.to_string(), value.clone());
+        if let Ok(new_config) = serde_json::from_value(val) {
+            persistence::save_config(&new_config);
+        }
+    }
 }
 
 async fn send_command<S>(

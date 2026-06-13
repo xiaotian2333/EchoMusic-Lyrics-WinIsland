@@ -31,9 +31,7 @@ pub fn current_character_index(characters: &[LyricCharacter], current_pos: u64) 
     if characters.is_empty() {
         return None;
     }
-    characters
-        .iter()
-        .rposition(|c| current_pos >= c.s)
+    characters.iter().rposition(|c| current_pos >= c.s)
 }
 
 pub fn filtered_lyric_text<F>(
@@ -127,15 +125,16 @@ pub fn parse_music_data_payload(payload: &Value) -> Option<MusicData> {
             if !time_ms.is_finite() || time_ms < 0.0 {
                 return None;
             }
-            let characters = line.get("characters").and_then(|v| v.as_array()).map(
-                |arr| {
+            let characters = line
+                .get("characters")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
                     arr.iter()
                         .filter_map(|c| {
                             let s = c.get("s")?.as_f64()?;
                             let e = c.get("e")?.as_f64()?;
                             let t = c.get("t")?.as_str()?.to_string();
-                            if !s.is_finite() || s < 0.0 || !e.is_finite() || e < 0.0
-                            {
+                            if !s.is_finite() || s < 0.0 || !e.is_finite() || e < 0.0 {
                                 return None;
                             }
                             Some(LyricCharacter {
@@ -145,9 +144,8 @@ pub fn parse_music_data_payload(payload: &Value) -> Option<MusicData> {
                             })
                         })
                         .collect::<Vec<_>>()
-                },
-            )
-            .filter(|chars: &Vec<LyricCharacter>| !chars.is_empty());
+                })
+                .filter(|chars: &Vec<LyricCharacter>| !chars.is_empty());
             Some(LyricLine {
                 time_ms: time_ms.round() as u64,
                 text,

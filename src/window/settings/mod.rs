@@ -623,10 +623,7 @@ impl SettingsApp {
             },
             SettingsItem::RowTextInput {
                 label: tr("lyrics_filter_regex"),
-                value: if matches!(
-                    self.focused_text_input,
-                    Some(FocusedTextInput::FilterRegex)
-                ) {
+                value: if matches!(self.focused_text_input, Some(FocusedTextInput::FilterRegex)) {
                     self.text_input_buffer.clone()
                 } else {
                     self.config.lyrics_filter_regex.clone()
@@ -635,10 +632,7 @@ impl SettingsApp {
                 enabled: show_lyrics && self.config.lyrics_filter_scope != LyricsFilterScope::Off,
                 invalid: !self.config.lyrics_filter_regex.trim().is_empty()
                     && regex::Regex::new(&self.config.lyrics_filter_regex).is_err(),
-                focused: matches!(
-                    self.focused_text_input,
-                    Some(FocusedTextInput::FilterRegex)
-                ),
+                focused: matches!(self.focused_text_input, Some(FocusedTextInput::FilterRegex)),
             },
             SettingsItem::GroupEnd,
             SettingsItem::SectionHeader {
