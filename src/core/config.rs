@@ -134,6 +134,13 @@ impl From<LyricsFilterScope> for String {
 }
 
 pub const DEFAULT_LYRICS_FILTER_REGEX: &str = r"^([^：]*)：.*$|^([^:]*):.*$|^([^翻唱]*)翻唱.*$|^([^许可]*)许可.*$|^([^音乐人]*)音乐人.*$|^([^国风]*)国风.*$|^([^纯音乐]*)纯音乐.*$|^([^星曜计划]*)星曜计划.*$";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ProcessDockRule {
+    pub process_name: String,
+    pub dock_position: DockPosition,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppConfig {
     pub non_expanded_scale: f32,
@@ -184,6 +191,8 @@ pub struct AppConfig {
     pub position_y_offset: i32,
     #[serde(default = "default_dock_position")]
     pub dock_position: DockPosition,
+    #[serde(default = "default_process_dock_rules")]
+    pub process_dock_rules: Vec<ProcessDockRule>,
     #[serde(default = "default_monitor_index")]
     pub monitor_index: i32,
     #[serde(default = "default_font_size")]
@@ -290,6 +299,10 @@ fn default_dock_position() -> DockPosition {
     DockPosition::TopCenter
 }
 
+fn default_process_dock_rules() -> Vec<ProcessDockRule> {
+    vec![]
+}
+
 fn default_monitor_index() -> i32 {
     0
 }
@@ -369,6 +382,7 @@ impl Default for AppConfig {
             position_x_offset: 0,
             position_y_offset: 0,
             dock_position: DockPosition::TopCenter,
+            process_dock_rules: vec![],
             monitor_index: 0,
             font_size: 0.0,
             settings_theme: "system".to_string(),

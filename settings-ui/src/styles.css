@@ -452,6 +452,42 @@ input:focus {
   color: var(--muted);
 }
 
+.process-rule-row {
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  padding: 6px 14px;
+}
+
+.rule-inputs {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.rule-inputs input[type="text"] {
+  width: 160px;
+}
+
+.rule-inputs select {
+  width: 150px;
+}
+
+.remove-rule-btn {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.add-rule-row {
+  display: flex;
+  justify-content: center;
+  padding: 10px 14px;
+  border-bottom: 0;
+}
+
+.add-rule-row .primary-button {
+  width: 100%;
+}
+
 .danger-zone {
   display: flex;
   justify-content: center;

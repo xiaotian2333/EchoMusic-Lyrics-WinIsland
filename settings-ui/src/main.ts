@@ -274,6 +274,30 @@ function dockOptions() {
   ];
 }
 
+function processRulesSection() {
+  const rules = config.process_dock_rules || [];
+  const rows = rules.map((rule, i) => {
+    const opts = dockOptions()
+      .map((o) => `<option value="${h(o.value)}"${o.value === rule.dock_position ? " selected" : ""}>${h(o.label)}</option>`)
+      .join("");
+    return `
+      <div class="row process-rule-row">
+        <div class="rule-inputs">
+          <input type="text" data-rule-process="${i}" value="${h(rule.process_name)}" placeholder="e.g. chrome.exe" />
+          <select data-rule-position="${i}">${opts}</select>
+        </div>
+        <button class="icon-button remove-rule-btn" data-action="remove-rule" data-index="${i}">&times;</button>
+      </div>
+    `;
+  });
+  rows.push(`
+    <div class="row add-rule-row">
+      <button class="primary-button" data-action="add-rule">+ ${h(tr("add_rule"))}</button>
+    </div>
+  `);
+  return section(tr("section_process_rules"), rows);
+}
+
 function generalAppearance() {
   return [
     section(tr("section_appearance"), [
@@ -289,6 +313,7 @@ function generalAppearance() {
       selectRow(tr("monitor"), "monitor_index", monitorOptions()),
       selectRow(tr("dock_position"), "dock_position", dockOptions()),
     ]),
+    processRulesSection(),
   ].join("");
 }
 
@@ -526,12 +551,42 @@ function handleClick(event) {
     void invoke("check_updates_now").catch((error) => setStatus(String(error)));
   } else if (action === "open-homepage") {
     void invoke("open_homepage").catch((error) => setStatus(String(error)));
+  } else if (action === "add-rule") {
+    config.process_dock_rules = config.process_dock_rules || [];
+    config.process_dock_rules.push({ process_name: "", dock_position: "top_center" });
+    render();
+    void saveConfig();
+  } else if (action === "remove-rule") {
+    const index = Number(button.dataset.index);
+    config.process_dock_rules = config.process_dock_rules || [];
+    if (index >= 0 && index < config.process_dock_rules.length) {
+      config.process_dock_rules.splice(index, 1);
+      render();
+      void saveConfig();
+    }
   }
 }
 
 function handleChange(event) {
   const target = event.target;
   const field = target?.dataset?.field;
+
+  const ruleIdx = target.dataset.ruleProcess ?? target.dataset.rulePosition;
+  if (ruleIdx !== undefined) {
+    const idx = Number(ruleIdx);
+    const rules = config.process_dock_rules || [];
+    if (idx >= 0 && idx < rules.length) {
+      if (target.dataset.ruleProcess !== undefined) {
+        rules[idx].process_name = target.value;
+      } else if (target.dataset.rulePosition !== undefined) {
+        rules[idx].dock_position = target.value;
+      }
+      render();
+      void saveConfig();
+    }
+    return;
+  }
+
   if (!field) {
     return;
   }

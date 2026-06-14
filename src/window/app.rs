@@ -1,5 +1,5 @@
 use crate::core::audio::AudioProcessor;
-use crate::core::config::{AppConfig, LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE};
+use crate::core::config::{AppConfig, DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE};
 use crate::core::lyrics::{current_lyric_index, filtered_lyric_text};
 use crate::core::persistence::load_config;
 use crate::core::render::{draw_island, get_mini_control_rects};
@@ -18,6 +18,7 @@ use crate::utils::mouse::{
     get_global_cursor_pos, is_cursor_hidden, is_foreground_fullscreen, is_left_button_pressed,
     is_point_in_rect,
 };
+use crate::utils::process::get_foreground_process_name;
 use crate::utils::physics::Spring;
 use crate::window::tray::{TrayAction, TrayManager};
 use regex::Regex;
@@ -88,6 +89,8 @@ pub struct App {
     seeking_preview_ms: u64,
     is_fullscreen_suppressed: bool,
     is_cursor_suppressed: bool,
+    effective_dock_position: DockPosition,
+    last_foreground_process: Option<String>,
     touch_id: Option<u64>,
     touch_pos: PhysicalPosition<f64>,
     hover_to_hide_enter_at: Option<Instant>,
@@ -146,6 +149,8 @@ impl Default for App {
             seeking_preview_ms: 0,
             is_fullscreen_suppressed: false,
             is_cursor_suppressed: false,
+            effective_dock_position: config.dock_position,
+            last_foreground_process: None,
             touch_id: None,
             touch_pos: PhysicalPosition::new(0.0, 0.0),
             hover_to_hide_enter_at: None,
@@ -164,6 +169,56 @@ struct IslandLayout {
 }
 
 impl App {
+    fn update_dock_position_from_process(&mut self, window: &Window) {
+        if self.config.process_dock_rules.is_empty() {
+            if self.effective_dock_position != self.config.dock_position {
+                self.effective_dock_position = self.config.dock_position;
+                self.last_foreground_process = None;
+                self.reposition_window(window);
+            }
+            return;
+        }
+
+        let proc_name = get_foreground_process_name();
+
+        if proc_name == self.last_foreground_process {
+            return;
+        }
+        self.last_foreground_process = proc_name.clone();
+
+        let matched = proc_name.and_then(|ref name| {
+            self.config
+                .process_dock_rules
+                .iter()
+                .find(|rule| {
+                    let process_name = rule.process_name.trim();
+                    !process_name.is_empty() && process_name.eq_ignore_ascii_case(name)
+                })
+                .map(|rule| rule.dock_position)
+        });
+
+        let new_position = matched.unwrap_or(self.config.dock_position);
+
+        if new_position != self.effective_dock_position {
+            self.effective_dock_position = new_position;
+            self.reposition_window(window);
+        }
+    }
+
+    fn reposition_window(&mut self, window: &Window) {
+        if let Some(monitor) = Self::get_target_monitor(window, self.config.monitor_index) {
+            let mon_size = monitor.size();
+            let mon_pos = monitor.position();
+            if mon_size.width > 0 && mon_size.height > 0 {
+                self.last_mon_size = (mon_size.width, mon_size.height);
+                self.last_mon_pos = (mon_pos.x, mon_pos.y);
+                (self.win_x, self.win_y) = self.compute_window_position(mon_pos, mon_size);
+                window.set_outer_position(PhysicalPosition::new(self.win_x, self.win_y));
+                window.request_redraw();
+            }
+        }
+    }
+
     fn set_aumid() {
         let aumid = "EchoMusic.Lyrics.WinIsland";
         let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
@@ -306,9 +361,9 @@ impl App {
         let top_y = mon_pos.y + TOP_OFFSET;
         let bottom_y = mon_pos.y + mon_size.height as i32 - TOP_OFFSET;
 
-        let win_x = if self.config.dock_position.is_left() {
+        let win_x = if self.effective_dock_position.is_left() {
             mon_pos.x - (PADDING / 2.0) as i32 + TOP_OFFSET + self.config.position_x_offset
-        } else if self.config.dock_position.is_right() {
+        } else if self.effective_dock_position.is_right() {
             mon_pos.x + mon_size.width as i32 - self.os_w as i32 + (PADDING / 2.0) as i32
                 - TOP_OFFSET
                 + self.config.position_x_offset
@@ -316,7 +371,7 @@ impl App {
             center_x - (self.os_w as i32) / 2 + self.config.position_x_offset
         };
 
-        let win_y = if self.config.dock_position.is_bottom() {
+        let win_y = if self.effective_dock_position.is_bottom() {
             bottom_y - self.os_h as i32 + (PADDING / 2.0) as i32 + self.config.position_y_offset
         } else {
             top_y - (PADDING / 2.0) as i32 + self.config.position_y_offset
@@ -326,16 +381,16 @@ impl App {
     }
 
     fn compute_island_layout(&self) -> IslandLayout {
-        let dock_bottom = self.config.dock_position.is_bottom();
+        let dock_bottom = self.effective_dock_position.is_bottom();
         let island_y = if dock_bottom {
             self.os_h as f64 - PADDING as f64 / 2.0 - self.spring_h.value as f64
         } else {
             PADDING as f64 / 2.0
         };
 
-        let offset_x = if self.config.dock_position.is_left() {
+        let offset_x = if self.effective_dock_position.is_left() {
             PADDING as f64 / 2.0
-        } else if self.config.dock_position.is_right() {
+        } else if self.effective_dock_position.is_right() {
             (self.os_w as f64 - PADDING as f64 / 2.0 - self.spring_w.value as f64).max(0.0)
         } else {
             (self.os_w as f64 - self.spring_w.value as f64) / 2.0
@@ -690,6 +745,8 @@ impl App {
             let old_font = self.config.custom_font_path.clone();
 
             self.config = current_config;
+            self.last_foreground_process = None;
+            self.effective_dock_position = self.config.dock_position;
             if old_style != self.config.island_style {
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 clear_mica_cache();
@@ -1082,7 +1139,7 @@ impl ApplicationHandler for App {
                                     non_expanded_scale: self.config.non_expanded_scale,
                                     expanded_scale: self.config.expanded_scale,
                                     hide_progress: self.spring_hide.value,
-                                    dock_position: self.config.dock_position,
+                                    dock_position: self.effective_dock_position,
                                 },
                                 media: crate::core::render::MediaParams {
                                     media: &media_info,
@@ -1188,6 +1245,10 @@ impl ApplicationHandler for App {
         if self.frame_count.is_multiple_of(10) {
             self.is_fullscreen_suppressed = is_foreground_fullscreen();
             self.is_cursor_suppressed = is_cursor_hidden();
+        }
+
+        if self.frame_count.is_multiple_of(30) {
+            self.update_dock_position_from_process(&window);
         }
 
         if self.is_fullscreen_suppressed || self.is_cursor_suppressed {
