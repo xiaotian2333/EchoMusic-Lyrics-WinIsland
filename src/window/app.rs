@@ -1090,7 +1090,7 @@ impl ApplicationHandler for App {
                         }
 
                         let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
-                        let mut char_data = if self.config.lyrics_char_highlight {
+                        let mut char_data = if self.config.lyrics_char_highlight && self.config.show_lyrics {
                             media_info.current_character_data(delay_ms)
                         } else {
                             None
