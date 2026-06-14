@@ -103,3 +103,5 @@ tray_hide=隐藏
 tray_settings=设置
 tray_restart=重启
 tray_exit=退出
+action_copy=复制
+action_paste=粘贴

@@ -123,6 +123,8 @@ const TRANSLATION_KEYS: &[&str] = &[
     "tray_settings",
     "tray_restart",
     "tray_exit",
+    "action_copy",
+    "action_paste",
 ];
 
 #[derive(Serialize)]

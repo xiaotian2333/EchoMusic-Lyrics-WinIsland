@@ -103,3 +103,5 @@ tray_hide=Hide
 tray_settings=Settings
 tray_restart=Restart
 tray_exit=Exit
+action_copy=Copy
+action_paste=Paste

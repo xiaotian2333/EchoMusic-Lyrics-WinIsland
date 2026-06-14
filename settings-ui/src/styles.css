@@ -299,6 +299,13 @@ input[type="number"] {
   width: 78px;
   padding: 0 8px;
   text-align: center;
+  -moz-appearance: textfield;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 input[type="text"] {
@@ -549,6 +556,36 @@ input:focus {
 
 .link-button:hover {
   background: var(--accent-soft);
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 9999;
+  display: none;
+  min-width: 120px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(6px);
+}
+
+.context-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 14px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.context-menu button:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .loading {

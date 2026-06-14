@@ -498,6 +498,7 @@ function render() {
   if (!root || !state || !config) {
     return;
   }
+  const scrollPos = document.querySelector(".content")?.scrollTop ?? 0;
   root.innerHTML = `
     <div class="settings-shell">
       <aside class="sidebar">
@@ -523,6 +524,12 @@ function render() {
       </main>
     </div>
   `;
+  requestAnimationFrame(() => {
+    const el = document.querySelector(".content");
+    if (el) {
+      el.scrollTop = scrollPos;
+    }
+  });
 }
 
 function handleClick(event) {
@@ -620,6 +627,111 @@ async function load() {
     root.innerHTML = `<div class="loading error">${h(error)}</div>`;
   }
 }
+
+/* ── 自定义右键菜单 ── */
+
+let contextTarget = null;
+
+function buildContextMenu() {
+  const menu = document.createElement("div");
+  menu.className = "context-menu";
+  menu.dataset.role = "context-menu";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.textContent = tr("action_copy");
+  copyBtn.addEventListener("click", async () => {
+    if (contextTarget && document.body.contains(contextTarget)) {
+      const start = contextTarget.selectionStart;
+      const end = contextTarget.selectionEnd;
+      if (start !== null && end !== null && start !== end) {
+        await navigator.clipboard.writeText(contextTarget.value.slice(start, end));
+      } else {
+        await navigator.clipboard.writeText(contextTarget.value);
+      }
+    }
+    hideContextMenu();
+  });
+
+  const pasteBtn = document.createElement("button");
+  pasteBtn.textContent = tr("action_paste");
+  pasteBtn.addEventListener("click", async () => {
+    if (contextTarget && document.body.contains(contextTarget)) {
+      const text = await navigator.clipboard.readText();
+      const start = contextTarget.selectionStart ?? contextTarget.value.length;
+      const end = contextTarget.selectionEnd ?? contextTarget.value.length;
+      const before = contextTarget.value.slice(0, start);
+      const after = contextTarget.value.slice(end);
+      contextTarget.value = before + text + after;
+      const pos = start + text.length;
+      contextTarget.setSelectionRange(pos, pos);
+      contextTarget.dispatchEvent(new Event("change", { bubbles: true }));
+      contextTarget.focus();
+    }
+    hideContextMenu();
+  });
+
+  menu.appendChild(copyBtn);
+  menu.appendChild(pasteBtn);
+  return menu;
+}
+
+function showContextMenu(x, y, el) {
+  hideContextMenu();
+  contextTarget = el;
+  const menu = document.querySelector(".context-menu");
+  if (!menu) return;
+  const btns = menu.querySelectorAll("button");
+  if (btns.length >= 2) {
+    btns[0].textContent = tr("action_copy");
+    btns[1].textContent = tr("action_paste");
+  }
+  menu.style.display = "block";
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+}
+
+function hideContextMenu() {
+  contextTarget = null;
+  const menu = document.querySelector(".context-menu");
+  if (menu) {
+    menu.style.display = "none";
+  }
+}
+
+/* ── 全局拦截 ── */
+
+document.body.appendChild(buildContextMenu());
+
+document.addEventListener("contextmenu", (e) => {
+  const target = e.target;
+  const isInput = target.tagName === "INPUT" || target.tagName === "TEXTAREA";
+  if (isInput && document.body.contains(root)) {
+    e.preventDefault();
+    showContextMenu(e.clientX, e.clientY, target);
+  } else if (!isInput) {
+    e.preventDefault();
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".context-menu")) {
+    hideContextMenu();
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    hideContextMenu();
+    return;
+  }
+  if (
+    e.key === "F12" ||
+    (e.ctrlKey && e.shiftKey && ["I", "J", "C"].includes(e.key)) ||
+    (e.ctrlKey && e.key === "U")
+  ) {
+    e.preventDefault();
+  }
+});
 
 root?.addEventListener("click", handleClick);
 root?.addEventListener("change", handleChange);
