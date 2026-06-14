@@ -68,6 +68,19 @@ jobs:
         "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         "cargo_version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+        cache-dependency-path: settings-ui/package-lock.json
+
+    - name: Build frontend
+      run: |
+        cd settings-ui
+        npm install
+        npm run build
+
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
       with:
