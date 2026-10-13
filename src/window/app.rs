@@ -27,7 +27,9 @@ use crate::core::lyrics::{
 use crate::core::lyrics_ws::normalize_volume_value;
 use crate::core::media_info::MediaInfo;
 use crate::core::persistence::load_config;
-use crate::core::render::{draw_island, get_mini_control_rects, get_mini_visualizer_hit_rect};
+use crate::core::render::{
+    draw_island, draw_island_canvas, get_mini_control_rects, get_mini_visualizer_hit_rect,
+};
 use crate::core::ws_media::WsMediaListener;
 use crate::ui::expanded::music_view::{
     get_expanded_visualizer_hit_rect, get_favorite_btn_rect, get_music_info_rect,
@@ -50,6 +52,8 @@ use crate::utils::process::get_foreground_process_name;
 use crate::window::tray::{TrayAction, TrayManager};
 
 const MINI_LYRIC_LOOP_GAP: f32 = 48.0;
+/// GPU 渲染管线初始化失败后的重试间隔。
+const GPU_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const VOLUME_WHEEL_SLOW_STEP: f32 = 2.0;
 const VOLUME_WHEEL_MEDIUM_STEP: f32 = 4.0;
 const VOLUME_WHEEL_FAST_STEP: f32 = 8.0;
@@ -113,6 +117,9 @@ pub struct App {
     hover_to_hide_enter_at: Option<Instant>,
     last_volume_wheel_at: Option<Instant>,
     pending_volume: Option<f32>,
+    gpu_island: Option<crate::gpu::GpuIsland>,
+    gpu_retry_at: Option<Instant>,
+    hwnd_raw: Option<isize>,
 }
 
 impl Default for App {
@@ -176,6 +183,9 @@ impl Default for App {
             hover_to_hide_enter_at: None,
             last_volume_wheel_at: None,
             pending_volume: None,
+            gpu_island: None,
+            gpu_retry_at: None,
+            hwnd_raw: None,
         }
     }
 }
@@ -1031,6 +1041,57 @@ impl App {
         }
     }
 
+    /// 按当前样式维护 GPU 渲染管线：liquid_glass 时惰性创建，其他样式释放。
+    fn ensure_gpu_island(&mut self) {
+        if self.config.island_style != "liquid_glass" {
+            if self.gpu_island.is_some() {
+                // Drop 会分离 DirectComposition 视觉树并关闭捕获会话
+                self.gpu_island = None;
+            }
+            return;
+        }
+        if self.gpu_island.is_some() {
+            return;
+        }
+        if let Some(retry_at) = self.gpu_retry_at
+            && retry_at.elapsed() < GPU_RETRY_INTERVAL
+        {
+            return;
+        }
+        let Some(hwnd_raw) = self.hwnd_raw else {
+            return;
+        };
+        if self.os_w == 0 || self.os_h == 0 {
+            return;
+        }
+        match crate::gpu::GpuIsland::new(hwnd_raw, self.os_w, self.os_h) {
+            Ok(gpu) => {
+                self.gpu_island = Some(gpu);
+                self.gpu_retry_at = None;
+                // GPU 模式由合成视觉树呈现；清空软缓冲，避免旧 CPU 画面从透明区域透出
+                if let Some(surface) = self.surface.as_mut()
+                    && let Ok(mut buffer) = surface.buffer_mut()
+                {
+                    for p in buffer.iter_mut() {
+                        *p = 0;
+                    }
+                    let _ = buffer.present();
+                }
+            }
+            Err(error) => {
+                log::warn!("GPU 渲染管线初始化失败，使用 CPU 液态玻璃路径: {error}");
+                self.gpu_retry_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// GPU 渲染失败时释放管线并进入冷却，下一帧回退到 CPU 路径。
+    fn fail_gpu_island(&mut self, error: &str) {
+        log::warn!("GPU 渲染失败，回退到 CPU 液态玻璃路径: {error}");
+        self.gpu_island = None;
+        self.gpu_retry_at = Some(Instant::now());
+    }
+
     fn reload_config_if_changed(&mut self, window: &Window) {
         if !self.frame_count.is_multiple_of(30) {
             return;
@@ -1071,6 +1132,10 @@ impl App {
                         }
                     }
                 }
+                // 样式切换时释放 GPU 管线（Drop 会分离合成视觉树并关闭捕获会话）；
+                // 进入液态玻璃时清除冷却，下一帧立即尝试重建
+                self.gpu_island = None;
+                self.gpu_retry_at = None;
             }
 
             if old_mini_shape != self.config.mini_cover_shape
@@ -1106,6 +1171,11 @@ impl App {
                         std::num::NonZeroU32::new(self.os_w.max(1)).unwrap(),
                         std::num::NonZeroU32::new(self.os_h.max(1)).unwrap(),
                     );
+                }
+                let (gpu_w, gpu_h) = (self.os_w, self.os_h);
+                let gpu_resize = self.gpu_island.as_mut().map(|gpu| gpu.resize(gpu_w, gpu_h));
+                if let Some(Err(error)) = gpu_resize {
+                    self.fail_gpu_island(&error);
                 }
             }
 
@@ -1252,6 +1322,14 @@ impl App {
 }
 
 impl ApplicationHandler for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // 捕获回调或权限回调唤醒主线程重绘
+        crate::gpu::take_wake_pending();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
         if self.window.is_none() {
@@ -1275,6 +1353,7 @@ impl ApplicationHandler for App {
             if let Ok(handle) = window.window_handle()
                 && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
             {
+                self.hwnd_raw = Some(win32_handle.hwnd.get());
                 let hwnd = HWND(win32_handle.hwnd.get() as _);
                 crate::utils::win32::modify_window_ex_style(
                     hwnd,
@@ -1396,7 +1475,8 @@ impl ApplicationHandler for App {
                     }
                     let is_hidden = self.is_hidden();
                     let progress = self.expansion_progress();
-                    if let Some(surface) = self.surface.as_mut() {
+                    self.ensure_gpu_island();
+                    if self.surface.is_some() {
                         let dt =
                             (self.last_frame_time.elapsed().as_secs_f32() * 60.0).clamp(0.1, 3.0);
                         let sigmas = if self.config.motion_blur {
@@ -1482,74 +1562,104 @@ impl ApplicationHandler for App {
                         let lyric_scroll_loop_gap =
                             MINI_LYRIC_LOOP_GAP * self.config.non_expanded_scale;
 
-                        let widget_animating = draw_island(
-                            surface,
-                            crate::core::render::DrawIslandParams {
-                                layout: crate::core::render::LayoutParams {
-                                    current_w: self.spring_w.value,
-                                    current_h: self.spring_h.value,
-                                    current_r: self.spring_r.value,
-                                    os_w: self.os_w,
-                                    os_h: self.os_h,
-                                    sigmas,
-                                    expansion_progress: progress,
-                                    view_offset: self.spring_view.value,
-                                    non_expanded_scale: self.config.non_expanded_scale,
-                                    expanded_scale: self.config.expanded_scale,
-                                    hide_progress: self.spring_hide.value,
-                                    dock_position: self.effective_dock_position,
-                                },
-                                media: crate::core::render::MediaParams {
-                                    media: &media_info,
-                                    music_active,
-                                },
-                                lyrics: crate::core::render::LyricsParams {
-                                    current_lyric: &self.current_lyric_text,
-                                    old_lyric: &self.old_lyric_text,
-                                    lyric_transition: self.lyric_transition,
-                                    lyric_scroll_active: self.lyric_scroll_active,
-                                    lyric_scroll_offset: self.lyric_scroll_offset,
-                                    lyric_scroll_loop: self.config.lyrics_scroll
-                                        && self.config.lyrics_scroll_infinite_loop
-                                        && !lyric_line_has_characters
-                                        && self.lyric_scroll_active,
-                                    lyric_scroll_loop_gap,
-                                    current_characters,
-                                    current_char_idx,
-                                    current_char_progress,
-                                    char_color_unplayed,
-                                    char_color_played,
-                                    char_highlight: self.config.lyrics_char_highlight,
-                                    char_lift_animation: self.config.lyrics_char_lift_animation,
-                                },
-                                window: crate::core::render::WindowParams {
-                                    win_x: self.win_x,
-                                    win_y: self.win_y,
-                                    monitor_x: self.last_mon_pos.0,
-                                    monitor_y: self.last_mon_pos.1,
-                                    monitor_w: self.last_mon_size.0,
-                                    monitor_h: self.last_mon_size.1,
-                                },
-                                style: crate::core::render::StyleParams {
-                                    island_style: &self.config.island_style,
-                                    use_blur: self.config.motion_blur,
-                                    font_size: self.config.font_size,
-                                    mini_cover_shape: &self.config.mini_cover_shape,
-                                    expanded_cover_shape: &self.config.expanded_cover_shape,
-                                    cover_rotate: self.config.cover_rotate,
-                                    mini_controls: self.config.mini_controls,
-                                    lyrics_delay: self.config.lyrics_delay,
-                                    lyrics_filter_scope: self.config.lyrics_filter_scope,
-                                    lyrics_filter_regex: self.lyrics_filter_regex_cache.as_ref(),
-                                    dt,
-                                    liquid_glass_blur: self.config.liquid_glass_blur,
-                                    liquid_glass_refraction: self.config.liquid_glass_refraction,
-                                    liquid_glass_dispersion: self.config.liquid_glass_dispersion,
-                                    liquid_glass_tint: self.config.liquid_glass_tint,
-                                    liquid_glass_siri: self.config.liquid_glass_siri,
-                                },
+                        let params = crate::core::render::DrawIslandParams {
+                            layout: crate::core::render::LayoutParams {
+                                current_w: self.spring_w.value,
+                                current_h: self.spring_h.value,
+                                current_r: self.spring_r.value,
+                                os_w: self.os_w,
+                                os_h: self.os_h,
+                                sigmas,
+                                expansion_progress: progress,
+                                view_offset: self.spring_view.value,
+                                non_expanded_scale: self.config.non_expanded_scale,
+                                expanded_scale: self.config.expanded_scale,
+                                hide_progress: self.spring_hide.value,
+                                dock_position: self.effective_dock_position,
                             },
-                        );
+                            media: crate::core::render::MediaParams {
+                                media: &media_info,
+                                music_active,
+                            },
+                            lyrics: crate::core::render::LyricsParams {
+                                current_lyric: &self.current_lyric_text,
+                                old_lyric: &self.old_lyric_text,
+                                lyric_transition: self.lyric_transition,
+                                lyric_scroll_active: self.lyric_scroll_active,
+                                lyric_scroll_offset: self.lyric_scroll_offset,
+                                lyric_scroll_loop: self.config.lyrics_scroll
+                                    && self.config.lyrics_scroll_infinite_loop
+                                    && !lyric_line_has_characters
+                                    && self.lyric_scroll_active,
+                                lyric_scroll_loop_gap,
+                                current_characters,
+                                current_char_idx,
+                                current_char_progress,
+                                char_color_unplayed,
+                                char_color_played,
+                                char_highlight: self.config.lyrics_char_highlight,
+                                char_lift_animation: self.config.lyrics_char_lift_animation,
+                            },
+                            window: crate::core::render::WindowParams {
+                                win_x: self.win_x,
+                                win_y: self.win_y,
+                                monitor_x: self.last_mon_pos.0,
+                                monitor_y: self.last_mon_pos.1,
+                                monitor_w: self.last_mon_size.0,
+                                monitor_h: self.last_mon_size.1,
+                            },
+                            style: crate::core::render::StyleParams {
+                                island_style: &self.config.island_style,
+                                use_blur: self.config.motion_blur,
+                                font_size: self.config.font_size,
+                                mini_cover_shape: &self.config.mini_cover_shape,
+                                expanded_cover_shape: &self.config.expanded_cover_shape,
+                                cover_rotate: self.config.cover_rotate,
+                                mini_controls: self.config.mini_controls,
+                                lyrics_delay: self.config.lyrics_delay,
+                                lyrics_filter_scope: self.config.lyrics_filter_scope,
+                                lyrics_filter_regex: self.lyrics_filter_regex_cache.as_ref(),
+                                dt,
+                                liquid_glass_blur: self.config.liquid_glass_blur,
+                                liquid_glass_refraction: self.config.liquid_glass_refraction,
+                                liquid_glass_dispersion: self.config.liquid_glass_dispersion,
+                                liquid_glass_tint: self.config.liquid_glass_tint,
+                                liquid_glass_siri: self.config.liquid_glass_siri,
+                            },
+                        };
+                        let mut gpu_error: Option<String> = None;
+                        let widget_animating = if let Some(gpu) = self.gpu_island.as_mut() {
+                            let liquid_scale = self.config.non_expanded_scale
+                                + (self.config.expanded_scale - self.config.non_expanded_scale)
+                                    * progress;
+                            let frost_sigma = self.config.liquid_glass_blur * liquid_scale;
+                            let animating =
+                                music_active || sigmas.0.abs() > 0.01 || sigmas.1.abs() > 0.01;
+                            let render_result = gpu.render(
+                                (self.win_x, self.win_y),
+                                (self.os_w, self.os_h),
+                                frost_sigma,
+                                animating,
+                                |canvas, backdrop| draw_island_canvas(canvas, params, backdrop),
+                            );
+                            match render_result {
+                                Ok(animating) => animating,
+                                Err(error) => {
+                                    gpu_error = Some(error);
+                                    false
+                                }
+                            }
+                        } else if let Some(surface) = self.surface.as_mut() {
+                            draw_island(surface, params)
+                        } else {
+                            false
+                        };
+                        if let Some(error) = gpu_error {
+                            self.fail_gpu_island(&error);
+                            if let Some(win) = &self.window {
+                                win.request_redraw();
+                            }
+                        }
                         if widget_animating && let Some(win) = &self.window {
                             win.request_redraw();
                         }

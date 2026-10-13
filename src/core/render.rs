@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
-    ClipOp, Color, FilterMode, ISize, MipmapMode, Paint, RRect, Rect, SamplingOptions,
+    Canvas, ClipOp, Color, FilterMode, ISize, MipmapMode, Paint, RRect, Rect, SamplingOptions,
     Surface as SkSurface, image_filters, surfaces,
 };
 use softbuffer::Surface;
@@ -23,7 +23,10 @@ use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mic
 use crate::utils::color::{color_with_alpha, lyric_boundary_gradient_shader};
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
-use crate::utils::liquid_glass::{LiquidGlassParams, get_liquid_glass_background};
+use crate::utils::liquid_glass::{
+    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams,
+    draw_liquid_glass_with_backdrop, get_liquid_glass_background,
+};
 
 thread_local! {
     static SK_SURFACE: RefCell<Option<SkSurface>> = const { RefCell::new(None) };
@@ -268,9 +271,52 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
     }
 }
 
+/// CPU 光栅路径：把整帧绘制到软缓冲表面并呈现。
 pub fn draw_island(
     surface: &mut Surface<Arc<Window>, Arc<Window>>,
     params: DrawIslandParams<'_>,
+) -> bool {
+    let mut buffer = surface.buffer_mut().unwrap();
+    let (os_w, os_h) = (params.layout.os_w, params.layout.os_h);
+    let mut sk_surface = SK_SURFACE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if let Some(ref s) = *opt
+            && s.width() == os_w as i32
+            && s.height() == os_h as i32
+        {
+            return s.clone();
+        }
+        let new_surface =
+            surfaces::raster_n32_premul(ISize::new(os_w as i32, os_h as i32)).unwrap();
+        *opt = Some(new_surface.clone());
+        new_surface
+    });
+    let widget_animating = draw_island_canvas(sk_surface.canvas(), params, None);
+
+    let info = skia_safe::ImageInfo::new(
+        skia_safe::ISize::new(os_w as i32, os_h as i32),
+        skia_safe::ColorType::BGRA8888,
+        skia_safe::AlphaType::Premul,
+        None,
+    );
+    let dst_row_bytes = (os_w * 4) as usize;
+    let u8_buffer: &mut [u8] = bytemuck::cast_slice_mut(&mut buffer);
+    let _ = sk_surface.read_pixels(&info, u8_buffer, dst_row_bytes, (0, 0));
+    if let Err(e) = buffer.present() {
+        log::error!("Present failed: {:?}", e);
+    }
+
+    widget_animating
+}
+
+/// 在任意 Skia 画布上绘制整帧（CPU 光栅路径与 GPU 合成交换链共用）。
+///
+/// `gpu_backdrop` 为 WinIsland 风格 GPU 渲染管线提供的屏幕背板；
+/// 为 None 时液态玻璃分支回退到 CPU 截屏实现。
+pub fn draw_island_canvas(
+    canvas: &Canvas,
+    params: DrawIslandParams<'_>,
+    gpu_backdrop: Option<&LiquidBackdrop>,
 ) -> bool {
     let DrawIslandParams {
         layout,
@@ -340,21 +386,6 @@ pub fn draw_island(
         liquid_glass_tint,
         liquid_glass_siri,
     } = style;
-    let mut buffer = surface.buffer_mut().unwrap();
-    let mut sk_surface = SK_SURFACE.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if let Some(ref s) = *opt
-            && s.width() == os_w as i32
-            && s.height() == os_h as i32
-        {
-            return s.clone();
-        }
-        let new_surface =
-            surfaces::raster_n32_premul(ISize::new(os_w as i32, os_h as i32)).unwrap();
-        *opt = Some(new_surface.clone());
-        new_surface
-    });
-    let canvas = sk_surface.canvas();
     canvas.clear(Color::TRANSPARENT);
 
     let dock_bottom = dock_position.is_bottom();
@@ -431,40 +462,67 @@ pub fn draw_island(
     if island_style == "liquid_glass" {
         let liquid_scale =
             non_expanded_scale + (expanded_scale - non_expanded_scale) * expansion_progress;
-        let glass_frame = get_liquid_glass_background(&LiquidGlassParams {
-            win_x,
-            win_y,
-            os_w,
-            os_h,
+        let draw_params = LiquidGlassDrawParams {
             offset_x,
             offset_y,
             width: current_w,
             height: current_h,
             corner_radius: current_r,
             scale: liquid_scale,
-            blur: liquid_glass_blur,
             refraction: liquid_glass_refraction / 100.0,
             dispersion: liquid_glass_dispersion / 100.0,
             tint: liquid_glass_tint / 100.0,
             siri: liquid_glass_siri,
-            monitor_x,
-            monitor_y,
-            monitor_w,
-            monitor_h,
-        });
-
-        if let Some(frame) = glass_frame {
-            let mut paint = Paint::default();
-            paint.set_anti_alias(true);
-            let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-            let dst = Rect::from_xywh(
-                offset_x - frame.margin,
-                offset_y - frame.margin,
-                frame.image.width() as f32,
-                frame.image.height() as f32,
-            );
-            canvas.draw_image_rect_with_sampling_options(&frame.image, None, dst, sampling, &paint);
+        };
+        // GPU 路径使用 WinIsland 原版渲染管线提供的背板；否则回退到 CPU 截屏实现
+        let drawn = if let Some(backdrop) = gpu_backdrop {
+            draw_liquid_glass_with_backdrop(canvas, backdrop, &draw_params)
         } else {
+            match get_liquid_glass_background(&LiquidGlassParams {
+                win_x,
+                win_y,
+                os_w,
+                os_h,
+                offset_x,
+                offset_y,
+                width: current_w,
+                height: current_h,
+                corner_radius: current_r,
+                scale: liquid_scale,
+                blur: liquid_glass_blur,
+                refraction: liquid_glass_refraction / 100.0,
+                dispersion: liquid_glass_dispersion / 100.0,
+                tint: liquid_glass_tint / 100.0,
+                siri: liquid_glass_siri,
+                monitor_x,
+                monitor_y,
+                monitor_w,
+                monitor_h,
+            }) {
+                Some(frame) => {
+                    let mut paint = Paint::default();
+                    paint.set_anti_alias(true);
+                    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+                    let dst = Rect::from_xywh(
+                        offset_x - frame.margin,
+                        offset_y - frame.margin,
+                        frame.image.width() as f32,
+                        frame.image.height() as f32,
+                    );
+                    canvas.draw_image_rect_with_sampling_options(
+                        &frame.image,
+                        None,
+                        dst,
+                        sampling,
+                        &paint,
+                    );
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if !drawn {
             let mut bg_paint = Paint::default();
             bg_paint.set_color(Color::from_argb(180, 32, 32, 36));
             bg_paint.set_anti_alias(true);
@@ -1039,19 +1097,6 @@ pub fn draw_island(
             current_r,
         );
         canvas.draw_rrect(border_rrect, &border_paint);
-    }
-
-    let info = skia_safe::ImageInfo::new(
-        skia_safe::ISize::new(os_w as i32, os_h as i32),
-        skia_safe::ColorType::BGRA8888,
-        skia_safe::AlphaType::Premul,
-        None,
-    );
-    let dst_row_bytes = (os_w * 4) as usize;
-    let u8_buffer: &mut [u8] = bytemuck::cast_slice_mut(&mut buffer);
-    let _ = sk_surface.read_pixels(&info, u8_buffer, dst_row_bytes, (0, 0));
-    if let Err(e) = buffer.present() {
-        log::error!("Present failed: {:?}", e);
     }
 
     widget_animating

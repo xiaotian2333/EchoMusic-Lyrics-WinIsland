@@ -49,6 +49,12 @@ src/
 │   ├── scroll.rs      Scroll container helpers
 │   ├── updater.rs     Nightly release check + download
 │   └── win32.rs       Raw Win32 API wrappers (topmost, window styles, etc.)
+├── gpu/               WinIsland-style GPU pipeline (D3D12 + DirectComposition + WGC)
+│   ├── mod.rs         GpuIsland orchestration, wake proxy, shared types
+│   ├── device.rs      D3D12 device + Skia Ganesh D3D12 context
+│   ├── target.rs      Composition swap chain render target
+│   ├── backdrop.rs    Shared texture + GPU frost pipeline
+│   └── capture.rs     Windows.Graphics.Capture screen capture
 └── window/
     ├── app.rs         Main App struct — event loop, state, input, orchestration
     ├── tray.rs        System tray icon + context menu
@@ -86,12 +92,13 @@ RedrawRequested → draw_island():
   7. Draw spectrum visualizer bars
   8. Draw progress bar
   9. Draw mini controls (play/pause/prev/next)
-  10. Read Skia surface pixels → softbuffer → present
+  10. Read Skia surface pixels → softbuffer → present (liquid_glass with an active
+     GPU pipeline draws on the DirectComposition swap chain instead, bypassing softbuffer)
 ```
 
 Each style draws its background differently:
 - **glass**: GDI screen capture → heavy blur → dark multiply blend
-- **liquid_glass**: GDI screen capture → frost blur (downscale + separable gaussian) → liquid.sksl refraction shader
+- **liquid_glass**: GPU path (WinIsland original) — D3D12 + DirectComposition swap chain, Windows.Graphics.Capture backdrop via shared texture/fences, GPU frost + liquid.sksl refraction; falls back to CPU path (GDI capture → frost → liquid.sksl) when GPU or capture is unavailable
 - **mica**: GDI screen capture (downscaled) → blur → dark overlay
 - **dynamic**: Solid color extracted from album art palette
 - **default**: Solid black

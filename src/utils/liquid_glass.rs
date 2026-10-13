@@ -154,12 +154,13 @@ struct LiquidShape {
 }
 
 /// 模糊后的屏幕背板。
-struct Backdrop {
-    image: Image,
+pub(crate) struct Backdrop {
+    /// 背板图像（模糊后或原始屏幕内容）。
+    pub(crate) image: Image,
     /// 背板相对窗口的分辨率比例；1.0 表示未模糊。
-    blur_scale: f32,
+    pub(crate) blur_scale: f32,
     /// 背板左上角在画布坐标中的位置（窗口部分离屏时非零）。
-    origin: (f32, f32),
+    pub(crate) origin: (f32, f32),
 }
 
 /// 背板截图缓存键：窗口与显示器矩形。
@@ -636,6 +637,50 @@ pub struct LiquidGlassParams {
     pub monitor_y: i32,
     pub monitor_w: u32,
     pub monitor_h: u32,
+}
+
+/// 液态玻璃绘制参数（GPU 路径使用外部背板时提供）。
+pub(crate) struct LiquidGlassDrawParams {
+    /// 岛屿在画布中的位置与尺寸。
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub corner_radius: f32,
+    /// 当前视觉缩放。
+    pub scale: f32,
+    /// 折射强度（配置值 / 100）。
+    pub refraction: f32,
+    /// 色散强度（配置值 / 100）。
+    pub dispersion: f32,
+    /// 暗色遮罩强度（配置值 / 100）。
+    pub tint: f32,
+    /// Siri 样式：黑色到玻璃的渐变。
+    pub siri: bool,
+}
+
+/// 用外部背板（如 GPU frost 结果）直接绘制液态玻璃，返回是否成功。
+pub(crate) fn draw_liquid_glass_with_backdrop(
+    canvas: &Canvas,
+    backdrop: &Backdrop,
+    params: &LiquidGlassDrawParams,
+) -> bool {
+    let mut material = LiquidMaterial::island(params.scale)
+        .with_optics(params.refraction, params.dispersion)
+        .with_tint(params.tint);
+    if params.siri {
+        material.black_fade = 1.0;
+    }
+    let shape = LiquidShape {
+        rect: Rect::from_xywh(
+            params.offset_x,
+            params.offset_y,
+            params.width,
+            params.height,
+        ),
+        radius: params.corner_radius,
+    };
+    draw_liquid_glass(canvas, backdrop, &shape, &material, 1.0, 1.0)
 }
 
 /// 最终帧：带 margin 的玻璃图像与绘制偏移。

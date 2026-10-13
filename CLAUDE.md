@@ -106,6 +106,12 @@ cargo build --release --verbose --target x86_64-pc-windows-msvc
 - `src/core/audio.rs` 启动输出设备捕获和音频峰值门控线程，生成 `[f32; 6]` 频谱供渲染频谱条使用。
 - `src/core/render.rs` 是主岛绘制入口，接收布局、媒体、歌词、窗口和样式参数，使用 thread-local Skia surface 绘制背景、封面、歌词、频谱、进度条和迷你控制，然后提交到 `softbuffer`。
 
+### GPU 渲染模块（WinIsland 原版管线）
+
+- `src/gpu/` 在 `island_style == "liquid_glass"` 时启用：`device.rs`（D3D12 + Skia Ganesh D3D12 上下文）、`target.rs`（DirectComposition 合成交换链）、`backdrop.rs`（共享纹理 + GPU frost 模糊）、`capture.rs`（Windows.Graphics.Capture 捕获）、`mod.rs`（`GpuIsland` 编排与事件循环唤醒代理）。
+- GPU 初始化或渲染失败时自动回退到 `src/utils/liquid_glass.rs` 的 CPU 路径（GDI 截屏 + CPU frost），10 秒后重试；其余样式始终走 softbuffer CPU 路径。
+- 该模块使用重命名依赖 `windows62`（windows 0.62），其余代码保持 windows 0.58，互不影响。
+
 ### UI、窗口和工具模块
 
 - `src/ui/expanded/music_view.rs` 绘制展开态音乐页，包含封面、标题/歌手滚动、进度条、播放控制、频谱、封面翻转/旋转等缓存和动画状态；也提供按钮/进度条 hit rect。
