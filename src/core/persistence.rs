@@ -29,6 +29,10 @@ pub fn load_config() -> AppConfig {
     config.base_height = config.base_height.max(15.0);
     config.expanded_width = config.expanded_width.max(200.0);
     config.expanded_height = config.expanded_height.max(100.0);
+    config.liquid_glass_blur = config.liquid_glass_blur.clamp(0.0, 30.0);
+    config.liquid_glass_refraction = config.liquid_glass_refraction.clamp(0.0, 400.0);
+    config.liquid_glass_dispersion = config.liquid_glass_dispersion.clamp(0.0, 100.0);
+    config.liquid_glass_tint = config.liquid_glass_tint.clamp(0.0, 200.0);
     config.lyrics_scroll_max_width = config.lyrics_scroll_max_width.max(config.base_width + 35.0);
     if !config.spectrum_wheel_volume {
         config.non_expanded_wheel_volume = false;

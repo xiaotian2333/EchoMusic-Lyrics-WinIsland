@@ -1542,6 +1542,11 @@ impl ApplicationHandler for App {
                                     lyrics_filter_scope: self.config.lyrics_filter_scope,
                                     lyrics_filter_regex: self.lyrics_filter_regex_cache.as_ref(),
                                     dt,
+                                    liquid_glass_blur: self.config.liquid_glass_blur,
+                                    liquid_glass_refraction: self.config.liquid_glass_refraction,
+                                    liquid_glass_dispersion: self.config.liquid_glass_dispersion,
+                                    liquid_glass_tint: self.config.liquid_glass_tint,
+                                    liquid_glass_siri: self.config.liquid_glass_siri,
                                 },
                             },
                         );

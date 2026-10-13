@@ -30,6 +30,10 @@ const numberSpecs = {
   update_check_interval: { min: 1, max: 24, step: 1, precision: 0 },
   lyrics_delay: { min: -10, max: 10, step: 0.1, precision: 1 },
   lyrics_scroll_max_width: { min: 100, max: 500, step: 10, precision: 0 },
+  liquid_glass_blur: { min: 0, max: 30, step: 1, precision: 0 },
+  liquid_glass_refraction: { min: 0, max: 400, step: 10, precision: 0 },
+  liquid_glass_dispersion: { min: 0, max: 100, step: 5, precision: 0 },
+  liquid_glass_tint: { min: 0, max: 200, step: 10, precision: 0 },
 };
 
 function numberSpec(field) {
@@ -354,6 +358,20 @@ function generalAppearance() {
   ].join("");
 }
 
+function liquidGlassRows() {
+  if (config.island_style !== "liquid_glass") {
+    return [];
+  }
+  return [
+    numberRow(tr("liquid_glass_blur"), "liquid_glass_blur"),
+    numberRow(tr("liquid_glass_refraction"), "liquid_glass_refraction"),
+    numberRow(tr("liquid_glass_dispersion"), "liquid_glass_dispersion"),
+    numberRow(tr("liquid_glass_tint"), "liquid_glass_tint"),
+    switchRow(tr("liquid_glass_siri"), "liquid_glass_siri"),
+    infoRow(tr("liquid_glass_siri_note")),
+  ];
+}
+
 function generalEffects() {
   return [
     section(tr("section_effects"), [
@@ -383,6 +401,7 @@ function generalEffects() {
         { value: "dynamic", label: tr("style_dynamic") },
         { value: "liquid_glass", label: tr("style_liquid_glass") },
       ]),
+      ...liquidGlassRows(),
       fontPicker(),
     ]),
   ].join("");

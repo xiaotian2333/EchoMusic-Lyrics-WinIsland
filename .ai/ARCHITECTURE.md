@@ -42,7 +42,7 @@ src/
 │   ├── font.rs        Font manager with caching
 │   ├── glass.rs       Frosted glass effect (GDI capture + blur + dark overlay)
 │   ├── icon.rs        Helper for loading/rendering icon bitmaps
-│   ├── liquid_glass.rs Advanced refractive liquid glass effect (SKSL shader)
+│   ├── liquid_glass.rs Refractive liquid glass (WinIsland liquid.sksl + frost blur)
 │   ├── mouse.rs       Global cursor position, hit-test, fullscreen detection
 │   ├── physics.rs     Spring physics for smooth animations
 │   ├── process.rs     Process discovery & external app detection
@@ -91,7 +91,7 @@ RedrawRequested → draw_island():
 
 Each style draws its background differently:
 - **glass**: GDI screen capture → heavy blur → dark multiply blend
-- **liquid_glass**: GDI screen capture → moderate blur → SKSL shader (refraction + specular)
+- **liquid_glass**: GDI screen capture → frost blur (downscale + separable gaussian) → liquid.sksl refraction shader
 - **mica**: GDI screen capture (downscaled) → blur → dark overlay
 - **dynamic**: Solid color extracted from album art palette
 - **default**: Solid black

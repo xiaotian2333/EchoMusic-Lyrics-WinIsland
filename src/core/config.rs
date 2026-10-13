@@ -152,6 +152,16 @@ pub struct AppConfig {
     pub motion_blur: bool,
     #[serde(default = "default_island_style")]
     pub island_style: String,
+    #[serde(default = "default_liquid_glass_blur")]
+    pub liquid_glass_blur: f32,
+    #[serde(default = "default_liquid_glass_refraction")]
+    pub liquid_glass_refraction: f32,
+    #[serde(default = "default_liquid_glass_dispersion")]
+    pub liquid_glass_dispersion: f32,
+    #[serde(default = "default_liquid_glass_tint")]
+    pub liquid_glass_tint: f32,
+    #[serde(default = "default_liquid_glass_siri")]
+    pub liquid_glass_siri: bool,
     #[serde(default = "default_show_lyrics")]
     pub show_lyrics: bool,
     #[serde(default = "default_custom_font")]
@@ -226,6 +236,26 @@ pub struct AppConfig {
 
 fn default_island_style() -> String {
     "default".to_string()
+}
+
+fn default_liquid_glass_blur() -> f32 {
+    6.0
+}
+
+fn default_liquid_glass_refraction() -> f32 {
+    200.0
+}
+
+fn default_liquid_glass_dispersion() -> f32 {
+    40.0
+}
+
+fn default_liquid_glass_tint() -> f32 {
+    100.0
+}
+
+fn default_liquid_glass_siri() -> bool {
+    false
 }
 
 fn default_show_lyrics() -> bool {
@@ -388,6 +418,11 @@ impl Default for AppConfig {
             expanded_height: 200.0,
             motion_blur: true,
             island_style: "default".to_string(),
+            liquid_glass_blur: 6.0,
+            liquid_glass_refraction: 200.0,
+            liquid_glass_dispersion: 40.0,
+            liquid_glass_tint: 100.0,
+            liquid_glass_siri: false,
             show_lyrics: true,
             custom_font_path: None,
             auto_start: false,

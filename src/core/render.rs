@@ -23,7 +23,7 @@ use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mic
 use crate::utils::color::{color_with_alpha, lyric_boundary_gradient_shader};
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
-use crate::utils::liquid_glass::get_liquid_glass_background;
+use crate::utils::liquid_glass::{LiquidGlassParams, get_liquid_glass_background};
 
 thread_local! {
     static SK_SURFACE: RefCell<Option<SkSurface>> = const { RefCell::new(None) };
@@ -91,6 +91,11 @@ pub struct StyleParams<'a> {
     pub lyrics_filter_scope: LyricsFilterScope,
     pub lyrics_filter_regex: Option<&'a regex::Regex>,
     pub dt: f32,
+    pub liquid_glass_blur: f32,
+    pub liquid_glass_refraction: f32,
+    pub liquid_glass_dispersion: f32,
+    pub liquid_glass_tint: f32,
+    pub liquid_glass_siri: bool,
 }
 
 pub fn get_mini_visualizer_hit_rect(
@@ -329,6 +334,11 @@ pub fn draw_island(
         lyrics_filter_scope,
         lyrics_filter_regex,
         dt,
+        liquid_glass_blur,
+        liquid_glass_refraction,
+        liquid_glass_dispersion,
+        liquid_glass_tint,
+        liquid_glass_siri,
     } = style;
     let mut buffer = surface.buffer_mut().unwrap();
     let mut sk_surface = SK_SURFACE.with(|cell| {
@@ -419,46 +429,50 @@ pub fn draw_island(
     };
 
     if island_style == "liquid_glass" {
-        let screen_x = win_x + offset_x as i32;
-        let screen_y = win_y + offset_y as i32;
-
-        let mut shadow_paint = Paint::default();
-        shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(Color::from_argb(50, 0, 0, 0));
-        if let Some(filter) = image_filters::blur((5.0, 5.0), None, None, None) {
-            shadow_paint.set_image_filter(filter);
-        }
-        let shadow_rrect = RRect::new_rect_xy(
-            Rect::from_xywh(offset_x, offset_y + 2.0, current_w, current_h),
-            current_r,
-            current_r,
-        );
-        canvas.draw_rrect(shadow_rrect, &shadow_paint);
-
-        canvas.save();
-        canvas.clip_rrect(rrect, ClipOp::Intersect, true);
-
-        if let Some(bg_img) = get_liquid_glass_background(
-            screen_x,
-            screen_y,
-            current_w as u32,
-            current_h as u32,
-            current_r,
+        let liquid_scale =
+            non_expanded_scale + (expanded_scale - non_expanded_scale) * expansion_progress;
+        let glass_frame = get_liquid_glass_background(&LiquidGlassParams {
+            win_x,
+            win_y,
+            os_w,
+            os_h,
+            offset_x,
+            offset_y,
+            width: current_w,
+            height: current_h,
+            corner_radius: current_r,
+            scale: liquid_scale,
+            blur: liquid_glass_blur,
+            refraction: liquid_glass_refraction / 100.0,
+            dispersion: liquid_glass_dispersion / 100.0,
+            tint: liquid_glass_tint / 100.0,
+            siri: liquid_glass_siri,
             monitor_x,
             monitor_y,
             monitor_w,
             monitor_h,
-        ) {
+        });
+
+        if let Some(frame) = glass_frame {
             let mut paint = Paint::default();
             paint.set_anti_alias(true);
             let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-            canvas.draw_image_rect_with_sampling_options(&bg_img, None, rect, sampling, &paint);
+            let dst = Rect::from_xywh(
+                offset_x - frame.margin,
+                offset_y - frame.margin,
+                frame.image.width() as f32,
+                frame.image.height() as f32,
+            );
+            canvas.draw_image_rect_with_sampling_options(&frame.image, None, dst, sampling, &paint);
         } else {
             let mut bg_paint = Paint::default();
             bg_paint.set_color(Color::from_argb(180, 32, 32, 36));
             bg_paint.set_anti_alias(true);
             canvas.draw_rrect(rrect, &bg_paint);
         }
+
+        canvas.save();
+        canvas.clip_rrect(rrect, ClipOp::Intersect, true);
     } else if island_style == "glass" {
         let screen_x = win_x + offset_x as i32;
         let screen_y = win_y + offset_y as i32;

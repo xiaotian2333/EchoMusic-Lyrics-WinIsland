@@ -1,0 +1,41 @@
+uniform shader source;
+uniform float2 direction;
+uniform float sigma;
+uniform float span;
+uniform float boxSize;
+
+const int kMaxRadius = 12;
+const int kMaxBox = 10;
+
+half4 main(float2 p) {
+    if (boxSize > 0.0) {
+        float2 origin = p * boxSize - float2(boxSize * 0.5);
+        half4 sum = half4(0.0);
+        float count = 0.0;
+        for (int y = 0; y < kMaxBox; y++) {
+            if (float(y) * 2.0 >= boxSize) {
+                break;
+            }
+            for (int x = 0; x < kMaxBox; x++) {
+                if (float(x) * 2.0 >= boxSize) {
+                    break;
+                }
+                sum += source.eval(origin + float2(float(x), float(y)) * 2.0 + float2(1.0));
+                count += 1.0;
+            }
+        }
+        return sum / half(max(count, 1.0));
+    }
+    half4 sum = half4(0.0);
+    float total = 0.0;
+    for (int i = -kMaxRadius; i <= kMaxRadius; i++) {
+        float offset = float(i);
+        if (abs(offset) > span) {
+            continue;
+        }
+        float weight = exp(-0.5 * offset * offset / (sigma * sigma));
+        sum += source.eval(p + direction * offset) * half(weight);
+        total += weight;
+    }
+    return sum / half(total);
+}

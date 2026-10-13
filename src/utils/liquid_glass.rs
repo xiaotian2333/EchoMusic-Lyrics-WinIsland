@@ -1,20 +1,51 @@
-use std::cell::RefCell;
+//! 液态玻璃效果，渲染方式移植自 WinIsland：
+//! GDI 截取窗口下方屏幕内容 → frost 模糊（降采样 + 可分离高斯）得到低分辨率背板 →
+//! liquid.sksl 在背板上完成边缘折射、色散、镜面高光、描边与阴影。
+//! 背板以 blur_scale 分之一的分辨率保存，着色器通过局部矩阵放大采样。
+
+use std::cell::{Cell, RefCell};
+use std::f32::consts::FRAC_1_SQRT_2;
 use std::time::Instant;
 
 use skia_safe::{
-    AlphaType, Color, ColorType, Data, FilterMode, ISize, Image, ImageInfo, MipmapMode, Paint,
-    RRect, Rect, SamplingOptions, TileMode, image_filters, images, surfaces,
+    AlphaType, BlendMode, Canvas, Color, ColorType, Data, FilterMode, ISize, Image, ImageInfo,
+    Matrix, MipmapMode, Paint, Rect, RuntimeEffect, SamplingOptions, Surface, TileMode, images,
+    runtime_effect::ChildPtr, surfaces,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WINDOW_DISPLAY_AFFINITY};
 
 use crate::utils::gdi_capture::{ScreenCaptureRequest, capture_screen_bgra};
 
-/// Exclude (or re-include) the island window from GDI screen captures.
+/// 折射着色器源码（移植自 WinIsland 的 liquid.sksl）。
+const LIQUID_SKSL_SOURCE: &str = include_str!("liquid.sksl");
+/// frost 模糊着色器源码（移植自 WinIsland 的 frost.sksl）。
+const FROST_SKSL_SOURCE: &str = include_str!("frost.sksl");
+
+// 连续圆角（超椭圆）映射参数，与 WinIsland liquid.rs 保持一致。
+const CORNER_SMOOTHING_SPAN: f32 = 3.333_333_3;
+const CONTINUOUS_CORNER_EXPONENT: f32 = 2.5;
+const CIRCULAR_APEX_INSET: f32 = 1.0 - FRAC_1_SQRT_2;
+const MAX_BEZEL_FRACTION: f32 = 0.7;
+const MAX_DISPERSION: f32 = 0.5;
+const EDGE_REACH: f32 = 1.0;
+const SHARP_RIM_REACH: f32 = 0.08;
+
+// frost 模糊参数，与 WinIsland backdrop.rs 保持一致。
+const MIN_FROST_SCALE: f32 = 2.0;
+const MAX_FROST_SCALE: f32 = 24.0;
+const MAX_WORK_SIGMA: f32 = 4.0;
+const MIN_WORK_SIGMA: f32 = 0.3;
+const MAX_WORK_SPAN: f32 = 12.0;
+
+// 背板截图与最终帧的缓存有效期。
+const CAPTURE_TTL_MS: u128 = 1000;
+const FRAME_TTL_MS: u128 = 200;
+
+/// 将岛屿窗口从 GDI 屏幕截图中排除（或恢复）。
 ///
-/// Must be called before every `capture_and_blur` to prevent self-capture
-/// feedback (the GDI BitBlt would otherwise include the island's own bright
-/// content). Set when entering liquid glass mode, cleared when leaving.
+/// 液态玻璃需要截取窗口下方内容，必须排除自身避免自捕获反馈。
+/// 进入液态玻璃时设置，离开时清除。
 pub fn set_exclude_from_capture(hwnd: HWND, exclude: bool) {
     // SAFETY: SetWindowDisplayAffinity 只修改调用方传入窗口句柄的显示亲和性。
     // 句柄由窗口层提供，调用失败只影响视觉捕获策略，返回值可忽略。
@@ -30,182 +61,498 @@ pub fn set_exclude_from_capture(hwnd: HWND, exclude: bool) {
     }
 }
 
-// SKSL shader — uses multi-tap blur on the captured desktop background to
-// produce a frosted-glass look with an edge highlight and specular sheen.
-
-const SKSL_SOURCE: &str = r#"
-uniform shader uBackground;
-uniform float4 uShape;
-uniform float uRadius;
-
-float roundedRectSDF(float2 p, float2 b, float r) {
-    float2 q = abs(p) - b + r;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+/// 玻璃材质参数，移植自 WinIsland 的 LiquidMaterial。
+#[derive(Clone, Copy)]
+struct LiquidMaterial {
+    bezel_width: f32,
+    thickness: f32,
+    glass_ior: f32,
+    displacement_factor: f32,
+    dispersion: f32,
+    morph_dispersion: f32,
+    tint: Color,
+    legibility: f32,
+    light: (f32, f32),
+    specular_strength: f32,
+    opposite_specular_strength: f32,
+    specular_sharpness: f32,
+    specular_falloff: f32,
+    specular_opacity: f32,
+    specular_width: f32,
+    stroke_width: f32,
+    stroke_opacity: f32,
+    stroke_offset_y: f32,
+    shadow_offset: (f32, f32),
+    shadow_radius: f32,
+    shadow_spread: f32,
+    shadow_alpha: f32,
+    black_fade: f32,
 }
 
-half4 main(float2 coord) {
-    float2 center = uShape.xy + uShape.zw * 0.5;
-    float2 halfSize = uShape.zw * 0.5;
-    float2 relPos = coord - center;
+impl LiquidMaterial {
+    /// 岛屿基础材质，参数随 scale 缩放（移植自 WinIsland LiquidMaterial::island）。
+    fn island(scale: f32) -> Self {
+        Self {
+            bezel_width: 18.0 * scale,
+            thickness: 14.0 * scale,
+            glass_ior: 1.45,
+            displacement_factor: 1.1,
+            dispersion: 0.08,
+            morph_dispersion: 0.06,
+            tint: Color::from_argb(95, 10, 11, 15),
+            legibility: 0.32,
+            light: (-FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
+            specular_strength: 0.75,
+            opposite_specular_strength: 0.38,
+            specular_sharpness: 3.0,
+            specular_falloff: 0.9,
+            specular_opacity: 0.8,
+            specular_width: 1.5 * scale,
+            stroke_width: 0.65 * scale,
+            stroke_opacity: 0.25,
+            stroke_offset_y: 0.2 * scale,
+            shadow_offset: (0.0, 2.0 * scale),
+            shadow_radius: 7.0 * scale,
+            shadow_spread: -scale,
+            shadow_alpha: 0.22,
+            black_fade: 0.0,
+        }
+    }
 
-    float dist = roundedRectSDF(relPos, halfSize, uRadius);
+    /// 按折射强度缩放边缘位移，并设置色散强度（0..1，内部映射到最大值）。
+    fn with_optics(mut self, refraction: f32, dispersion: f32) -> Self {
+        self.displacement_factor *= refraction.max(0.0);
+        self.dispersion = dispersion.clamp(0.0, 1.0) * MAX_DISPERSION;
+        self
+    }
 
-    float2 uv = (coord - uShape.xy) / uShape.zw;
-    float ix = uv.x - 0.5;
-    float iy = uv.y - 0.5;
+    /// 按强度缩放暗色遮罩与自适应可读性着色；0 表示完全透明玻璃。
+    fn with_tint(mut self, strength: f32) -> Self {
+        let strength = strength.max(0.0);
+        let alpha = (f32::from(self.tint.a()) * strength)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        self.tint = self.tint.with_a(alpha);
+        self.legibility *= strength;
+        self
+    }
 
-    float minDim = min(uShape.z, uShape.w);
-    float normDist = dist / minDim;
-
-    float displacement = smoothstep(0.8, 0.0, normDist - 0.15);
-    float scaled = smoothstep(0.0, 1.0, displacement);
-
-    float2 sourceUV = float2(ix * scaled + 0.5, iy * scaled + 0.5);
-    float2 sourceCoord = sourceUV * uShape.zw + uShape.xy;
-
-    float blurAmt = 6.0;
-    half4 color = uBackground.eval(sourceCoord) * 0.40;
-    color += uBackground.eval(sourceCoord + float2(blurAmt, 0)) * 0.15;
-    color += uBackground.eval(sourceCoord - float2(blurAmt, 0)) * 0.15;
-    color += uBackground.eval(sourceCoord + float2(0, blurAmt)) * 0.15;
-    color += uBackground.eval(sourceCoord - float2(0, blurAmt)) * 0.15;
-
-    float gray = dot(color.rgb, half3(0.299, 0.587, 0.114));
-    color.rgb = mix(float3(gray), color.rgb, 1.0);
-
-    float edgeBright = smoothstep(0.0, -0.3, normDist) * 0.08;
-    color.rgb += edgeBright;
-
-    float specY = smoothstep(0.15, 0.0, uv.y) * smoothstep(-0.02, 0.08, uv.y);
-    float specX = smoothstep(0.1, 0.3, uv.x) * smoothstep(0.9, 0.7, uv.x);
-    float specular = specY * specX * smoothstep(0.0, -0.2, normDist);
-    color.rgb += specular * 0.06;
-
-    color.rgb += smoothstep(0.3, 0.0, uv.y) * 0.03;
-
-    color.rgb = clamp(color.rgb, 0.0, 1.0);
-
-    return color;
+    /// 阴影与描边超出形状边缘的最大距离，用于确定绘制范围。
+    fn margin(&self) -> f32 {
+        (self.shadow_radius + self.shadow_spread.max(0.0))
+            .max(self.stroke_width + self.stroke_offset_y)
+            + self.shadow_offset.0.abs().max(self.shadow_offset.1.abs())
+            + 2.0
+    }
 }
-"#;
 
-type CacheEntry = (Image, Instant, i32, i32, u32, u32);
+/// 玻璃轮廓（画布坐标，画布即窗口内坐标）。
+#[derive(Clone, Copy)]
+struct LiquidShape {
+    rect: Rect,
+    radius: f32,
+}
 
-// Captured + blurred desktop background, keyed by screen position and size.
-// Refreshed when position/size changes or every 5s (heavily blurred = stale content invisible).
-type BgCacheEntry = (Image, i32, i32, u32, u32, Instant);
+/// 模糊后的屏幕背板。
+struct Backdrop {
+    image: Image,
+    /// 背板相对窗口的分辨率比例；1.0 表示未模糊。
+    blur_scale: f32,
+    /// 背板左上角在画布坐标中的位置（窗口部分离屏时非零）。
+    origin: (f32, f32),
+}
+
+/// 背板截图缓存键：窗口与显示器矩形。
+#[derive(Clone, Copy, PartialEq)]
+struct CaptureKey {
+    win_x: i32,
+    win_y: i32,
+    os_w: u32,
+    os_h: u32,
+    mon_x: i32,
+    mon_y: i32,
+    mon_w: u32,
+    mon_h: u32,
+}
+
+/// 最终帧缓存键：几何、材质与模糊强度。
+#[derive(Clone, Copy, PartialEq)]
+struct FrameKey {
+    offset_x: u32,
+    offset_y: u32,
+    width: u32,
+    height: u32,
+    radius: u32,
+    scale: u32,
+    sigma_key: u32,
+    refraction: u32,
+    dispersion: u32,
+    tint: u32,
+    siri: bool,
+}
+
+/// 背板截图缓存：(图像, 代次, 画布内原点, 时间, 键)。
+type CaptureCacheEntry = (Image, u64, (f32, f32), Instant, CaptureKey);
+/// frost 缓存：(图像, blur_scale, 背板代次, sigma 键)。
+type FrostCacheEntry = (Image, f32, u64, u32);
+/// 最终帧缓存：(图像, margin, 时间, 键)。
+type FrameCacheEntry = (Image, f32, Instant, FrameKey);
 
 thread_local! {
-    static GLASS_CACHE: RefCell<Option<CacheEntry>> = const { RefCell::new(None) };
-    static BG_CACHE: RefCell<Option<BgCacheEntry>> = const { RefCell::new(None) };
-    static EFFECT_CACHE: RefCell<Option<skia_safe::RuntimeEffect>> = const { RefCell::new(None) };
+    static LIQUID_EFFECT: RefCell<Option<RuntimeEffect>> = const { RefCell::new(None) };
+    static FROST_EFFECT: RefCell<Option<RuntimeEffect>> = const { RefCell::new(None) };
+    static CAPTURE_CACHE: RefCell<Option<CaptureCacheEntry>> = const { RefCell::new(None) };
+    static FROST_CACHE: RefCell<Option<FrostCacheEntry>> = const { RefCell::new(None) };
+    static FRAME_CACHE: RefCell<Option<FrameCacheEntry>> = const { RefCell::new(None) };
+    static CAPTURE_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
-fn get_or_init_effect() -> Option<skia_safe::RuntimeEffect> {
-    EFFECT_CACHE.with(|cell| {
-        if let Some(eff) = cell.borrow().as_ref() {
-            return Some(eff.clone());
+/// 编译并缓存折射着色器。
+fn liquid_effect() -> Option<RuntimeEffect> {
+    LIQUID_EFFECT.with(|cell| {
+        if let Some(effect) = cell.borrow().as_ref() {
+            return Some(effect.clone());
         }
-        let eff = skia_safe::RuntimeEffect::make_for_shader(SKSL_SOURCE, None).ok()?;
-        *cell.borrow_mut() = Some(eff.clone());
-        Some(eff)
+        let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL_SOURCE, None).ok()?;
+        *cell.borrow_mut() = Some(effect.clone());
+        Some(effect)
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn get_liquid_glass_background(
-    screen_x: i32,
-    screen_y: i32,
-    w: u32,
-    h: u32,
-    corner_radius: f32,
-    _monitor_x: i32,
-    _monitor_y: i32,
-    _monitor_w: u32,
-    _monitor_h: u32,
+/// 编译并缓存 frost 模糊着色器。
+fn frost_effect() -> Option<RuntimeEffect> {
+    FROST_EFFECT.with(|cell| {
+        if let Some(effect) = cell.borrow().as_ref() {
+            return Some(effect.clone());
+        }
+        let effect = RuntimeEffect::make_for_shader(FROST_SKSL_SOURCE, None).ok()?;
+        *cell.borrow_mut() = Some(effect.clone());
+        Some(effect)
+    })
+}
+
+/// 按名称写入 RuntimeEffect uniform 的辅助结构。
+struct Uniforms<'a> {
+    effect: &'a RuntimeEffect,
+    bytes: Vec<u8>,
+}
+
+impl Uniforms<'_> {
+    fn set(&mut self, name: &str, values: &[f32]) {
+        let Some(uniform) = self.effect.find_uniform(name) else {
+            return;
+        };
+        let offset = uniform.offset();
+        for (index, value) in values.iter().enumerate() {
+            let start = offset + index * 4;
+            if let Some(slot) = self.bytes.get_mut(start..start + 4) {
+                slot.copy_from_slice(&value.to_ne_bytes());
+            }
+        }
+    }
+}
+
+/// 连续圆角映射：返回 [超椭圆范围, 指数]，移植自 WinIsland liquid.rs。
+fn corner(rect: Rect, radius: f32) -> [f32; 2] {
+    let limit = (rect.width().min(rect.height()) * 0.5).max(0.5);
+    let radius = radius.clamp(0.5, limit);
+    let extent =
+        radius * CIRCULAR_APEX_INSET / (1.0 - 2.0_f32.powf(-1.0 / CONTINUOUS_CORNER_EXPONENT));
+    if extent <= limit {
+        return [extent, CONTINUOUS_CORNER_EXPONENT];
+    }
+    let exponent = (-(1.0 - radius * CIRCULAR_APEX_INSET / limit).log2())
+        .recip()
+        .clamp(2.0, 2.0 + CORNER_SMOOTHING_SPAN);
+    [limit, exponent]
+}
+
+/// 形状 uniform：[中心 x, 中心 y, 半宽, 半高]。
+fn shape_uniform(rect: Rect) -> [f32; 4] {
+    [
+        rect.center_x(),
+        rect.center_y(),
+        rect.width() * 0.5,
+        rect.height() * 0.5,
+    ]
+}
+
+/// 用折射着色器把背板绘制到画布上，返回是否成功。
+///
+/// 绘制范围覆盖形状四周 margin（阴影/描边），着色器自行处理边缘抗锯齿，
+/// 调用方无需裁剪。progress 与 opacity 固定为 1.0（当前项目无融合动画）。
+fn draw_liquid_glass(
+    canvas: &Canvas,
+    backdrop: &Backdrop,
+    shape: &LiquidShape,
+    material: &LiquidMaterial,
+    progress: f32,
+    opacity: f32,
+) -> bool {
+    let opacity = opacity.clamp(0.0, 1.0);
+    let progress = progress.clamp(0.0, 1.0);
+    if opacity <= 0.0 || progress <= 0.0 || shape.rect.width() <= 0.0 || shape.rect.height() <= 0.0
+    {
+        return true;
+    }
+    let Some(effect) = liquid_effect() else {
+        return false;
+    };
+    let min_half = shape.rect.width().min(shape.rect.height()) * 0.5;
+    let bezel = material
+        .bezel_width
+        .min(min_half * MAX_BEZEL_FRACTION)
+        .max(1.0);
+    let thickness = material.thickness * bezel / material.bezel_width.max(1.0);
+    let light_length = material.light.0.hypot(material.light.1);
+    let light = if light_length > 1e-4 {
+        [
+            material.light.0 / light_length,
+            material.light.1 / light_length,
+        ]
+    } else {
+        [1.0, 0.0]
+    };
+
+    let mut uniforms = Uniforms {
+        effect: &effect,
+        bytes: vec![0; effect.uniform_size()],
+    };
+    uniforms.set("shape0", &shape_uniform(shape.rect));
+    uniforms.set("corner0", &corner(shape.rect, shape.radius));
+    uniforms.set("bezelWidth", &[bezel]);
+    uniforms.set("thickness", &[thickness]);
+    uniforms.set("glassIor", &[material.glass_ior]);
+    uniforms.set("displacementFactor", &[material.displacement_factor]);
+    uniforms.set(
+        "dispersion",
+        &[material.dispersion.clamp(0.0, MAX_DISPERSION)],
+    );
+    uniforms.set(
+        "morphDispersion",
+        &[material.morph_dispersion.clamp(0.0, 0.5)],
+    );
+    uniforms.set("progress", &[progress]);
+    uniforms.set(
+        "tint",
+        &[
+            f32::from(material.tint.r()) / 255.0,
+            f32::from(material.tint.g()) / 255.0,
+            f32::from(material.tint.b()) / 255.0,
+            f32::from(material.tint.a()) / 255.0,
+        ],
+    );
+    uniforms.set("legibility", &[material.legibility.clamp(0.0, 1.0)]);
+    uniforms.set("lightDir", &light);
+    uniforms.set(
+        "specular",
+        &[
+            material.specular_strength,
+            material.opposite_specular_strength,
+            material.specular_opacity,
+            material.specular_falloff,
+        ],
+    );
+    uniforms.set(
+        "specularShape",
+        &[material.specular_width, material.specular_sharpness],
+    );
+    uniforms.set(
+        "stroke",
+        &[
+            material.stroke_width,
+            material.stroke_opacity,
+            material.stroke_offset_y,
+        ],
+    );
+    uniforms.set(
+        "shadow",
+        &[
+            material.shadow_offset.0,
+            material.shadow_offset.1,
+            material.shadow_radius,
+            material.shadow_spread,
+        ],
+    );
+    uniforms.set("shadowAlpha", &[material.shadow_alpha]);
+    uniforms.set("opacity", &[opacity]);
+    uniforms.set("blackFade", &[material.black_fade.clamp(0.0, 1.0)]);
+    // 背板未模糊（blur_scale = 1）时缩短边缘折射采样范围，避免边缘抖动。
+    let rim_reach = if backdrop.blur_scale > 1.0 {
+        EDGE_REACH
+    } else {
+        (bezel * SHARP_RIM_REACH * material.displacement_factor).clamp(EDGE_REACH, bezel)
+    };
+    uniforms.set("rimReach", &[rim_reach]);
+
+    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+    // 局部矩阵：画布坐标 p → 背板纹理坐标 (p - origin) / blur_scale。
+    let local_matrix = Matrix::new_all(
+        backdrop.blur_scale,
+        0.0,
+        backdrop.origin.0,
+        0.0,
+        backdrop.blur_scale,
+        backdrop.origin.1,
+        0.0,
+        0.0,
+        1.0,
+    );
+    let Some(backdrop_shader) = backdrop.image.to_shader(
+        (TileMode::Clamp, TileMode::Clamp),
+        sampling,
+        Some(&local_matrix),
+    ) else {
+        return false;
+    };
+    let children = [ChildPtr::from(backdrop_shader)];
+    let Some(shader) = effect.make_shader(Data::new_copy(&uniforms.bytes), &children, None) else {
+        return false;
+    };
+
+    let margin = material.margin();
+    let mut paint = Paint::default();
+    paint.set_shader(shader);
+    canvas.draw_rect(
+        Rect::from_ltrb(
+            shape.rect.left - margin,
+            shape.rect.top - margin,
+            shape.rect.right + margin,
+            shape.rect.bottom + margin,
+        ),
+        &paint,
+    );
+    true
+}
+
+/// frost 着色器的两遍处理模式。
+enum FrostPass {
+    /// 降采样（盒式平均）。
+    Reduce(f32),
+    /// 可分离高斯的一遍，参数为方向与工作分辨率下的 sigma。
+    Blur([f32; 2], f32),
+}
+
+/// 在目标表面上执行一遍 frost 着色器，返回结果图像。
+fn frost_pass(
+    effect: &RuntimeEffect,
+    source: &Image,
+    target: &mut Surface,
+    pass: FrostPass,
 ) -> Option<Image> {
-    if w == 0 || h == 0 {
+    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+    let source_shader = source.to_shader((TileMode::Clamp, TileMode::Clamp), sampling, None)?;
+    let mut uniforms = Uniforms {
+        effect,
+        bytes: vec![0; effect.uniform_size()],
+    };
+    match pass {
+        FrostPass::Reduce(scale) => uniforms.set("boxSize", &[scale]),
+        FrostPass::Blur(direction, sigma) => {
+            uniforms.set("direction", &direction);
+            uniforms.set("sigma", &[sigma]);
+            uniforms.set("span", &[(sigma * 3.0).ceil().min(MAX_WORK_SPAN)]);
+        }
+    }
+    let shader = effect.make_shader(
+        Data::new_copy(&uniforms.bytes),
+        &[ChildPtr::from(source_shader)],
+        None,
+    )?;
+    let mut paint = Paint::default();
+    paint.set_shader(shader);
+    paint.set_blend_mode(BlendMode::Src);
+    let target_w = target.width() as f32;
+    let target_h = target.height() as f32;
+    target
+        .canvas()
+        .draw_rect(Rect::from_xywh(0.0, 0.0, target_w, target_h), &paint);
+    Some(target.image_snapshot())
+}
+
+/// 降采样 + 可分离高斯模糊，返回背板与 blur_scale（移植自 WinIsland backdrop.rs）。
+fn frost(capture: &Image, frost_sigma: f32) -> Option<(Image, f32)> {
+    if frost_sigma < MIN_WORK_SIGMA {
+        return Some((capture.clone(), 1.0));
+    }
+    let effect = frost_effect()?;
+    let scale = (frost_sigma / MAX_WORK_SIGMA)
+        .ceil()
+        .clamp(MIN_FROST_SCALE, MAX_FROST_SCALE);
+    let reduced_w = (capture.width() as f32 / scale).ceil().max(1.0) as i32;
+    let reduced_h = (capture.height() as f32 / scale).ceil().max(1.0) as i32;
+    let size = ISize::new(reduced_w, reduced_h);
+    let mut reduce_surface = surfaces::raster_n32_premul(size)?;
+    let reduced = frost_pass(
+        &effect,
+        capture,
+        &mut reduce_surface,
+        FrostPass::Reduce(scale),
+    )?;
+    let work_sigma = frost_sigma / scale;
+    if work_sigma < MIN_WORK_SIGMA {
+        return Some((reduced, scale));
+    }
+    let mut blur_surface = surfaces::raster_n32_premul(size)?;
+    let horizontal = frost_pass(
+        &effect,
+        &reduced,
+        &mut blur_surface,
+        FrostPass::Blur([1.0, 0.0], work_sigma),
+    )?;
+    let mut blur_surface = surfaces::raster_n32_premul(size)?;
+    let vertical = frost_pass(
+        &effect,
+        &horizontal,
+        &mut blur_surface,
+        FrostPass::Blur([0.0, 1.0], work_sigma),
+    )?;
+    Some((vertical, scale))
+}
+
+/// 获取或截取窗口下方屏幕内容，返回 (图像, 代次, 画布内原点)。
+///
+/// 截图范围裁剪到显示器内；窗口部分离屏时原点非零，着色器仍按窗口坐标采样。
+fn get_or_capture(params: &LiquidGlassParams) -> Option<(Image, u64, (f32, f32))> {
+    let key = CaptureKey {
+        win_x: params.win_x,
+        win_y: params.win_y,
+        os_w: params.os_w,
+        os_h: params.os_h,
+        mon_x: params.monitor_x,
+        mon_y: params.monitor_y,
+        mon_w: params.monitor_w,
+        mon_h: params.monitor_h,
+    };
+    let cached = CAPTURE_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        if let Some((image, generation, origin, time, cached_key)) = cache.as_ref()
+            && *cached_key == key
+            && time.elapsed().as_millis() < CAPTURE_TTL_MS
+        {
+            return Some((image.clone(), *generation, *origin));
+        }
+        None
+    });
+    if let Some(hit) = cached {
+        return Some(hit);
+    }
+
+    let left = params.win_x.max(params.monitor_x);
+    let top = params.win_y.max(params.monitor_y);
+    let right = (params.win_x + params.os_w as i32).min(params.monitor_x + params.monitor_w as i32);
+    let bottom =
+        (params.win_y + params.os_h as i32).min(params.monitor_y + params.monitor_h as i32);
+    if right <= left || bottom <= top {
         return None;
     }
-
-    // Fast path: final output already cached (exact params, <200ms)
-    let cached = GLASS_CACHE.with(|cell| {
-        let cache = cell.borrow();
-        if let Some((img, time, cx, cy, cw, ch)) = cache.as_ref()
-            && time.elapsed().as_millis() < 200
-            && *cx == screen_x
-            && *cy == screen_y
-            && *cw == w
-            && *ch == h
-        {
-            return Some(img.clone());
-        }
-        None
-    });
-    if let Some(img) = cached {
-        return Some(img);
-    }
-
-    // Get or refresh the blurred background capture (keyed by screen position only)
-    let blurred = get_or_capture_background(screen_x, screen_y, w, h)?;
-
-    // Run shader + borders using the (potentially cached) background
-    let result = render_liquid_glass(screen_x, screen_y, w, h, corner_radius, &blurred);
-
-    if let Some(ref img) = result {
-        GLASS_CACHE.with(|cell| {
-            *cell.borrow_mut() = Some((img.clone(), Instant::now(), screen_x, screen_y, w, h));
-        });
-    }
-
-    result
-}
-
-fn get_or_capture_background(screen_x: i32, screen_y: i32, w: u32, h: u32) -> Option<Image> {
-    // Check BG_CACHE: same position, same dimensions, and less than 5s old
-    let cached = BG_CACHE.with(|cell| {
-        let cache = cell.borrow();
-        if let Some((img, cx, cy, cw, ch, time)) = cache.as_ref()
-            && *cx == screen_x
-            && *cy == screen_y
-            && *cw == w
-            && *ch == h
-            && time.elapsed().as_millis() < 5000
-        {
-            return Some(img.clone());
-        }
-        None
-    });
-    if let Some(img) = cached {
-        return Some(img);
-    }
-
-    // Capture + blur the desktop region
-    let blurred = capture_and_blur(screen_x, screen_y, w, h)?;
-
-    BG_CACHE.with(|cell| {
-        *cell.borrow_mut() = Some((blurred.clone(), screen_x, screen_y, w, h, Instant::now()));
-    });
-
-    Some(blurred)
-}
-
-fn capture_and_blur(screen_x: i32, screen_y: i32, w: u32, h: u32) -> Option<Image> {
-    let blur_sigma = 12.0f32;
-    let margin = (blur_sigma * 3.0).max(20.0) as i32;
-
-    let cap_x = (screen_x - margin).max(0);
-    let cap_y = (screen_y - margin).max(0);
-    let cap_w = w as i32 + 2 * margin;
-    let cap_h = h as i32 + 2 * margin;
-
     let capture = capture_screen_bgra(ScreenCaptureRequest {
-        src_x: cap_x,
-        src_y: cap_y,
-        src_w: cap_w,
-        src_h: cap_h,
-        dst_w: cap_w,
-        dst_h: cap_h,
+        src_x: left,
+        src_y: top,
+        src_w: right - left,
+        src_h: bottom - top,
+        dst_w: right - left,
+        dst_h: bottom - top,
         use_halftone: false,
         force_opaque_alpha: true,
     })?;
@@ -217,124 +564,271 @@ fn capture_and_blur(screen_x: i32, screen_y: i32, w: u32, h: u32) -> Option<Imag
         None,
     );
     let data = Data::new_copy(&capture.pixels);
-    let src_img = images::raster_from_data(&info, data, (capture.width * 4) as usize)?;
+    let image = images::raster_from_data(&info, data, (capture.width * 4) as usize)?;
 
-    let mut blur_surface = surfaces::raster_n32_premul(ISize::new(capture.width, capture.height))?;
-    let blur_canvas = blur_surface.canvas();
-    let mut blur_paint = Paint::default();
-    if let Some(filter) = image_filters::blur((blur_sigma, blur_sigma), None, None, None) {
-        blur_paint.set_image_filter(filter);
-    }
-    blur_canvas.draw_image(&src_img, (0, 0), Some(&blur_paint));
-
-    Some(blur_surface.image_snapshot())
+    let generation = CAPTURE_GENERATION.with(|cell| {
+        let next = cell.get().wrapping_add(1);
+        cell.set(next);
+        next
+    });
+    let origin = ((left - params.win_x) as f32, (top - params.win_y) as f32);
+    CAPTURE_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((image.clone(), generation, origin, Instant::now(), key));
+    });
+    Some((image, generation, origin))
 }
 
-fn render_liquid_glass(
-    screen_x: i32,
-    screen_y: i32,
-    w: u32,
-    h: u32,
-    corner_radius: f32,
-    blurred: &Image,
-) -> Option<Image> {
-    let margin = (12.0_f32 * 3.0_f32).max(20.0) as i32;
-    let cap_x = (screen_x - margin).max(0);
-    let cap_y = (screen_y - margin).max(0);
-    let cap_w = w as i32 + 2 * margin;
-    let cap_h = h as i32 + 2 * margin;
+/// 获取或生成 frost 模糊背板（按背板代次与 sigma 键缓存）。
+fn get_or_frost(
+    capture: &Image,
+    generation: u64,
+    sigma_key: u32,
+    frost_sigma: f32,
+) -> Option<(Image, f32)> {
+    let cached = FROST_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        if let Some((image, blur_scale, cached_generation, cached_sigma)) = cache.as_ref()
+            && *cached_generation == generation
+            && *cached_sigma == sigma_key
+        {
+            return Some((image.clone(), *blur_scale));
+        }
+        None
+    });
+    if let Some(hit) = cached {
+        return Some(hit);
+    }
+    let (image, blur_scale) = frost(capture, frost_sigma)?;
+    FROST_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((image.clone(), blur_scale, generation, sigma_key));
+    });
+    Some((image, blur_scale))
+}
 
-    let effect = get_or_init_effect()?;
+/// 液态玻璃绘制参数。
+pub struct LiquidGlassParams {
+    /// 窗口左上角屏幕坐标。
+    pub win_x: i32,
+    pub win_y: i32,
+    /// 窗口尺寸。
+    pub os_w: u32,
+    pub os_h: u32,
+    /// 岛屿在窗口内的位置与尺寸（画布坐标）。
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub corner_radius: f32,
+    /// 当前视觉缩放（随展开进度在非展开/展开缩放间插值）。
+    pub scale: f32,
+    /// 背景模糊强度，frost sigma = blur * scale。
+    pub blur: f32,
+    /// 折射强度（配置值 / 100）。
+    pub refraction: f32,
+    /// 色散强度（配置值 / 100）。
+    pub dispersion: f32,
+    /// 暗色遮罩强度（配置值 / 100）。
+    pub tint: f32,
+    /// Siri 样式：黑色到玻璃的渐变。
+    pub siri: bool,
+    /// 所在显示器矩形（截图裁剪边界）。
+    pub monitor_x: i32,
+    pub monitor_y: i32,
+    pub monitor_w: u32,
+    pub monitor_h: u32,
+}
 
-    let shape_x = (screen_x - cap_x) as f32;
-    let shape_y = (screen_y - cap_y) as f32;
-    let shape_w = w as f32;
-    let shape_h = h as f32;
+/// 最终帧：带 margin 的玻璃图像与绘制偏移。
+pub struct LiquidGlassFrame {
+    pub image: Image,
+    pub margin: f32,
+}
 
-    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-    let bg_shader = blurred.to_shader((TileMode::Clamp, TileMode::Clamp), sampling, None)?;
+/// 获取液态玻璃帧；失败时调用方应回退到实心圆角矩形。
+pub fn get_liquid_glass_background(params: &LiquidGlassParams) -> Option<LiquidGlassFrame> {
+    if params.width <= 0.0 || params.height <= 0.0 || params.os_w == 0 || params.os_h == 0 {
+        return None;
+    }
+    let frost_sigma = params.blur * params.scale;
+    let sigma_key = (frost_sigma * 16.0).round() as u32;
 
-    let uniform_size = effect.uniform_size();
-    let mut uniform_data = vec![0u8; uniform_size];
-    let write_f32 = |data: &mut [u8], offset: usize, val: f32| {
-        data[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+    let mut material = LiquidMaterial::island(params.scale)
+        .with_optics(params.refraction, params.dispersion)
+        .with_tint(params.tint);
+    if params.siri {
+        material.black_fade = 1.0;
+    }
+    let shape = LiquidShape {
+        rect: Rect::from_xywh(
+            params.offset_x,
+            params.offset_y,
+            params.width,
+            params.height,
+        ),
+        radius: params.corner_radius,
     };
-    for u in effect.uniforms() {
-        match u.name() {
-            "uShape" => {
-                let off = u.offset();
-                write_f32(&mut uniform_data, off, shape_x);
-                write_f32(&mut uniform_data, off + 4, shape_y);
-                write_f32(&mut uniform_data, off + 8, shape_w);
-                write_f32(&mut uniform_data, off + 12, shape_h);
-            }
-            "uRadius" => {
-                write_f32(&mut uniform_data, u.offset(), corner_radius);
-            }
-            _ => {}
+
+    let frame_key = FrameKey {
+        offset_x: params.offset_x.to_bits(),
+        offset_y: params.offset_y.to_bits(),
+        width: params.width.to_bits(),
+        height: params.height.to_bits(),
+        radius: params.corner_radius.to_bits(),
+        scale: params.scale.to_bits(),
+        sigma_key,
+        refraction: params.refraction.to_bits(),
+        dispersion: params.dispersion.to_bits(),
+        tint: params.tint.to_bits(),
+        siri: params.siri,
+    };
+
+    // 帧缓存：几何与材质不变时直接复用，避免每帧重跑着色器。
+    let cached = FRAME_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        if let Some((image, margin, time, key)) = cache.as_ref()
+            && *key == frame_key
+            && time.elapsed().as_millis() < FRAME_TTL_MS
+        {
+            return Some((image.clone(), *margin));
+        }
+        None
+    });
+    if let Some((image, margin)) = cached {
+        return Some(LiquidGlassFrame { image, margin });
+    }
+
+    let (capture, generation, origin) = get_or_capture(params)?;
+    let (backdrop_image, blur_scale) = get_or_frost(&capture, generation, sigma_key, frost_sigma)?;
+    let backdrop = Backdrop {
+        image: backdrop_image,
+        blur_scale,
+        origin,
+    };
+
+    let margin = material.margin().ceil();
+    let out_w = (params.width + margin * 2.0).ceil() as i32;
+    let out_h = (params.height + margin * 2.0).ceil() as i32;
+    if out_w <= 0 || out_h <= 0 {
+        return None;
+    }
+    let mut surface = surfaces::raster_n32_premul(ISize::new(out_w, out_h))?;
+    {
+        let canvas = surface.canvas();
+        canvas.clear(Color::TRANSPARENT);
+        // 平移画布，使着色器收到的局部坐标与窗口坐标一致（背板采样依赖该对齐）。
+        canvas.translate((-(shape.rect.left - margin), -(shape.rect.top - margin)));
+        if !draw_liquid_glass(canvas, &backdrop, &shape, &material, 1.0, 1.0) {
+            return None;
         }
     }
+    let image = surface.image_snapshot();
 
-    let uniform_data_obj = skia_safe::Data::new_copy(&uniform_data);
-    let children = [skia_safe::runtime_effect::ChildPtr::from(bg_shader)];
-    let liquid_shader = effect.make_shader(uniform_data_obj, &children, None)?;
-
-    let crop_x = (screen_x - cap_x) as f32;
-    let crop_y = (screen_y - cap_y) as f32;
-
-    let mut final_surface = surfaces::raster_n32_premul(ISize::new(w as i32, h as i32))?;
-    let final_canvas = final_surface.canvas();
-
-    let mut paint = Paint::default();
-    paint.set_anti_alias(true);
-    paint.set_shader(liquid_shader);
-
-    final_canvas.translate((-crop_x, -crop_y));
-    final_canvas.draw_rect(
-        Rect::from_xywh(0.0, 0.0, cap_w as f32, cap_h as f32),
-        &paint,
-    );
-
-    let final_img = final_surface.image_snapshot();
-
-    // Draw borders
-    let mut border_surface = surfaces::raster_n32_premul(ISize::new(w as i32, h as i32))?;
-    let border_canvas = border_surface.canvas();
-    border_canvas.draw_image(&final_img, (0, 0), None);
-
-    let mut outer_border = Paint::default();
-    outer_border.set_anti_alias(true);
-    outer_border.set_color(Color::from_argb(90, 255, 255, 255));
-    outer_border.set_style(skia_safe::PaintStyle::Stroke);
-    outer_border.set_stroke_width(1.0);
-    let outer_rrect = RRect::new_rect_xy(
-        Rect::from_xywh(0.5, 0.5, w as f32 - 1.0, h as f32 - 1.0),
-        corner_radius,
-        corner_radius,
-    );
-    border_canvas.draw_rrect(outer_rrect, &outer_border);
-
-    let inset = 1.0f32;
-    let inner_rrect = RRect::new_rect_xy(
-        Rect::from_xywh(inset, inset, w as f32 - inset * 2.0, h as f32 - inset * 2.0),
-        (corner_radius - inset).max(0.0),
-        (corner_radius - inset).max(0.0),
-    );
-    let mut inner_border = Paint::default();
-    inner_border.set_anti_alias(true);
-    inner_border.set_color(Color::from_argb(40, 255, 255, 255));
-    inner_border.set_style(skia_safe::PaintStyle::Stroke);
-    inner_border.set_stroke_width(0.5);
-    border_canvas.draw_rrect(inner_rrect, &inner_border);
-
-    Some(border_surface.image_snapshot())
+    FRAME_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((image.clone(), margin, Instant::now(), frame_key));
+    });
+    Some(LiquidGlassFrame { image, margin })
 }
 
+/// 清空所有液态玻璃缓存（样式切换、主题变化或配置重载时调用）。
 pub fn clear_liquid_glass_cache() {
-    GLASS_CACHE.with(|cell| {
+    CAPTURE_CACHE.with(|cell| {
         *cell.borrow_mut() = None;
     });
-    BG_CACHE.with(|cell| {
+    FROST_CACHE.with(|cell| {
         *cell.borrow_mut() = None;
     });
+    FRAME_CACHE.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 折射着色器必须能编译通过。
+    #[test]
+    fn liquid_shader_compiles() {
+        assert!(RuntimeEffect::make_for_shader(LIQUID_SKSL_SOURCE, None).is_ok());
+    }
+
+    /// frost 着色器必须能编译通过。
+    #[test]
+    fn frost_shader_compiles() {
+        assert!(RuntimeEffect::make_for_shader(FROST_SKSL_SOURCE, None).is_ok());
+    }
+
+    /// 连续圆角范围不超过矩形短边的一半，指数保持连续圆角默认值。
+    #[test]
+    fn corner_extent_stays_within_limit() {
+        let rect = Rect::from_xywh(0.0, 0.0, 200.0, 100.0);
+        let [extent, exponent] = corner(rect, 24.0);
+        assert!(extent > 0.0 && extent <= 50.0);
+        assert_eq!(exponent, CONTINUOUS_CORNER_EXPONENT);
+    }
+
+    /// 光学参数与遮罩强度按范围收敛。
+    #[test]
+    fn optics_and_tint_clamp() {
+        let material = LiquidMaterial::island(1.0)
+            .with_optics(-1.0, 2.0)
+            .with_tint(0.0);
+        assert_eq!(material.displacement_factor, 0.0);
+        assert_eq!(material.dispersion, MAX_DISPERSION);
+        assert_eq!(material.tint.a(), 0);
+        assert_eq!(material.legibility, 0.0);
+    }
+
+    /// 折射着色器能在 CPU 光栅画布上完整走通（编译 + 绘制）。
+    #[test]
+    fn liquid_glass_draws_on_raster_canvas() {
+        let mut backdrop_surface = surfaces::raster_n32_premul(ISize::new(32, 32)).unwrap();
+        backdrop_surface
+            .canvas()
+            .clear(Color::from_argb(255, 128, 128, 128));
+        let backdrop = Backdrop {
+            image: backdrop_surface.image_snapshot(),
+            blur_scale: 1.0,
+            origin: (0.0, 0.0),
+        };
+        let mut surface = surfaces::raster_n32_premul(ISize::new(64, 64)).unwrap();
+        let shape = LiquidShape {
+            rect: Rect::from_xywh(8.0, 8.0, 48.0, 48.0),
+            radius: 12.0,
+        };
+        let material = LiquidMaterial::island(1.0)
+            .with_optics(2.0, 0.4)
+            .with_tint(1.0);
+        assert!(draw_liquid_glass(
+            surface.canvas(),
+            &backdrop,
+            &shape,
+            &material,
+            1.0,
+            1.0,
+        ));
+    }
+
+    /// frost 着色器能在 CPU 光栅画布上完整走通（降采样 + 单遍模糊）。
+    #[test]
+    fn frost_shader_draws_on_raster_canvas() {
+        let effect = frost_effect().unwrap();
+        let mut source_surface = surfaces::raster_n32_premul(ISize::new(16, 16)).unwrap();
+        source_surface
+            .canvas()
+            .clear(Color::from_argb(255, 100, 150, 200));
+        let source = source_surface.image_snapshot();
+        let mut target = surfaces::raster_n32_premul(ISize::new(8, 8)).unwrap();
+        let reduced = frost_pass(&effect, &source, &mut target, FrostPass::Reduce(2.0)).unwrap();
+        let mut target = surfaces::raster_n32_premul(ISize::new(8, 8)).unwrap();
+        assert!(
+            frost_pass(
+                &effect,
+                &reduced,
+                &mut target,
+                FrostPass::Blur([1.0, 0.0], 1.5)
+            )
+            .is_some()
+        );
+    }
 }

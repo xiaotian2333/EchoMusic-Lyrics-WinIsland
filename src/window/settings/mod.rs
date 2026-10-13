@@ -64,6 +64,12 @@ const TRANSLATION_KEYS: &[&str] = &[
     "style_mica",
     "style_dynamic",
     "style_liquid_glass",
+    "liquid_glass_blur",
+    "liquid_glass_refraction",
+    "liquid_glass_dispersion",
+    "liquid_glass_tint",
+    "liquid_glass_siri",
+    "liquid_glass_siri_note",
     "custom_font",
     "font_select",
     "font_reset",
@@ -280,6 +286,10 @@ fn normalize_config(config: &mut AppConfig) {
     config.base_height = config.base_height.max(15.0);
     config.expanded_width = config.expanded_width.max(200.0);
     config.expanded_height = config.expanded_height.max(100.0);
+    config.liquid_glass_blur = config.liquid_glass_blur.clamp(0.0, 30.0);
+    config.liquid_glass_refraction = config.liquid_glass_refraction.clamp(0.0, 400.0);
+    config.liquid_glass_dispersion = config.liquid_glass_dispersion.clamp(0.0, 100.0);
+    config.liquid_glass_tint = config.liquid_glass_tint.clamp(0.0, 200.0);
     config.font_size = config.font_size.clamp(0.0, 30.0);
     config.auto_hide_delay = config.auto_hide_delay.clamp(1.0, 60.0);
     config.hover_to_hide_distance = config.hover_to_hide_distance.clamp(50.0, 300.0);
