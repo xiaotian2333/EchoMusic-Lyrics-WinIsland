@@ -1,0 +1,29 @@
+[package]
+name = "host-backdrop"
+version = "1.2.13"
+edition = "2024"
+description = "WinIsland 原版毛玻璃宿主背板：DWM 宿主背板画笔 + DirectComposition 合成视觉"
+
+[dependencies]
+log = "0.4"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
+    "Win32_UI_WindowsAndMessaging",
+    "Foundation",
+    "Graphics_Effects",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
+] }
+# #[implement] 宏展开使用 ::windows_core 绝对路径，必须与上面的 windows 同版本
+windows-core = "0.62"
+windows-collections = "0.3"
+windows-numerics = "0.3"

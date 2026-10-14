@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod core;
+mod gpu;
 mod icons;
 mod ui;
 mod utils;
@@ -103,6 +104,8 @@ fn main() {
         utils::updater::start_update_checker();
 
         let event_loop = EventLoop::new().unwrap();
+        // 注册唤醒代理：屏幕捕获回调通过它请求主线程重绘
+        crate::gpu::set_wake_proxy(event_loop.create_proxy());
         let mut app = App::default();
         let result = event_loop.run_app(&mut app);
         let restart_requested = app.take_restart_requested();

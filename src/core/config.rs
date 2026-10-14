@@ -152,6 +152,20 @@ pub struct AppConfig {
     pub motion_blur: bool,
     #[serde(default = "default_island_style")]
     pub island_style: String,
+    #[serde(default = "default_liquid_glass_blur")]
+    pub liquid_glass_blur: f32,
+    #[serde(default = "default_liquid_glass_refraction")]
+    pub liquid_glass_refraction: f32,
+    #[serde(default = "default_liquid_glass_dispersion")]
+    pub liquid_glass_dispersion: f32,
+    #[serde(default = "default_liquid_glass_tint")]
+    pub liquid_glass_tint: f32,
+    #[serde(default = "default_liquid_glass_siri")]
+    pub liquid_glass_siri: bool,
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: f32,
+    #[serde(default = "default_lyrics_transition_animation")]
+    pub lyrics_transition_animation: String,
     #[serde(default = "default_show_lyrics")]
     pub show_lyrics: bool,
     #[serde(default = "default_custom_font")]
@@ -226,6 +240,36 @@ pub struct AppConfig {
 
 fn default_island_style() -> String {
     "default".to_string()
+}
+
+fn default_liquid_glass_blur() -> f32 {
+    6.0
+}
+
+fn default_liquid_glass_refraction() -> f32 {
+    200.0
+}
+
+fn default_liquid_glass_dispersion() -> f32 {
+    40.0
+}
+
+fn default_liquid_glass_tint() -> f32 {
+    100.0
+}
+
+fn default_liquid_glass_siri() -> bool {
+    false
+}
+
+/// 毛玻璃额外模糊量，与 WinIsland 一致默认为 0（只使用宿主背板本身）。
+fn default_glass_blur() -> f32 {
+    0.0
+}
+
+/// 迷你歌词切换动画，与 WinIsland 一致默认为「模糊滑动」。
+fn default_lyrics_transition_animation() -> String {
+    "blur".to_string()
 }
 
 fn default_show_lyrics() -> bool {
@@ -388,6 +432,13 @@ impl Default for AppConfig {
             expanded_height: 200.0,
             motion_blur: true,
             island_style: "default".to_string(),
+            liquid_glass_blur: 6.0,
+            liquid_glass_refraction: 200.0,
+            liquid_glass_dispersion: 40.0,
+            liquid_glass_tint: 100.0,
+            liquid_glass_siri: false,
+            glass_blur: 0.0,
+            lyrics_transition_animation: "blur".to_string(),
             show_lyrics: true,
             custom_font_path: None,
             auto_start: false,

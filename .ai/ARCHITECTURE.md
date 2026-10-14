@@ -33,6 +33,7 @@ src/
 │   └── settings.rs
 ├── ui/expanded/       Expanded island views
 │   ├── music_view.rs  Music player page (album art, controls, progress)
+│   ├── spectrum.rs    WinIsland spectrum visualizer (cover color mesh / default gradient)
 │   └── widget_view.rs Widget/page view for additional content
 ├── utils/             Utilities
 │   ├── autostart.rs   Registry-based auto-start
@@ -42,13 +43,23 @@ src/
 │   ├── font.rs        Font manager with caching
 │   ├── glass.rs       Frosted glass effect (GDI capture + blur + dark overlay)
 │   ├── icon.rs        Helper for loading/rendering icon bitmaps
-│   ├── liquid_glass.rs Advanced refractive liquid glass effect (SKSL shader)
+│   ├── liquid_glass.rs Refractive liquid glass (WinIsland liquid.sksl + frost blur)
 │   ├── mouse.rs       Global cursor position, hit-test, fullscreen detection
 │   ├── physics.rs     Spring physics for smooth animations
 │   ├── process.rs     Process discovery & external app detection
 │   ├── scroll.rs      Scroll container helpers
 │   ├── updater.rs     Nightly release check + download
 │   └── win32.rs       Raw Win32 API wrappers (topmost, window styles, etc.)
+├── gpu/               WinIsland-style GPU pipeline (D3D12 + DirectComposition + WGC)
+│   ├── mod.rs         GpuIsland orchestration, wake proxy, shared types
+│   ├── device.rs      D3D12 device + Skia Ganesh D3D12 context
+│   ├── target.rs      Composition swap chain render target
+│   ├── backdrop.rs    Shared texture + GPU frost pipeline
+│   └── capture.rs     Windows.Graphics.Capture screen capture
+├── crates/host-backdrop/  WinIsland frosted-glass host backdrop (separate crate)
+│   ├── lib.rs         DWM host backdrop brush + DirectComposition visual tree
+│   ├── blur.rs        D2D1 GaussianBlur IGraphicsEffectD2D1Interop implementation
+│   └── styles.rs      DWMWA_USE_HOSTBACKDROPBRUSH / acrylic fallback
 └── window/
     ├── app.rs         Main App struct — event loop, state, input, orchestration
     ├── tray.rs        System tray icon + context menu
@@ -63,6 +74,7 @@ The application runs on winit's **Poll** event loop in [app.rs](src/window/app.r
 
 ```
 resumed() → create window (transparent, topmost, skip-taskbar)
+           → create hidden companion backdrop window (no redirection bitmap)
            → create softbuffer surface
            → create Skia thread-local surface
 
@@ -86,15 +98,28 @@ RedrawRequested → draw_island():
   7. Draw spectrum visualizer bars
   8. Draw progress bar
   9. Draw mini controls (play/pause/prev/next)
-  10. Read Skia surface pixels → softbuffer → present
+  10. Read Skia surface pixels → softbuffer → present (liquid_glass with an active
+     GPU pipeline draws on the DirectComposition swap chain instead, bypassing softbuffer)
 ```
 
 Each style draws its background differently:
-- **glass**: GDI screen capture → heavy blur → dark multiply blend
-- **liquid_glass**: GDI screen capture → moderate blur → SKSL shader (refraction + specular)
+- **glass**: WinIsland original host backdrop — a companion window with the DWM host
+  backdrop brush (`DWMWA_USE_HOSTBACKDROPBRUSH`) composites the real desktop content
+  below the island through DirectComposition, clipped to the island's rounded rect with
+  an optional D2D Gaussian blur (`glass_blur`); the island itself only paints a
+  translucent dark overlay. Falls back to the CPU path (GDI capture → heavy blur →
+  dark multiply blend) when the host backdrop is unavailable
+- **liquid_glass**: GPU path (WinIsland original) — D3D12 + DirectComposition swap chain, Windows.Graphics.Capture backdrop via shared texture/fences, GPU frost + liquid.sksl refraction; falls back to CPU path (GDI capture → frost → liquid.sksl) when GPU or capture is unavailable
 - **mica**: GDI screen capture (downscaled) → blur → dark overlay
 - **dynamic**: Solid color extracted from album art palette
 - **default**: Solid black
+
+Mini lyric transitions follow WinIsland's three modes (`lyrics_transition_animation`):
+`blur` (10px offset + smoothstep-driven blur), `slide` (offset only) and `fade`
+(no offset, old line fades out in the first half, new line fades in during the second).
+Spectrum bars use WinIsland's visualizer: a 16x16 color mesh derived from the album
+cover (OKLab/LCh binning → 2x3 dominant colors → smoothstep mesh) sampled per bar, or a
+diagonal three-stop gradient when no cover is available.
 
 ---
 

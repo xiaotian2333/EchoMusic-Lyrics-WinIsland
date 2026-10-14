@@ -22,12 +22,14 @@ use crate::core::config::{
     AppConfig, DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE,
 };
 use crate::core::lyrics::{
-    LyricCharacter, current_character_index, current_lyric_index, filtered_lyric_text,
+    LyricCharacter, LyricLine, current_character_index, current_lyric_index, filtered_lyric_text,
 };
 use crate::core::lyrics_ws::normalize_volume_value;
 use crate::core::media_info::MediaInfo;
 use crate::core::persistence::load_config;
-use crate::core::render::{draw_island, get_mini_control_rects, get_mini_visualizer_hit_rect};
+use crate::core::render::{
+    draw_island, draw_island_canvas, get_mini_control_rects, get_mini_visualizer_hit_rect,
+};
 use crate::core::ws_media::WsMediaListener;
 use crate::ui::expanded::music_view::{
     get_expanded_visualizer_hit_rect, get_favorite_btn_rect, get_music_info_rect,
@@ -50,6 +52,12 @@ use crate::utils::process::get_foreground_process_name;
 use crate::window::tray::{TrayAction, TrayManager};
 
 const MINI_LYRIC_LOOP_GAP: f32 = 48.0;
+/// GPU 渲染管线初始化失败后的重试间隔。
+const GPU_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// 毛玻璃宿主背板初始化失败后的重试间隔。
+const HOST_BACKDROP_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// 毛玻璃伴随窗口标题；仅用于调试识别，不显示在任务栏。
+const BACKDROP_WINDOW_TITLE: &str = "EchoMusic-Lyrics-WinIsland Backdrop";
 const VOLUME_WHEEL_SLOW_STEP: f32 = 2.0;
 const VOLUME_WHEEL_MEDIUM_STEP: f32 = 4.0;
 const VOLUME_WHEEL_FAST_STEP: f32 = 8.0;
@@ -81,6 +89,13 @@ pub struct App {
     last_media_playing: bool,
     current_lyric_text: String,
     old_lyric_text: String,
+    /// 当前歌词行在 `lyrics` 中的下标；与 `current_lyric_text` 同时确定，
+    /// 逐字数据以它为准，避免重绘时按位置重新解析而与显示的行错位
+    current_lyric_line_idx: Option<usize>,
+    /// 本帧的逐字状态；歌词切换时转存到 old_lyric_chars
+    rendered_lyric_chars: Option<LyricCharsSnapshot>,
+    /// 上一行的逐字状态，过渡动画期间用于保留旧行的已唱/未唱配色
+    old_lyric_chars: Option<LyricCharsSnapshot>,
     lyric_transition: f32,
     lyrics_filter_pattern_cache: String,
     lyrics_filter_regex_cache: Option<Regex>,
@@ -113,6 +128,13 @@ pub struct App {
     hover_to_hide_enter_at: Option<Instant>,
     last_volume_wheel_at: Option<Instant>,
     pending_volume: Option<f32>,
+    gpu_island: Option<crate::gpu::GpuIsland>,
+    gpu_retry_at: Option<Instant>,
+    backdrop_window: Option<Arc<Window>>,
+    backdrop_hwnd_raw: Option<isize>,
+    host_backdrop: Option<crate::gpu::HostBackdrop>,
+    host_backdrop_retry_at: Option<Instant>,
+    hwnd_raw: Option<isize>,
 }
 
 impl Default for App {
@@ -144,6 +166,9 @@ impl Default for App {
             last_media_playing: false,
             current_lyric_text: String::new(),
             old_lyric_text: String::new(),
+            current_lyric_line_idx: None,
+            rendered_lyric_chars: None,
+            old_lyric_chars: None,
             lyric_transition: 1.0,
             lyrics_filter_pattern_cache: String::new(),
             lyrics_filter_regex_cache: None,
@@ -176,6 +201,13 @@ impl Default for App {
             hover_to_hide_enter_at: None,
             last_volume_wheel_at: None,
             pending_volume: None,
+            gpu_island: None,
+            gpu_retry_at: None,
+            backdrop_window: None,
+            backdrop_hwnd_raw: None,
+            host_backdrop: None,
+            host_backdrop_retry_at: None,
+            hwnd_raw: None,
         }
     }
 }
@@ -188,6 +220,17 @@ struct IslandLayout {
     hide_distance: f64,
     hidden_handle_y: f64,
     hidden_handle_h: f64,
+}
+
+/// 逐字渲染状态快照：歌词数据 + 行下标 + 当前字下标与字内进度。
+///
+/// 歌词切换时把它转存为旧行的状态，过渡动画期间旧行才能保持已唱/未唱配色。
+#[derive(Clone)]
+struct LyricCharsSnapshot {
+    lyrics: Arc<Vec<LyricLine>>,
+    line_idx: usize,
+    char_idx: usize,
+    char_progress: f32,
 }
 
 struct MiniLyricCharacterData<'a> {
@@ -1012,6 +1055,10 @@ impl App {
                     self.visible = !self.visible;
                     window.set_visible(self.visible);
                     tray.update_item_text(self.visible);
+                    if !self.visible {
+                        // 主岛隐藏时同步收起毛玻璃背板，避免伴随窗口留在屏幕上
+                        self.update_host_backdrop(None, 0.0);
+                    }
                 }
                 TrayAction::OpenSettings => {
                     if let Ok(exe) = std::env::current_exe() {
@@ -1029,6 +1076,138 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 按当前样式维护 GPU 渲染管线：liquid_glass 时惰性创建，其他样式释放。
+    fn ensure_gpu_island(&mut self) {
+        if self.config.island_style != "liquid_glass" {
+            if self.gpu_island.is_some() {
+                // Drop 会分离 DirectComposition 视觉树并关闭捕获会话
+                self.gpu_island = None;
+            }
+            return;
+        }
+        if self.gpu_island.is_some() {
+            return;
+        }
+        if let Some(retry_at) = self.gpu_retry_at
+            && retry_at.elapsed() < GPU_RETRY_INTERVAL
+        {
+            return;
+        }
+        let Some(hwnd_raw) = self.hwnd_raw else {
+            return;
+        };
+        if self.os_w == 0 || self.os_h == 0 {
+            return;
+        }
+        match crate::gpu::GpuIsland::new(hwnd_raw, self.os_w, self.os_h) {
+            Ok(gpu) => {
+                self.gpu_island = Some(gpu);
+                self.gpu_retry_at = None;
+                // GPU 模式由合成视觉树呈现；清空软缓冲，避免旧 CPU 画面从透明区域透出
+                if let Some(surface) = self.surface.as_mut()
+                    && let Ok(mut buffer) = surface.buffer_mut()
+                {
+                    for p in buffer.iter_mut() {
+                        *p = 0;
+                    }
+                    let _ = buffer.present();
+                }
+            }
+            Err(error) => {
+                log::warn!("GPU 渲染管线初始化失败，使用 CPU 液态玻璃路径: {error}");
+                self.gpu_retry_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// GPU 渲染失败时释放管线并进入冷却，下一帧回退到 CPU 路径。
+    fn fail_gpu_island(&mut self, error: &str) {
+        log::warn!("GPU 渲染失败，回退到 CPU 液态玻璃路径: {error}");
+        self.gpu_island = None;
+        self.gpu_retry_at = Some(Instant::now());
+    }
+
+    /// 按当前样式维护毛玻璃宿主背板：glass 时惰性创建，其他样式释放。
+    fn ensure_host_backdrop(&mut self) {
+        if self.config.island_style != "glass" {
+            // Drop 会隐藏伴随窗口并关闭合成目标
+            self.host_backdrop = None;
+            return;
+        }
+        if self.host_backdrop.is_some() {
+            return;
+        }
+        if let Some(retry_at) = self.host_backdrop_retry_at
+            && retry_at.elapsed() < HOST_BACKDROP_RETRY_INTERVAL
+        {
+            return;
+        }
+        let (Some(main_hwnd), Some(backdrop_hwnd)) = (self.hwnd_raw, self.backdrop_hwnd_raw) else {
+            return;
+        };
+        match crate::gpu::HostBackdrop::new(main_hwnd, backdrop_hwnd) {
+            Ok(host_backdrop) => {
+                self.host_backdrop = Some(host_backdrop);
+                self.host_backdrop_retry_at = None;
+            }
+            Err(error) => {
+                log::warn!("毛玻璃宿主背板初始化失败，使用 CPU 截屏毛玻璃路径: {error}");
+                self.host_backdrop_retry_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 释放宿主背板并进入冷却，下一帧回退到 CPU 截屏毛玻璃。
+    fn fail_host_backdrop(&mut self, error: &str) {
+        log::warn!("毛玻璃宿主背板更新失败，回退到 CPU 截屏毛玻璃路径: {error}");
+        self.host_backdrop = None;
+        self.host_backdrop_retry_at = Some(Instant::now());
+    }
+
+    /// 同步宿主背板形状与磨砂程度；`shape` 为 None 时隐藏背板窗口。
+    fn update_host_backdrop(&mut self, shape: Option<crate::gpu::HostBackdropShape>, blur: f32) {
+        let Some(host_backdrop) = self.host_backdrop.as_ref() else {
+            return;
+        };
+        if let Err(error) = host_backdrop.update(shape, blur) {
+            self.fail_host_backdrop(&error);
+        }
+    }
+
+    /// 岛屿在屏幕上的矩形与磨砂程度；`hide_progress` 会把矩形一起推出屏幕。
+    fn host_backdrop_frame(&self, progress: f32) -> (Option<crate::gpu::HostBackdropShape>, f32) {
+        if !self.visible {
+            return (None, 0.0);
+        }
+        let layout = crate::core::render::LayoutParams {
+            current_w: self.spring_w.value,
+            current_h: self.spring_h.value,
+            current_r: self.spring_r.value,
+            os_w: self.os_w,
+            os_h: self.os_h,
+            sigmas: (0.0, 0.0),
+            expansion_progress: progress,
+            view_offset: self.spring_view.value,
+            non_expanded_scale: self.config.non_expanded_scale,
+            expanded_scale: self.config.expanded_scale,
+            hide_progress: self.spring_hide.value,
+            dock_position: self.effective_dock_position,
+        };
+        let (offset_x, offset_y) = crate::core::render::island_offset(&layout);
+        let scale = self.config.non_expanded_scale
+            + (self.config.expanded_scale - self.config.non_expanded_scale) * progress;
+        (
+            Some(crate::gpu::HostBackdropShape {
+                screen_x: self.win_x as f32 + offset_x,
+                screen_y: self.win_y as f32 + offset_y,
+                width: self.spring_w.value,
+                height: self.spring_h.value,
+                radius: self.spring_r.value,
+            }),
+            self.config.glass_blur * scale,
+        )
     }
 
     fn reload_config_if_changed(&mut self, window: &Window) {
@@ -1071,6 +1250,13 @@ impl App {
                         }
                     }
                 }
+                // 样式切换时释放 GPU 管线（Drop 会分离合成视觉树并关闭捕获会话）；
+                // 进入液态玻璃时清除冷却，下一帧立即尝试重建
+                self.gpu_island = None;
+                self.gpu_retry_at = None;
+                // 毛玻璃宿主背板同理：Drop 会隐藏伴随窗口并关闭合成目标
+                self.host_backdrop = None;
+                self.host_backdrop_retry_at = None;
             }
 
             if old_mini_shape != self.config.mini_cover_shape
@@ -1106,6 +1292,11 @@ impl App {
                         std::num::NonZeroU32::new(self.os_w.max(1)).unwrap(),
                         std::num::NonZeroU32::new(self.os_h.max(1)).unwrap(),
                     );
+                }
+                let (gpu_w, gpu_h) = (self.os_w, self.os_h);
+                let gpu_resize = self.gpu_island.as_mut().map(|gpu| gpu.resize(gpu_w, gpu_h));
+                if let Some(Err(error)) = gpu_resize {
+                    self.fail_gpu_island(&error);
                 }
             }
 
@@ -1252,6 +1443,14 @@ impl App {
 }
 
 impl ApplicationHandler for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // 捕获回调或权限回调唤醒主线程重绘
+        crate::gpu::take_wake_pending();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
         if self.window.is_none() {
@@ -1275,6 +1474,7 @@ impl ApplicationHandler for App {
             if let Ok(handle) = window.window_handle()
                 && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
             {
+                self.hwnd_raw = Some(win32_handle.hwnd.get());
                 let hwnd = HWND(win32_handle.hwnd.get() as _);
                 crate::utils::win32::modify_window_ex_style(
                     hwnd,
@@ -1292,6 +1492,31 @@ impl ApplicationHandler for App {
             }
 
             self.window = Some(window.clone());
+
+            // 毛玻璃伴随窗口：只承载 DWM 宿主背板合成视觉，始终隐藏，由宿主背板按需显示
+            let backdrop_attrs = Window::default_attributes()
+                .with_title(BACKDROP_WINDOW_TITLE)
+                .with_inner_size(PhysicalSize::new(1, 1))
+                .with_transparent(true)
+                .with_no_redirection_bitmap(true)
+                .with_visible(false)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_enabled_buttons(WindowButtons::empty())
+                .with_window_level(WindowLevel::AlwaysOnTop)
+                .with_skip_taskbar(true);
+            if let Ok(backdrop) = event_loop.create_window(backdrop_attrs) {
+                // 背板窗口只负责合成，不参与命中测试
+                let _ = backdrop.set_cursor_hittest(false);
+                if let Ok(handle) = backdrop.window_handle()
+                    && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
+                {
+                    self.backdrop_hwnd_raw = Some(win32_handle.hwnd.get());
+                }
+                self.backdrop_window = Some(Arc::new(backdrop));
+            } else {
+                log::warn!("毛玻璃伴随窗口创建失败，毛玻璃将使用 CPU 截屏路径");
+            }
 
             let mut monitor_opt = None;
             for _ in 0..10 {
@@ -1396,7 +1621,9 @@ impl ApplicationHandler for App {
                     }
                     let is_hidden = self.is_hidden();
                     let progress = self.expansion_progress();
-                    if let Some(surface) = self.surface.as_mut() {
+                    self.ensure_gpu_island();
+                    self.ensure_host_backdrop();
+                    if self.surface.is_some() {
                         let dt =
                             (self.last_frame_time.elapsed().as_secs_f32() * 60.0).clamp(0.1, 3.0);
                         let sigmas = if self.config.motion_blur {
@@ -1430,29 +1657,32 @@ impl ApplicationHandler for App {
 
                         let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
                         let lyric_current_pos = media_info.effective_position_ms(delay_ms);
+                        // 逐字数据必须取自正在显示的那一行：行下标由 about_to_wait 与文本同时确定，
+                        // 这里只按位置推进字下标；否则重绘先于 about_to_wait 执行时会取到下一行，
+                        // 把下一行的字形（未播放色）按满不透明度画出来
                         let mut char_data =
                             if self.config.lyrics_char_highlight && self.config.show_lyrics {
-                                media_info.current_character_data(delay_ms)
+                                self.current_lyric_line_idx.and_then(|line_idx| {
+                                    let lyrics = media_info.lyrics.as_ref()?;
+                                    let characters = lyrics.get(line_idx)?.characters.as_ref()?;
+                                    current_character_index(characters, lyric_current_pos)
+                                        .map(|idx| (characters.as_slice(), idx))
+                                })
                             } else {
                                 None
                             };
                         if char_data.is_some() && self.config.lyrics_filter_scope.filters_desktop()
                         {
-                            let lyrics = media_info.lyrics.as_ref();
-                            let is_filtered = lyrics
-                                .and_then(|ly| {
-                                    let idx = current_lyric_index(ly, lyric_current_pos)?;
-                                    if self
-                                        .lyrics_filter_regex_cache
-                                        .as_ref()
-                                        .is_some_and(|r| r.is_match(ly[idx].text.trim()))
-                                    {
-                                        Some(())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .is_some();
+                            // 与逐字数据同源，按显示的行判断是否被过滤
+                            let line_text = self
+                                .current_lyric_line_idx
+                                .and_then(|idx| media_info.lyrics.as_ref()?.get(idx))
+                                .map(|line| line.text.trim().to_string());
+                            let is_filtered = line_text.is_some_and(|text| {
+                                self.lyrics_filter_regex_cache
+                                    .as_ref()
+                                    .is_some_and(|regex| regex.is_match(&text))
+                            });
                             if is_filtered {
                                 char_data = None;
                             }
@@ -1475,6 +1705,15 @@ impl ApplicationHandler for App {
                         let lyric_line_has_characters = char_data.is_some();
                         let current_characters = char_data.as_ref().map(|(c, _)| *c);
                         let current_char_idx = char_data.map(|(_, i)| i);
+                        // 记录本帧逐字状态：歌词切换时它会转存为旧行状态
+                        self.rendered_lyric_chars = current_char_idx.and_then(|char_idx| {
+                            Some(LyricCharsSnapshot {
+                                lyrics: media_info.lyrics.clone()?,
+                                line_idx: self.current_lyric_line_idx?,
+                                char_idx,
+                                char_progress: current_char_progress.unwrap_or(1.0),
+                            })
+                        });
                         let char_color_unplayed =
                             parse_hex_color(&self.config.lyrics_char_color_unplayed);
                         let char_color_played =
@@ -1482,69 +1721,127 @@ impl ApplicationHandler for App {
                         let lyric_scroll_loop_gap =
                             MINI_LYRIC_LOOP_GAP * self.config.non_expanded_scale;
 
-                        let widget_animating = draw_island(
-                            surface,
-                            crate::core::render::DrawIslandParams {
-                                layout: crate::core::render::LayoutParams {
-                                    current_w: self.spring_w.value,
-                                    current_h: self.spring_h.value,
-                                    current_r: self.spring_r.value,
-                                    os_w: self.os_w,
-                                    os_h: self.os_h,
-                                    sigmas,
-                                    expansion_progress: progress,
-                                    view_offset: self.spring_view.value,
-                                    non_expanded_scale: self.config.non_expanded_scale,
-                                    expanded_scale: self.config.expanded_scale,
-                                    hide_progress: self.spring_hide.value,
-                                    dock_position: self.effective_dock_position,
-                                },
-                                media: crate::core::render::MediaParams {
-                                    media: &media_info,
-                                    music_active,
-                                },
-                                lyrics: crate::core::render::LyricsParams {
-                                    current_lyric: &self.current_lyric_text,
-                                    old_lyric: &self.old_lyric_text,
-                                    lyric_transition: self.lyric_transition,
-                                    lyric_scroll_active: self.lyric_scroll_active,
-                                    lyric_scroll_offset: self.lyric_scroll_offset,
-                                    lyric_scroll_loop: self.config.lyrics_scroll
-                                        && self.config.lyrics_scroll_infinite_loop
-                                        && !lyric_line_has_characters
-                                        && self.lyric_scroll_active,
-                                    lyric_scroll_loop_gap,
-                                    current_characters,
-                                    current_char_idx,
-                                    current_char_progress,
-                                    char_color_unplayed,
-                                    char_color_played,
-                                    char_highlight: self.config.lyrics_char_highlight,
-                                    char_lift_animation: self.config.lyrics_char_lift_animation,
-                                },
-                                window: crate::core::render::WindowParams {
-                                    win_x: self.win_x,
-                                    win_y: self.win_y,
-                                    monitor_x: self.last_mon_pos.0,
-                                    monitor_y: self.last_mon_pos.1,
-                                    monitor_w: self.last_mon_size.0,
-                                    monitor_h: self.last_mon_size.1,
-                                },
-                                style: crate::core::render::StyleParams {
-                                    island_style: &self.config.island_style,
-                                    use_blur: self.config.motion_blur,
-                                    font_size: self.config.font_size,
-                                    mini_cover_shape: &self.config.mini_cover_shape,
-                                    expanded_cover_shape: &self.config.expanded_cover_shape,
-                                    cover_rotate: self.config.cover_rotate,
-                                    mini_controls: self.config.mini_controls,
-                                    lyrics_delay: self.config.lyrics_delay,
-                                    lyrics_filter_scope: self.config.lyrics_filter_scope,
-                                    lyrics_filter_regex: self.lyrics_filter_regex_cache.as_ref(),
-                                    dt,
-                                },
+                        // 毛玻璃宿主背板：先同步背板形状与磨砂程度，再绘制只含暗色覆盖层的岛
+                        let (backdrop_shape, backdrop_blur) = self.host_backdrop_frame(progress);
+                        self.update_host_backdrop(backdrop_shape, backdrop_blur);
+
+                        // 旧行的逐字状态：过渡期间保持它的已唱/未唱配色
+                        let old_lyric_chars = self.old_lyric_chars.as_ref().and_then(|snapshot| {
+                            let characters = snapshot
+                                .lyrics
+                                .get(snapshot.line_idx)?
+                                .characters
+                                .as_ref()?;
+                            Some(crate::core::render::OldLyricChars {
+                                characters: characters.as_slice(),
+                                char_idx: snapshot.char_idx,
+                                char_progress: snapshot.char_progress,
+                            })
+                        });
+
+                        let params = crate::core::render::DrawIslandParams {
+                            layout: crate::core::render::LayoutParams {
+                                current_w: self.spring_w.value,
+                                current_h: self.spring_h.value,
+                                current_r: self.spring_r.value,
+                                os_w: self.os_w,
+                                os_h: self.os_h,
+                                sigmas,
+                                expansion_progress: progress,
+                                view_offset: self.spring_view.value,
+                                non_expanded_scale: self.config.non_expanded_scale,
+                                expanded_scale: self.config.expanded_scale,
+                                hide_progress: self.spring_hide.value,
+                                dock_position: self.effective_dock_position,
                             },
-                        );
+                            media: crate::core::render::MediaParams {
+                                media: &media_info,
+                                music_active,
+                            },
+                            lyrics: crate::core::render::LyricsParams {
+                                current_lyric: &self.current_lyric_text,
+                                old_lyric: &self.old_lyric_text,
+                                old_chars: old_lyric_chars,
+                                lyric_transition: self.lyric_transition,
+                                lyric_scroll_active: self.lyric_scroll_active,
+                                lyric_scroll_offset: self.lyric_scroll_offset,
+                                lyric_scroll_loop: self.config.lyrics_scroll
+                                    && self.config.lyrics_scroll_infinite_loop
+                                    && !lyric_line_has_characters
+                                    && self.lyric_scroll_active,
+                                lyric_scroll_loop_gap,
+                                current_characters,
+                                current_char_idx,
+                                current_char_progress,
+                                char_color_unplayed,
+                                char_color_played,
+                                char_highlight: self.config.lyrics_char_highlight,
+                                char_lift_animation: self.config.lyrics_char_lift_animation,
+                            },
+                            window: crate::core::render::WindowParams {
+                                win_x: self.win_x,
+                                win_y: self.win_y,
+                                monitor_x: self.last_mon_pos.0,
+                                monitor_y: self.last_mon_pos.1,
+                                monitor_w: self.last_mon_size.0,
+                                monitor_h: self.last_mon_size.1,
+                            },
+                            style: crate::core::render::StyleParams {
+                                island_style: &self.config.island_style,
+                                use_blur: self.config.motion_blur,
+                                font_size: self.config.font_size,
+                                mini_cover_shape: &self.config.mini_cover_shape,
+                                expanded_cover_shape: &self.config.expanded_cover_shape,
+                                cover_rotate: self.config.cover_rotate,
+                                mini_controls: self.config.mini_controls,
+                                lyrics_delay: self.config.lyrics_delay,
+                                lyrics_filter_scope: self.config.lyrics_filter_scope,
+                                lyrics_filter_regex: self.lyrics_filter_regex_cache.as_ref(),
+                                dt,
+                                liquid_glass_blur: self.config.liquid_glass_blur,
+                                liquid_glass_refraction: self.config.liquid_glass_refraction,
+                                liquid_glass_dispersion: self.config.liquid_glass_dispersion,
+                                liquid_glass_tint: self.config.liquid_glass_tint,
+                                liquid_glass_siri: self.config.liquid_glass_siri,
+                                host_backdrop: self.host_backdrop.is_some(),
+                                lyrics_transition_animation: &self
+                                    .config
+                                    .lyrics_transition_animation,
+                            },
+                        };
+                        let mut gpu_error: Option<String> = None;
+                        let widget_animating = if let Some(gpu) = self.gpu_island.as_mut() {
+                            let liquid_scale = self.config.non_expanded_scale
+                                + (self.config.expanded_scale - self.config.non_expanded_scale)
+                                    * progress;
+                            let frost_sigma = self.config.liquid_glass_blur * liquid_scale;
+                            let animating =
+                                music_active || sigmas.0.abs() > 0.01 || sigmas.1.abs() > 0.01;
+                            let render_result = gpu.render(
+                                (self.win_x, self.win_y),
+                                (self.os_w, self.os_h),
+                                frost_sigma,
+                                animating,
+                                |canvas, backdrop| draw_island_canvas(canvas, params, backdrop),
+                            );
+                            match render_result {
+                                Ok(animating) => animating,
+                                Err(error) => {
+                                    gpu_error = Some(error);
+                                    false
+                                }
+                            }
+                        } else if let Some(surface) = self.surface.as_mut() {
+                            draw_island(surface, params)
+                        } else {
+                            false
+                        };
+                        if let Some(error) = gpu_error {
+                            self.fail_gpu_island(&error);
+                            if let Some(win) = &self.window {
+                                win.request_redraw();
+                            }
+                        }
                         if widget_animating && let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -1861,10 +2158,27 @@ impl ApplicationHandler for App {
         } else {
             None
         };
+        let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
+        let lyric_line_idx = media
+            .lyrics
+            .as_ref()
+            .and_then(|lyrics| current_lyric_index(lyrics, media.effective_position_ms(delay_ms)));
+        // 显示文本就是该行自身的文本时才认为行下标有效：
+        // 歌词过滤会把上一行的文本当作当前显示内容，那种情况下不应按行下标触发切换
+        let line_idx_is_displayed = current_lyric_opt.as_deref().is_some_and(|text| {
+            lyric_line_idx
+                .and_then(|idx| media.lyrics.as_ref()?.get(idx))
+                .is_some_and(|line| line.text == text)
+        });
         if let Some(lyric) = current_lyric_opt {
-            if lyric != self.current_lyric_text {
+            // 文本相同但行下标前进（重复歌词行）时同样要切换，否则逐字高亮不会重新开始
+            let line_advanced =
+                line_idx_is_displayed && lyric_line_idx != self.current_lyric_line_idx;
+            if lyric != self.current_lyric_text || line_advanced {
                 self.old_lyric_text = self.current_lyric_text.clone();
+                self.old_lyric_chars = self.rendered_lyric_chars.take();
                 self.current_lyric_text = lyric.clone();
+                self.current_lyric_line_idx = lyric_line_idx;
                 self.lyric_transition = 0.0;
                 self.lyric_scroll_offset = 0.0;
                 self.lyric_scroll_pause = 0.0;
@@ -1874,15 +2188,19 @@ impl ApplicationHandler for App {
             if self.current_lyric_text != fallback {
                 if !self.current_lyric_text.is_empty() {
                     self.old_lyric_text = self.current_lyric_text.clone();
+                    self.old_lyric_chars = self.rendered_lyric_chars.take();
                 }
                 self.current_lyric_text = fallback;
+                self.current_lyric_line_idx = None;
                 self.lyric_transition = 0.0;
                 self.lyric_scroll_offset = 0.0;
                 self.lyric_scroll_pause = 0.0;
             }
         } else if !is_paused && !self.current_lyric_text.is_empty() {
             self.old_lyric_text = self.current_lyric_text.clone();
+            self.old_lyric_chars = self.rendered_lyric_chars.take();
             self.current_lyric_text = String::new();
+            self.current_lyric_line_idx = None;
             self.lyric_transition = 0.0;
             self.lyric_scroll_offset = 0.0;
             self.lyric_scroll_pause = 0.0;

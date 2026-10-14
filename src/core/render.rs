@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
-    ClipOp, Color, FilterMode, ISize, MipmapMode, Paint, RRect, Rect, SamplingOptions,
+    Canvas, ClipOp, Color, FilterMode, ISize, MipmapMode, Paint, RRect, Rect, SamplingOptions,
     Surface as SkSurface, image_filters, surfaces,
 };
 use softbuffer::Surface;
@@ -14,16 +14,21 @@ use crate::core::lyrics::LyricCharacter;
 use crate::core::media_info::MediaInfo;
 use crate::icons::controls::draw_play_button;
 use crate::ui::expanded::music_view::{
-    DrawMusicPageParams, DrawVisualizerParams, draw_music_page, draw_text_cached, draw_visualizer,
-    get_cached_media_image, get_cached_media_image_with_key, get_media_palette,
-    get_visualizer_hit_rect,
+    DrawMusicPageParams, draw_music_page, draw_text_cached, get_cached_media_image,
+    get_cached_media_image_with_key, get_media_palette, get_visualizer_hit_rect,
+};
+use crate::ui::expanded::spectrum::{
+    DrawVisualizerParams, default_spectrum_fill, draw_visualizer, get_media_spectrum_fill,
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
 use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mica_background};
 use crate::utils::color::{color_with_alpha, lyric_boundary_gradient_shader};
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
-use crate::utils::liquid_glass::get_liquid_glass_background;
+use crate::utils::liquid_glass::{
+    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams,
+    draw_liquid_glass_with_backdrop, get_liquid_glass_background,
+};
 
 thread_local! {
     static SK_SURFACE: RefCell<Option<SkSurface>> = const { RefCell::new(None) };
@@ -31,6 +36,62 @@ thread_local! {
     static CHAR_LIFT_ANIM: RefCell<f32> = const { RefCell::new(1.0) };
     static LAST_CHAR_IDX: RefCell<Option<usize>> = const { RefCell::new(None) };
 
+}
+
+/// 歌词切换动画的模糊强度上限（与 WinIsland 一致）。
+const LYRIC_TRANSITION_BLUR_SIGMA: f32 = 6.0;
+/// 模糊的横向系数；纵向取满强度，形成纵向拖影（与 WinIsland 一致）。
+const LYRIC_TRANSITION_BLUR_X_SCALE: f32 = 0.25;
+/// 歌词切换时旧行滑出、新行滑入的位移（与 WinIsland 一致）。
+const LYRIC_TRANSITION_OFFSET: f32 = 10.0;
+/// 低于该模糊量时不再生成图像滤镜。
+const MIN_BLUR_SIGMA: f32 = 0.1;
+/// 逐字上浮动画速度，按 dt/60 归一化；4.0 约等于 0.25 秒完成一次上浮。
+///
+/// 三种切换动画共用同一速度：早期实现里带模糊的分支取了 0.25，比这慢 16 倍，
+/// 当前字在唱完前几乎不动，换字时直接跳到已上浮位置，看起来像瞬移。
+const CHAR_LIFT_SPEED: f32 = 4.0;
+
+/// 歌词切换进度缓动：WinIsland 使用 smoothstep 让进出更自然。
+fn lyric_transition_progress(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    progress * progress * (3.0 - 2.0 * progress)
+}
+
+/// 歌词切换动画参数：模糊强度、滑出位移、旧行透明度、新行透明度。
+///
+/// 与 WinIsland 一致：blur 与 slide 共用 10px 位移，blur 额外叠加模糊；
+/// fade 无位移无模糊，旧行在前半段淡出、新行在后半段淡入。
+fn lyric_transition_style(mode: &str, progress: f32) -> (f32, f32, f32, f32) {
+    let transition = lyric_transition_progress(progress);
+    match mode {
+        "slide" => (0.0, LYRIC_TRANSITION_OFFSET, 1.0 - transition, transition),
+        "fade" => (
+            0.0,
+            0.0,
+            1.0 - lyric_transition_progress(progress * 2.0),
+            lyric_transition_progress(progress * 2.0 - 1.0),
+        ),
+        _ => (
+            LYRIC_TRANSITION_BLUR_SIGMA,
+            LYRIC_TRANSITION_OFFSET,
+            1.0 - transition,
+            transition,
+        ),
+    }
+}
+
+/// 按 WinIsland 的模糊参数（横向 1/4、纵向满强度）生成歌词切换滤镜。
+fn lyric_transition_blur_filter(sigma: f32) -> Option<skia_safe::ImageFilter> {
+    if sigma <= MIN_BLUR_SIGMA {
+        return None;
+    }
+    image_filters::blur(
+        (sigma * LYRIC_TRANSITION_BLUR_X_SCALE, sigma),
+        None,
+        None,
+        None,
+    )
 }
 
 pub struct LayoutParams {
@@ -56,6 +117,8 @@ pub struct MediaParams<'a> {
 pub struct LyricsParams<'a> {
     pub current_lyric: &'a str,
     pub old_lyric: &'a str,
+    /// 旧行的逐字状态；Some 时过渡动画期间旧行保持已唱/未唱配色而不是退化成纯色
+    pub old_chars: Option<OldLyricChars<'a>>,
     pub lyric_transition: f32,
     pub lyric_scroll_active: bool,
     pub lyric_scroll_offset: f32,
@@ -68,6 +131,13 @@ pub struct LyricsParams<'a> {
     pub char_color_played: Option<Color>,
     pub char_highlight: bool,
     pub char_lift_animation: bool,
+}
+
+/// 旧行（正在离场的那一行）的逐字状态快照。
+pub struct OldLyricChars<'a> {
+    pub characters: &'a [LyricCharacter],
+    pub char_idx: usize,
+    pub char_progress: f32,
 }
 
 pub struct WindowParams {
@@ -91,6 +161,55 @@ pub struct StyleParams<'a> {
     pub lyrics_filter_scope: LyricsFilterScope,
     pub lyrics_filter_regex: Option<&'a regex::Regex>,
     pub dt: f32,
+    pub liquid_glass_blur: f32,
+    pub liquid_glass_refraction: f32,
+    pub liquid_glass_dispersion: f32,
+    pub liquid_glass_tint: f32,
+    pub liquid_glass_siri: bool,
+    /// 毛玻璃宿主背板是否已就绪；就绪时背景由合成视觉提供，这里只画暗色覆盖层
+    pub host_backdrop: bool,
+    /// 迷你歌词切换动画：blur / slide / fade（WinIsland 原版三选一）
+    pub lyrics_transition_animation: &'a str,
+}
+
+/// 计算岛屿在窗口内的左上角偏移；`layout.hide_progress` 会把岛屿推出屏幕。
+pub fn island_offset(layout: &LayoutParams) -> (f32, f32) {
+    let LayoutParams {
+        current_w,
+        current_h,
+        os_w,
+        os_h,
+        non_expanded_scale,
+        hide_progress,
+        dock_position,
+        ..
+    } = *layout;
+    let dock_bottom = dock_position.is_bottom();
+    let offset_x = if dock_position.is_left() {
+        PADDING / 2.0
+    } else if dock_position.is_right() {
+        (os_w as f32 - PADDING / 2.0 - current_w).max(0.0)
+    } else {
+        (os_w as f32 - current_w) / 2.0
+    };
+    let base_y = if dock_bottom {
+        os_h as f32 - PADDING / 2.0 - current_h
+    } else {
+        PADDING / 2.0
+    };
+    let hidden_peek_h = (5.0 * non_expanded_scale).max(3.0);
+    let hide_distance = if dock_bottom {
+        (current_h - hidden_peek_h).max(0.0)
+    } else {
+        (current_h - hidden_peek_h + TOP_OFFSET as f32).max(0.0)
+    };
+    let hide_y_offset = hide_progress * hide_distance;
+    let offset_y = if dock_bottom {
+        base_y + hide_y_offset
+    } else {
+        base_y - hide_y_offset
+    };
+    (offset_x, offset_y)
 }
 
 pub fn get_mini_visualizer_hit_rect(
@@ -148,6 +267,11 @@ fn lyric_character_boundary_x(
     }
 }
 
+/// 逐字上浮动画的每帧增量；`dt` 以 60fps 为 1.0 归一化。
+fn char_lift_step(dt: f32) -> f32 {
+    CHAR_LIFT_SPEED * dt / 60.0
+}
+
 struct DrawCurrentLyricCharactersParams<'a> {
     canvas: &'a skia_safe::Canvas,
     chars: &'a [LyricCharacter],
@@ -161,7 +285,8 @@ struct DrawCurrentLyricCharactersParams<'a> {
     resolved_char_played: Color,
     resolved_char_unplayed: Color,
     char_lift_animation: bool,
-    lift_speed: f32,
+    /// 是否推进全局逐字上浮进度；旧行只读取终态，不推进也不重置
+    advance_lift: bool,
     dt: f32,
     blur_filter: Option<&'a skia_safe::ImageFilter>,
 }
@@ -180,7 +305,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
         resolved_char_played,
         resolved_char_unplayed,
         char_lift_animation,
-        lift_speed,
+        advance_lift,
         dt,
         blur_filter,
     } = params;
@@ -200,7 +325,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
     let char_progress = current_char_progress.unwrap_or(0.5);
     let boundary_x = lyric_character_boundary_x(&char_widths, start_x, char_idx, char_progress);
     let mut char_x = start_x;
-    let anim_progress = if char_lift_animation {
+    let anim_progress = if char_lift_animation && advance_lift {
         CHAR_LIFT_ANIM.with(|cell| {
             LAST_CHAR_IDX.with(|last| {
                 let mut last = last.borrow_mut();
@@ -211,7 +336,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
             });
             let val = *cell.borrow();
             if val < 1.0 {
-                *cell.borrow_mut() += lift_speed * dt / 60.0;
+                *cell.borrow_mut() += char_lift_step(dt);
                 if *cell.borrow() > 1.0 {
                     *cell.borrow_mut() = 1.0;
                 }
@@ -219,6 +344,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
             *cell.borrow()
         })
     } else {
+        // 旧行或未开启上浮动画时直接取终态：已唱字停在已上浮位置，与当前行对齐
         1.0
     };
     let mut ch_paint = Paint::default();
@@ -263,9 +389,52 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
     }
 }
 
+/// CPU 光栅路径：把整帧绘制到软缓冲表面并呈现。
 pub fn draw_island(
     surface: &mut Surface<Arc<Window>, Arc<Window>>,
     params: DrawIslandParams<'_>,
+) -> bool {
+    let mut buffer = surface.buffer_mut().unwrap();
+    let (os_w, os_h) = (params.layout.os_w, params.layout.os_h);
+    let mut sk_surface = SK_SURFACE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if let Some(ref s) = *opt
+            && s.width() == os_w as i32
+            && s.height() == os_h as i32
+        {
+            return s.clone();
+        }
+        let new_surface =
+            surfaces::raster_n32_premul(ISize::new(os_w as i32, os_h as i32)).unwrap();
+        *opt = Some(new_surface.clone());
+        new_surface
+    });
+    let widget_animating = draw_island_canvas(sk_surface.canvas(), params, None);
+
+    let info = skia_safe::ImageInfo::new(
+        skia_safe::ISize::new(os_w as i32, os_h as i32),
+        skia_safe::ColorType::BGRA8888,
+        skia_safe::AlphaType::Premul,
+        None,
+    );
+    let dst_row_bytes = (os_w * 4) as usize;
+    let u8_buffer: &mut [u8] = bytemuck::cast_slice_mut(&mut buffer);
+    let _ = sk_surface.read_pixels(&info, u8_buffer, dst_row_bytes, (0, 0));
+    if let Err(e) = buffer.present() {
+        log::error!("Present failed: {:?}", e);
+    }
+
+    widget_animating
+}
+
+/// 在任意 Skia 画布上绘制整帧（CPU 光栅路径与 GPU 合成交换链共用）。
+///
+/// `gpu_backdrop` 为 WinIsland 风格 GPU 渲染管线提供的屏幕背板；
+/// 为 None 时液态玻璃分支回退到 CPU 截屏实现。
+pub fn draw_island_canvas(
+    canvas: &Canvas,
+    params: DrawIslandParams<'_>,
+    gpu_backdrop: Option<&LiquidBackdrop>,
 ) -> bool {
     let DrawIslandParams {
         layout,
@@ -275,6 +444,7 @@ pub fn draw_island(
         style,
     } = params;
 
+    let (offset_x, offset_y) = island_offset(&layout);
     let LayoutParams {
         current_w,
         current_h,
@@ -287,7 +457,7 @@ pub fn draw_island(
         non_expanded_scale,
         expanded_scale,
         hide_progress,
-        dock_position,
+        dock_position: _,
     } = layout;
     let MediaParams {
         media,
@@ -296,6 +466,7 @@ pub fn draw_island(
     let LyricsParams {
         current_lyric,
         old_lyric,
+        old_chars,
         lyric_transition,
         lyric_scroll_active,
         lyric_scroll_offset,
@@ -329,49 +500,15 @@ pub fn draw_island(
         lyrics_filter_scope,
         lyrics_filter_regex,
         dt,
+        liquid_glass_blur,
+        liquid_glass_refraction,
+        liquid_glass_dispersion,
+        liquid_glass_tint,
+        liquid_glass_siri,
+        host_backdrop,
+        lyrics_transition_animation,
     } = style;
-    let mut buffer = surface.buffer_mut().unwrap();
-    let mut sk_surface = SK_SURFACE.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if let Some(ref s) = *opt
-            && s.width() == os_w as i32
-            && s.height() == os_h as i32
-        {
-            return s.clone();
-        }
-        let new_surface =
-            surfaces::raster_n32_premul(ISize::new(os_w as i32, os_h as i32)).unwrap();
-        *opt = Some(new_surface.clone());
-        new_surface
-    });
-    let canvas = sk_surface.canvas();
     canvas.clear(Color::TRANSPARENT);
-
-    let dock_bottom = dock_position.is_bottom();
-    let offset_x = if dock_position.is_left() {
-        PADDING / 2.0
-    } else if dock_position.is_right() {
-        (os_w as f32 - PADDING / 2.0 - current_w).max(0.0)
-    } else {
-        (os_w as f32 - current_w) / 2.0
-    };
-    let base_y = if dock_bottom {
-        os_h as f32 - PADDING / 2.0 - current_h
-    } else {
-        PADDING / 2.0
-    };
-    let hidden_peek_h = (5.0 * non_expanded_scale).max(3.0);
-    let hide_distance = if dock_bottom {
-        (current_h - hidden_peek_h).max(0.0)
-    } else {
-        (current_h - hidden_peek_h + TOP_OFFSET as f32).max(0.0)
-    };
-    let hide_y_offset = hide_progress * hide_distance;
-    let offset_y = if dock_bottom {
-        base_y + hide_y_offset
-    } else {
-        base_y - hide_y_offset
-    };
 
     let rect = Rect::from_xywh(offset_x, offset_y, current_w, current_h);
     let rrect = RRect::new_rect_xy(rect, current_r, current_r);
@@ -419,59 +556,96 @@ pub fn draw_island(
     };
 
     if island_style == "liquid_glass" {
-        let screen_x = win_x + offset_x as i32;
-        let screen_y = win_y + offset_y as i32;
-
-        let mut shadow_paint = Paint::default();
-        shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(Color::from_argb(50, 0, 0, 0));
-        if let Some(filter) = image_filters::blur((5.0, 5.0), None, None, None) {
-            shadow_paint.set_image_filter(filter);
-        }
-        let shadow_rrect = RRect::new_rect_xy(
-            Rect::from_xywh(offset_x, offset_y + 2.0, current_w, current_h),
-            current_r,
-            current_r,
-        );
-        canvas.draw_rrect(shadow_rrect, &shadow_paint);
-
-        canvas.save();
-        canvas.clip_rrect(rrect, ClipOp::Intersect, true);
-
-        if let Some(bg_img) = get_liquid_glass_background(
-            screen_x,
-            screen_y,
-            current_w as u32,
-            current_h as u32,
-            current_r,
-            monitor_x,
-            monitor_y,
-            monitor_w,
-            monitor_h,
-        ) {
-            let mut paint = Paint::default();
-            paint.set_anti_alias(true);
-            let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-            canvas.draw_image_rect_with_sampling_options(&bg_img, None, rect, sampling, &paint);
+        let liquid_scale =
+            non_expanded_scale + (expanded_scale - non_expanded_scale) * expansion_progress;
+        let draw_params = LiquidGlassDrawParams {
+            offset_x,
+            offset_y,
+            width: current_w,
+            height: current_h,
+            corner_radius: current_r,
+            scale: liquid_scale,
+            refraction: liquid_glass_refraction / 100.0,
+            dispersion: liquid_glass_dispersion / 100.0,
+            tint: liquid_glass_tint / 100.0,
+            siri: liquid_glass_siri,
+        };
+        // GPU 路径使用 WinIsland 原版渲染管线提供的背板；否则回退到 CPU 截屏实现
+        let drawn = if let Some(backdrop) = gpu_backdrop {
+            draw_liquid_glass_with_backdrop(canvas, backdrop, &draw_params)
         } else {
+            match get_liquid_glass_background(&LiquidGlassParams {
+                win_x,
+                win_y,
+                os_w,
+                os_h,
+                offset_x,
+                offset_y,
+                width: current_w,
+                height: current_h,
+                corner_radius: current_r,
+                scale: liquid_scale,
+                blur: liquid_glass_blur,
+                refraction: liquid_glass_refraction / 100.0,
+                dispersion: liquid_glass_dispersion / 100.0,
+                tint: liquid_glass_tint / 100.0,
+                siri: liquid_glass_siri,
+                monitor_x,
+                monitor_y,
+                monitor_w,
+                monitor_h,
+            }) {
+                Some(frame) => {
+                    let mut paint = Paint::default();
+                    paint.set_anti_alias(true);
+                    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+                    let dst = Rect::from_xywh(
+                        offset_x - frame.margin,
+                        offset_y - frame.margin,
+                        frame.image.width() as f32,
+                        frame.image.height() as f32,
+                    );
+                    canvas.draw_image_rect_with_sampling_options(
+                        &frame.image,
+                        None,
+                        dst,
+                        sampling,
+                        &paint,
+                    );
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if !drawn {
             let mut bg_paint = Paint::default();
             bg_paint.set_color(Color::from_argb(180, 32, 32, 36));
             bg_paint.set_anti_alias(true);
             canvas.draw_rrect(rrect, &bg_paint);
         }
-    } else if island_style == "glass" {
-        let screen_x = win_x + offset_x as i32;
-        let screen_y = win_y + offset_y as i32;
+
         canvas.save();
         canvas.clip_rrect(rrect, ClipOp::Intersect, true);
-        if let Some(bg_img) = get_glass_background(
-            screen_x,
-            screen_y,
+    } else if island_style == "glass" {
+        canvas.save();
+        canvas.clip_rrect(rrect, ClipOp::Intersect, true);
+        if host_backdrop {
+            // WinIsland 原版毛玻璃：真实桌面内容由伴随窗口的宿主背板合成视觉提供，
+            // 主岛这里只叠加一层半透明暗色覆盖，保证前景文字可读
+            let mut host_paint = Paint::default();
+            host_paint.set_color(Color::from_argb(150, 10, 10, 14));
+            host_paint.set_anti_alias(true);
+            canvas.draw_rrect(rrect, &host_paint);
+        } else if let Some(bg_img) = get_glass_background(
+            win_x + offset_x as i32,
+            win_y + offset_y as i32,
             current_w as u32,
             current_h as u32,
             40.0 * (non_expanded_scale
                 + (expanded_scale - non_expanded_scale) * expansion_progress),
         ) {
+            // 宿主背板不可用时回退到 CPU 截屏毛玻璃
             let mut paint = Paint::default();
             paint.set_anti_alias(true);
             let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
@@ -556,6 +730,13 @@ pub fn draw_island(
             .unwrap_or(text_color)
     });
 
+    // 频谱填充：可见时取封面主色网格，不可见时用默认配色（避免无谓的解码开销）
+    let spectrum_fill = if expanded_alpha_f > 0.01 || mini_alpha_f > 0.01 {
+        get_media_spectrum_fill(media)
+    } else {
+        default_spectrum_fill()
+    };
+
     let viz_h_scale = 0.45 + (1.0 - 0.45) * expansion_progress;
 
     let mut widget_animating = false;
@@ -592,7 +773,7 @@ pub fn draw_island(
             dt,
             text_color,
             text_color_sec,
-            palette: palette.clone(),
+            spectrum_fill: &spectrum_fill,
         });
         canvas.restore();
 
@@ -716,7 +897,6 @@ pub fn draw_island(
                 widget_animating = true;
             }
         }
-        let palette = &palette;
         let viz_x = offset_x + current_w - 17.0 * non_expanded_scale;
         let viz_y = offset_y + current_h / 2.0;
         draw_visualizer(DrawVisualizerParams {
@@ -725,7 +905,7 @@ pub fn draw_island(
             y: viz_y,
             alpha,
             is_playing: media.is_playing,
-            palette,
+            fill: &spectrum_fill,
             spectrum: &media.spectrum,
             w_scale: 0.55 * non_expanded_scale,
             h_scale: viz_h_scale * non_expanded_scale,
@@ -776,225 +956,141 @@ pub fn draw_island(
                 let clip_rect = Rect::from_xywh(space_left, offset_y, available_w, current_h);
                 canvas.clip_rect(clip_rect, ClipOp::Intersect, true);
 
-                if use_blur {
-                    if lyric_transition < 1.0 && !old_lyric.is_empty() {
-                        let mut text_paint = Paint::default();
-                        text_paint.set_anti_alias(true);
-                        let fade_alpha = (alpha as f32 * (1.0 - lyric_transition)) as u8;
-                        text_paint.set_color(Color::from_argb(
-                            fade_alpha,
-                            text_color.r(),
-                            text_color.g(),
-                            text_color.b(),
-                        ));
+                // 歌词切换动画：与 WinIsland 一致，在 blur / slide / fade 三选一
+                let (blur_sigma, offset, old_opacity, new_opacity) =
+                    lyric_transition_style(lyrics_transition_animation, lyric_transition);
+                let transition = lyric_transition_progress(lyric_transition);
+                let center_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
 
-                        let blur_sigma = lyric_transition * 12.0 * non_expanded_scale;
-                        if blur_sigma > 0.1 {
-                            text_paint.set_image_filter(image_filters::blur(
-                                (blur_sigma, 0.0),
-                                None,
-                                None,
-                                None,
-                            ));
-                        }
-
-                        let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale
-                            - (10.0 * non_expanded_scale * lyric_transition);
-                        let old_lx = if text_centered {
-                            let w = FontManager::global().measure_text_cached(
-                                old_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            text_x - w / 2.0
-                        } else {
-                            text_x
-                        };
-                        draw_text_cached(DrawTextCachedParams {
-                            canvas,
-                            text: old_lyric,
-                            x: old_lx,
-                            y: text_y,
-                            size: lyric_font_sz,
-                            bold: false,
-                            paint: &text_paint,
-                        });
-                    }
-
-                    if !current_lyric.is_empty() {
-                        let mut text_paint = Paint::default();
-                        text_paint.set_anti_alias(true);
-                        let fade_alpha = (alpha as f32 * lyric_transition) as u8;
-
-                        let blur_sigma = (1.0 - lyric_transition) * 12.0 * non_expanded_scale;
-                        let blur_filter = if blur_sigma > 0.1 {
-                            image_filters::blur((blur_sigma, 0.0), None, None, None)
-                        } else {
-                            None
-                        };
-
-                        let text_y = offset_y
-                            + current_h / 2.0
-                            + 4.0 * non_expanded_scale
-                            + (10.0 * non_expanded_scale * (1.0 - lyric_transition));
-
-                        if let (Some(chars), Some(char_idx)) =
-                            (current_characters, current_char_idx)
-                        {
+                if old_opacity > 0.0 && !old_lyric.is_empty() {
+                    let old_alpha = (alpha as f32 * old_opacity) as u8;
+                    let old_blur = lyric_transition_blur_filter(
+                        transition * transition * blur_sigma * non_expanded_scale,
+                    );
+                    let text_y = center_y - offset * non_expanded_scale * transition;
+                    // 有逐字状态时按逐字绘制，保留旧行的已唱/未唱配色与字位；
+                    // 滚动循环需要整行重复绘制，此时退回纯文本路径
+                    match old_chars.filter(|_| !lyric_scroll_loop) {
+                        Some(old) => {
                             draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
                                 canvas,
-                                chars,
-                                char_idx,
-                                current_char_progress,
+                                chars: old.characters,
+                                char_idx: old.char_idx,
+                                current_char_progress: Some(old.char_progress),
                                 text_x,
                                 text_y,
                                 text_centered,
                                 lyric_font_sz,
-                                fade_alpha,
+                                fade_alpha: old_alpha,
                                 resolved_char_played,
                                 resolved_char_unplayed,
                                 char_lift_animation,
-                                lift_speed: 0.25,
+                                advance_lift: false,
                                 dt,
-                                blur_filter: blur_filter.as_ref(),
+                                blur_filter: old_blur.as_ref(),
                             });
-                        } else {
-                            text_paint.set_color(Color::from_argb(
-                                fade_alpha,
-                                text_color.r(),
-                                text_color.g(),
-                                text_color.b(),
-                            ));
-                            if let Some(ref filter) = blur_filter {
-                                text_paint.set_image_filter(filter.clone());
-                            }
-                            let current_text_w = FontManager::global().measure_text_cached(
-                                current_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            let cur_lx = if text_centered {
-                                text_x - current_text_w / 2.0
-                            } else {
-                                text_x
-                            };
-                            draw_text_cached(DrawTextCachedParams {
-                                canvas,
-                                text: current_lyric,
-                                x: cur_lx,
-                                y: text_y,
-                                size: lyric_font_sz,
-                                bold: false,
-                                paint: &text_paint,
-                            });
-                            if lyric_scroll_loop && !text_centered {
-                                draw_text_cached(DrawTextCachedParams {
-                                    canvas,
-                                    text: current_lyric,
-                                    x: cur_lx + current_text_w + lyric_scroll_loop_gap,
-                                    y: text_y,
-                                    size: lyric_font_sz,
-                                    bold: false,
-                                    paint: &text_paint,
-                                });
-                            }
                         }
-                    }
-                } else {
-                    let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
-                    if lyric_transition < 0.5 && !old_lyric.is_empty() {
-                        let mut text_paint = Paint::default();
-                        text_paint.set_anti_alias(true);
-                        let progress = lyric_transition * 2.0;
-                        let fade_alpha = (alpha as f32 * (1.0 - progress)) as u8;
-                        text_paint.set_color(Color::from_argb(
-                            fade_alpha,
-                            text_color.r(),
-                            text_color.g(),
-                            text_color.b(),
-                        ));
-                        let old_lx2 = if text_centered {
-                            let w = FontManager::global().measure_text_cached(
-                                old_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            text_x - w / 2.0
-                        } else {
-                            text_x
-                        };
-                        draw_text_cached(DrawTextCachedParams {
-                            canvas,
-                            text: old_lyric,
-                            x: old_lx2,
-                            y: text_y,
-                            size: lyric_font_sz,
-                            bold: false,
-                            paint: &text_paint,
-                        });
-                    } else if lyric_transition >= 0.5 && !current_lyric.is_empty() {
-                        let progress = (lyric_transition - 0.5) * 2.0;
-                        let fade_alpha = (alpha as f32 * progress) as u8;
-
-                        if let (Some(chars), Some(char_idx)) =
-                            (current_characters, current_char_idx)
-                        {
-                            draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
-                                canvas,
-                                chars,
-                                char_idx,
-                                current_char_progress,
-                                text_x,
-                                text_y,
-                                text_centered,
-                                lyric_font_sz,
-                                fade_alpha,
-                                resolved_char_played,
-                                resolved_char_unplayed,
-                                char_lift_animation,
-                                lift_speed: 4.0,
-                                dt,
-                                blur_filter: None,
-                            });
-                        } else {
+                        None => {
                             let mut text_paint = Paint::default();
                             text_paint.set_anti_alias(true);
                             text_paint.set_color(Color::from_argb(
-                                fade_alpha,
+                                old_alpha,
                                 text_color.r(),
                                 text_color.g(),
                                 text_color.b(),
                             ));
-                            let current_text_w = FontManager::global().measure_text_cached(
-                                current_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            let cur_lx2 = if text_centered {
-                                text_x - current_text_w / 2.0
+                            if let Some(filter) = old_blur {
+                                text_paint.set_image_filter(filter);
+                            }
+                            let old_lx = if text_centered {
+                                let w = FontManager::global().measure_text_cached(
+                                    old_lyric,
+                                    lyric_font_sz,
+                                    skia_safe::FontStyle::normal(),
+                                );
+                                text_x - w / 2.0
                             } else {
                                 text_x
                             };
                             draw_text_cached(DrawTextCachedParams {
                                 canvas,
-                                text: current_lyric,
-                                x: cur_lx2,
+                                text: old_lyric,
+                                x: old_lx,
                                 y: text_y,
                                 size: lyric_font_sz,
                                 bold: false,
                                 paint: &text_paint,
                             });
-                            if lyric_scroll_loop && !text_centered {
-                                draw_text_cached(DrawTextCachedParams {
-                                    canvas,
-                                    text: current_lyric,
-                                    x: cur_lx2 + current_text_w + lyric_scroll_loop_gap,
-                                    y: text_y,
-                                    size: lyric_font_sz,
-                                    bold: false,
-                                    paint: &text_paint,
-                                });
-                            }
+                        }
+                    }
+                }
+
+                if new_opacity > 0.0 && !current_lyric.is_empty() {
+                    let fade_alpha = (alpha as f32 * new_opacity) as u8;
+                    let text_y = center_y + offset * non_expanded_scale * (1.0 - transition);
+                    let blur_filter = lyric_transition_blur_filter(
+                        (1.0 - transition) * (1.0 - transition) * blur_sigma * non_expanded_scale,
+                    );
+
+                    if let (Some(chars), Some(char_idx)) = (current_characters, current_char_idx) {
+                        draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
+                            canvas,
+                            chars,
+                            char_idx,
+                            current_char_progress,
+                            text_x,
+                            text_y,
+                            text_centered,
+                            lyric_font_sz,
+                            fade_alpha,
+                            resolved_char_played,
+                            resolved_char_unplayed,
+                            char_lift_animation,
+                            advance_lift: true,
+                            dt,
+                            blur_filter: blur_filter.as_ref(),
+                        });
+                    } else {
+                        let mut text_paint = Paint::default();
+                        text_paint.set_anti_alias(true);
+                        text_paint.set_color(Color::from_argb(
+                            fade_alpha,
+                            text_color.r(),
+                            text_color.g(),
+                            text_color.b(),
+                        ));
+                        if let Some(ref filter) = blur_filter {
+                            text_paint.set_image_filter(filter.clone());
+                        }
+                        let current_text_w = FontManager::global().measure_text_cached(
+                            current_lyric,
+                            lyric_font_sz,
+                            skia_safe::FontStyle::normal(),
+                        );
+                        let cur_lx = if text_centered {
+                            text_x - current_text_w / 2.0
+                        } else {
+                            text_x
+                        };
+                        draw_text_cached(DrawTextCachedParams {
+                            canvas,
+                            text: current_lyric,
+                            x: cur_lx,
+                            y: text_y,
+                            size: lyric_font_sz,
+                            bold: false,
+                            paint: &text_paint,
+                        });
+                        if lyric_scroll_loop && !text_centered {
+                            draw_text_cached(DrawTextCachedParams {
+                                canvas,
+                                text: current_lyric,
+                                x: cur_lx + current_text_w + lyric_scroll_loop_gap,
+                                y: text_y,
+                                size: lyric_font_sz,
+                                bold: false,
+                                paint: &text_paint,
+                            });
                         }
                     }
                 }
@@ -1025,19 +1121,6 @@ pub fn draw_island(
             current_r,
         );
         canvas.draw_rrect(border_rrect, &border_paint);
-    }
-
-    let info = skia_safe::ImageInfo::new(
-        skia_safe::ISize::new(os_w as i32, os_h as i32),
-        skia_safe::ColorType::BGRA8888,
-        skia_safe::AlphaType::Premul,
-        None,
-    );
-    let dst_row_bytes = (os_w * 4) as usize;
-    let u8_buffer: &mut [u8] = bytemuck::cast_slice_mut(&mut buffer);
-    let _ = sk_surface.read_pixels(&info, u8_buffer, dst_row_bytes, (0, 0));
-    if let Err(e) = buffer.present() {
-        log::error!("Present failed: {:?}", e);
     }
 
     widget_animating
@@ -1071,4 +1154,117 @@ pub fn get_mini_control_rects(
 
     // Only the play/pause button is rendered; prev/next are invisible.
     (None, Some(play_rect), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LYRIC_TRANSITION_BLUR_SIGMA, LYRIC_TRANSITION_OFFSET, char_lift_step,
+        lyric_transition_progress, lyric_transition_style,
+    };
+
+    #[test]
+    fn lyric_transition_progress_is_smoothstep() {
+        assert_eq!(lyric_transition_progress(0.0), 0.0);
+        assert_eq!(lyric_transition_progress(0.5), 0.5);
+        assert_eq!(lyric_transition_progress(1.0), 1.0);
+        // 越界输入被夹紧，避免过渡结束后继续漂移
+        assert_eq!(lyric_transition_progress(-1.0), 0.0);
+        assert_eq!(lyric_transition_progress(2.0), 1.0);
+    }
+
+    #[test]
+    fn lyric_transition_style_matches_winisland_modes() {
+        let (blur, offset, old_alpha, new_alpha) = lyric_transition_style("blur", 0.0);
+        assert_eq!(blur, LYRIC_TRANSITION_BLUR_SIGMA);
+        assert_eq!(offset, LYRIC_TRANSITION_OFFSET);
+        assert_eq!((old_alpha, new_alpha), (1.0, 0.0));
+
+        let (blur, offset, old_alpha, new_alpha) = lyric_transition_style("slide", 0.0);
+        assert_eq!(blur, 0.0);
+        assert_eq!(offset, LYRIC_TRANSITION_OFFSET);
+        assert_eq!((old_alpha, new_alpha), (1.0, 0.0));
+
+        // fade 无位移无模糊，且前半段只有旧行、后半段只有新行
+        let (blur, offset, old_alpha, new_alpha) = lyric_transition_style("fade", 0.25);
+        assert_eq!((blur, offset), (0.0, 0.0));
+        assert_eq!((old_alpha, new_alpha), (0.5, 0.0));
+        let (_, _, old_alpha, new_alpha) = lyric_transition_style("fade", 0.75);
+        assert_eq!((old_alpha, new_alpha), (0.0, 0.5));
+    }
+
+    #[test]
+    fn lyric_transition_style_unknown_mode_falls_back_to_blur() {
+        assert_eq!(
+            lyric_transition_style("random", 0.0),
+            lyric_transition_style("blur", 0.0)
+        );
+    }
+
+    /// 逐字上浮必须在当前字唱完前走完，否则换字时会看到瞬移。
+    #[test]
+    fn char_lift_finishes_quickly_enough() {
+        // dt = 1.0 对应 60fps 下的标准帧步进
+        let frames = 1.0 / char_lift_step(1.0);
+        assert!(
+            frames <= 30.0,
+            "逐字上浮耗时过长，看起来像瞬移: {frames} 帧"
+        );
+        assert!(frames >= 2.0, "逐字上浮过快，会失去动画感: {frames} 帧");
+    }
+
+    /// 旧行渲染不得推进或重置当前行的逐字上浮进度，
+    /// 否则当前行的上浮动画会被每帧打断，退化成瞬移。
+    #[test]
+    fn old_line_does_not_touch_lift_progress() {
+        use super::{
+            CHAR_LIFT_ANIM, DrawCurrentLyricCharactersParams, draw_current_lyric_characters,
+        };
+        use crate::core::lyrics::LyricCharacter;
+        use skia_safe::{Color, ISize, surfaces};
+
+        let mut surface = surfaces::raster_n32_premul(ISize::new(160, 48)).unwrap();
+        let chars = [
+            LyricCharacter {
+                s: 0,
+                e: 500,
+                t: "你".to_string(),
+            },
+            LyricCharacter {
+                s: 500,
+                e: 1000,
+                t: "好".to_string(),
+            },
+        ];
+        let mut draw = |char_idx: usize, advance_lift: bool| {
+            draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
+                canvas: surface.canvas(),
+                chars: &chars,
+                char_idx,
+                current_char_progress: Some(0.5),
+                text_x: 8.0,
+                text_y: 24.0,
+                text_centered: false,
+                lyric_font_sz: 14.0,
+                fade_alpha: 255,
+                resolved_char_played: Color::BLUE,
+                resolved_char_unplayed: Color::WHITE,
+                char_lift_animation: true,
+                advance_lift,
+                dt: 1.0,
+                blur_filter: None,
+            });
+        };
+        for _ in 0..3 {
+            draw(0, true);
+        }
+        let before = CHAR_LIFT_ANIM.with(|cell| *cell.borrow());
+        assert!(
+            before > 0.0 && before < 1.0,
+            "当前行的上浮进度没有推进: {before}"
+        );
+        draw(1, false);
+        let after = CHAR_LIFT_ANIM.with(|cell| *cell.borrow());
+        assert_eq!(before, after, "旧行渲染改动了当前行的上浮进度");
+    }
 }
