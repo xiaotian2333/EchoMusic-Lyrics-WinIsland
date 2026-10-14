@@ -89,6 +89,9 @@ pub struct App {
     last_media_playing: bool,
     current_lyric_text: String,
     old_lyric_text: String,
+    /// 当前歌词行在 `lyrics` 中的下标；与 `current_lyric_text` 同时确定，
+    /// 逐字数据以它为准，避免重绘时按位置重新解析而与显示的行错位
+    current_lyric_line_idx: Option<usize>,
     /// 本帧的逐字状态；歌词切换时转存到 old_lyric_chars
     rendered_lyric_chars: Option<LyricCharsSnapshot>,
     /// 上一行的逐字状态，过渡动画期间用于保留旧行的已唱/未唱配色
@@ -163,6 +166,7 @@ impl Default for App {
             last_media_playing: false,
             current_lyric_text: String::new(),
             old_lyric_text: String::new(),
+            current_lyric_line_idx: None,
             rendered_lyric_chars: None,
             old_lyric_chars: None,
             lyric_transition: 1.0,
@@ -1653,29 +1657,32 @@ impl ApplicationHandler for App {
 
                         let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
                         let lyric_current_pos = media_info.effective_position_ms(delay_ms);
+                        // 逐字数据必须取自正在显示的那一行：行下标由 about_to_wait 与文本同时确定，
+                        // 这里只按位置推进字下标；否则重绘先于 about_to_wait 执行时会取到下一行，
+                        // 把下一行的字形（未播放色）按满不透明度画出来
                         let mut char_data =
                             if self.config.lyrics_char_highlight && self.config.show_lyrics {
-                                media_info.current_character_data(delay_ms)
+                                self.current_lyric_line_idx.and_then(|line_idx| {
+                                    let lyrics = media_info.lyrics.as_ref()?;
+                                    let characters = lyrics.get(line_idx)?.characters.as_ref()?;
+                                    current_character_index(characters, lyric_current_pos)
+                                        .map(|idx| (characters.as_slice(), idx))
+                                })
                             } else {
                                 None
                             };
                         if char_data.is_some() && self.config.lyrics_filter_scope.filters_desktop()
                         {
-                            let lyrics = media_info.lyrics.as_ref();
-                            let is_filtered = lyrics
-                                .and_then(|ly| {
-                                    let idx = current_lyric_index(ly, lyric_current_pos)?;
-                                    if self
-                                        .lyrics_filter_regex_cache
-                                        .as_ref()
-                                        .is_some_and(|r| r.is_match(ly[idx].text.trim()))
-                                    {
-                                        Some(())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .is_some();
+                            // 与逐字数据同源，按显示的行判断是否被过滤
+                            let line_text = self
+                                .current_lyric_line_idx
+                                .and_then(|idx| media_info.lyrics.as_ref()?.get(idx))
+                                .map(|line| line.text.trim().to_string());
+                            let is_filtered = line_text.is_some_and(|text| {
+                                self.lyrics_filter_regex_cache
+                                    .as_ref()
+                                    .is_some_and(|regex| regex.is_match(&text))
+                            });
                             if is_filtered {
                                 char_data = None;
                             }
@@ -1700,11 +1707,9 @@ impl ApplicationHandler for App {
                         let current_char_idx = char_data.map(|(_, i)| i);
                         // 记录本帧逐字状态：歌词切换时它会转存为旧行状态
                         self.rendered_lyric_chars = current_char_idx.and_then(|char_idx| {
-                            let lyrics = media_info.lyrics.clone()?;
-                            let line_idx = current_lyric_index(&lyrics, lyric_current_pos)?;
                             Some(LyricCharsSnapshot {
-                                lyrics,
-                                line_idx,
+                                lyrics: media_info.lyrics.clone()?,
+                                line_idx: self.current_lyric_line_idx?,
                                 char_idx,
                                 char_progress: current_char_progress.unwrap_or(1.0),
                             })
@@ -2153,11 +2158,27 @@ impl ApplicationHandler for App {
         } else {
             None
         };
+        let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
+        let lyric_line_idx = media
+            .lyrics
+            .as_ref()
+            .and_then(|lyrics| current_lyric_index(lyrics, media.effective_position_ms(delay_ms)));
+        // 显示文本就是该行自身的文本时才认为行下标有效：
+        // 歌词过滤会把上一行的文本当作当前显示内容，那种情况下不应按行下标触发切换
+        let line_idx_is_displayed = current_lyric_opt.as_deref().is_some_and(|text| {
+            lyric_line_idx
+                .and_then(|idx| media.lyrics.as_ref()?.get(idx))
+                .is_some_and(|line| line.text == text)
+        });
         if let Some(lyric) = current_lyric_opt {
-            if lyric != self.current_lyric_text {
+            // 文本相同但行下标前进（重复歌词行）时同样要切换，否则逐字高亮不会重新开始
+            let line_advanced =
+                line_idx_is_displayed && lyric_line_idx != self.current_lyric_line_idx;
+            if lyric != self.current_lyric_text || line_advanced {
                 self.old_lyric_text = self.current_lyric_text.clone();
                 self.old_lyric_chars = self.rendered_lyric_chars.take();
                 self.current_lyric_text = lyric.clone();
+                self.current_lyric_line_idx = lyric_line_idx;
                 self.lyric_transition = 0.0;
                 self.lyric_scroll_offset = 0.0;
                 self.lyric_scroll_pause = 0.0;
@@ -2170,6 +2191,7 @@ impl ApplicationHandler for App {
                     self.old_lyric_chars = self.rendered_lyric_chars.take();
                 }
                 self.current_lyric_text = fallback;
+                self.current_lyric_line_idx = None;
                 self.lyric_transition = 0.0;
                 self.lyric_scroll_offset = 0.0;
                 self.lyric_scroll_pause = 0.0;
@@ -2178,6 +2200,7 @@ impl ApplicationHandler for App {
             self.old_lyric_text = self.current_lyric_text.clone();
             self.old_lyric_chars = self.rendered_lyric_chars.take();
             self.current_lyric_text = String::new();
+            self.current_lyric_line_idx = None;
             self.lyric_transition = 0.0;
             self.lyric_scroll_offset = 0.0;
             self.lyric_scroll_pause = 0.0;
