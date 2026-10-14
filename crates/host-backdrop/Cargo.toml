@@ -2,6 +2,7 @@
 name = "host-backdrop"
 version = "1.2.13"
 edition = "2024"
+license = "GPL-3.0-only"
 description = "WinIsland 原版毛玻璃宿主背板：DWM 宿主背板画笔 + DirectComposition 合成视觉"
 
 [dependencies]

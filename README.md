@@ -66,7 +66,9 @@ EchoMusic-Lyrics-WinIsland 支持将自定义 TTF 字体编译时嵌入为默认
 
 ## 许可证
 
-[MIT](LICENSE)
+本项目以 [GNU General Public License v3.0](LICENSE) 发布。
+
+Copyright (C) 2026 EchoMusic-Lyrics-WinIsland contributors
 
 # 致谢
 
