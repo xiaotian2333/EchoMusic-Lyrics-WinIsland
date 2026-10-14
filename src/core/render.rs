@@ -117,6 +117,8 @@ pub struct MediaParams<'a> {
 pub struct LyricsParams<'a> {
     pub current_lyric: &'a str,
     pub old_lyric: &'a str,
+    /// 旧行的逐字状态；Some 时过渡动画期间旧行保持已唱/未唱配色而不是退化成纯色
+    pub old_chars: Option<OldLyricChars<'a>>,
     pub lyric_transition: f32,
     pub lyric_scroll_active: bool,
     pub lyric_scroll_offset: f32,
@@ -129,6 +131,13 @@ pub struct LyricsParams<'a> {
     pub char_color_played: Option<Color>,
     pub char_highlight: bool,
     pub char_lift_animation: bool,
+}
+
+/// 旧行（正在离场的那一行）的逐字状态快照。
+pub struct OldLyricChars<'a> {
+    pub characters: &'a [LyricCharacter],
+    pub char_idx: usize,
+    pub char_progress: f32,
 }
 
 pub struct WindowParams {
@@ -276,6 +285,8 @@ struct DrawCurrentLyricCharactersParams<'a> {
     resolved_char_played: Color,
     resolved_char_unplayed: Color,
     char_lift_animation: bool,
+    /// 是否推进全局逐字上浮进度；旧行只读取终态，不推进也不重置
+    advance_lift: bool,
     dt: f32,
     blur_filter: Option<&'a skia_safe::ImageFilter>,
 }
@@ -294,6 +305,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
         resolved_char_played,
         resolved_char_unplayed,
         char_lift_animation,
+        advance_lift,
         dt,
         blur_filter,
     } = params;
@@ -313,7 +325,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
     let char_progress = current_char_progress.unwrap_or(0.5);
     let boundary_x = lyric_character_boundary_x(&char_widths, start_x, char_idx, char_progress);
     let mut char_x = start_x;
-    let anim_progress = if char_lift_animation {
+    let anim_progress = if char_lift_animation && advance_lift {
         CHAR_LIFT_ANIM.with(|cell| {
             LAST_CHAR_IDX.with(|last| {
                 let mut last = last.borrow_mut();
@@ -332,6 +344,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
             *cell.borrow()
         })
     } else {
+        // 旧行或未开启上浮动画时直接取终态：已唱字停在已上浮位置，与当前行对齐
         1.0
     };
     let mut ch_paint = Paint::default();
@@ -453,6 +466,7 @@ pub fn draw_island_canvas(
     let LyricsParams {
         current_lyric,
         old_lyric,
+        old_chars,
         lyric_transition,
         lyric_scroll_active,
         lyric_scroll_offset,
@@ -949,39 +963,66 @@ pub fn draw_island_canvas(
                 let center_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
 
                 if old_opacity > 0.0 && !old_lyric.is_empty() {
-                    let mut text_paint = Paint::default();
-                    text_paint.set_anti_alias(true);
-                    text_paint.set_color(Color::from_argb(
-                        (alpha as f32 * old_opacity) as u8,
-                        text_color.r(),
-                        text_color.g(),
-                        text_color.b(),
-                    ));
-                    if let Some(filter) = lyric_transition_blur_filter(
+                    let old_alpha = (alpha as f32 * old_opacity) as u8;
+                    let old_blur = lyric_transition_blur_filter(
                         transition * transition * blur_sigma * non_expanded_scale,
-                    ) {
-                        text_paint.set_image_filter(filter);
-                    }
+                    );
                     let text_y = center_y - offset * non_expanded_scale * transition;
-                    let old_lx = if text_centered {
-                        let w = FontManager::global().measure_text_cached(
-                            old_lyric,
-                            lyric_font_sz,
-                            skia_safe::FontStyle::normal(),
-                        );
-                        text_x - w / 2.0
-                    } else {
-                        text_x
-                    };
-                    draw_text_cached(DrawTextCachedParams {
-                        canvas,
-                        text: old_lyric,
-                        x: old_lx,
-                        y: text_y,
-                        size: lyric_font_sz,
-                        bold: false,
-                        paint: &text_paint,
-                    });
+                    // 有逐字状态时按逐字绘制，保留旧行的已唱/未唱配色与字位；
+                    // 滚动循环需要整行重复绘制，此时退回纯文本路径
+                    match old_chars.filter(|_| !lyric_scroll_loop) {
+                        Some(old) => {
+                            draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
+                                canvas,
+                                chars: old.characters,
+                                char_idx: old.char_idx,
+                                current_char_progress: Some(old.char_progress),
+                                text_x,
+                                text_y,
+                                text_centered,
+                                lyric_font_sz,
+                                fade_alpha: old_alpha,
+                                resolved_char_played,
+                                resolved_char_unplayed,
+                                char_lift_animation,
+                                advance_lift: false,
+                                dt,
+                                blur_filter: old_blur.as_ref(),
+                            });
+                        }
+                        None => {
+                            let mut text_paint = Paint::default();
+                            text_paint.set_anti_alias(true);
+                            text_paint.set_color(Color::from_argb(
+                                old_alpha,
+                                text_color.r(),
+                                text_color.g(),
+                                text_color.b(),
+                            ));
+                            if let Some(filter) = old_blur {
+                                text_paint.set_image_filter(filter);
+                            }
+                            let old_lx = if text_centered {
+                                let w = FontManager::global().measure_text_cached(
+                                    old_lyric,
+                                    lyric_font_sz,
+                                    skia_safe::FontStyle::normal(),
+                                );
+                                text_x - w / 2.0
+                            } else {
+                                text_x
+                            };
+                            draw_text_cached(DrawTextCachedParams {
+                                canvas,
+                                text: old_lyric,
+                                x: old_lx,
+                                y: text_y,
+                                size: lyric_font_sz,
+                                bold: false,
+                                paint: &text_paint,
+                            });
+                        }
+                    }
                 }
 
                 if new_opacity > 0.0 && !current_lyric.is_empty() {
@@ -1005,6 +1046,7 @@ pub fn draw_island_canvas(
                             resolved_char_played,
                             resolved_char_unplayed,
                             char_lift_animation,
+                            advance_lift: true,
                             dt,
                             blur_filter: blur_filter.as_ref(),
                         });
@@ -1169,5 +1211,60 @@ mod tests {
             "逐字上浮耗时过长，看起来像瞬移: {frames} 帧"
         );
         assert!(frames >= 2.0, "逐字上浮过快，会失去动画感: {frames} 帧");
+    }
+
+    /// 旧行渲染不得推进或重置当前行的逐字上浮进度，
+    /// 否则当前行的上浮动画会被每帧打断，退化成瞬移。
+    #[test]
+    fn old_line_does_not_touch_lift_progress() {
+        use super::{
+            CHAR_LIFT_ANIM, DrawCurrentLyricCharactersParams, draw_current_lyric_characters,
+        };
+        use crate::core::lyrics::LyricCharacter;
+        use skia_safe::{Color, ISize, surfaces};
+
+        let mut surface = surfaces::raster_n32_premul(ISize::new(160, 48)).unwrap();
+        let chars = [
+            LyricCharacter {
+                s: 0,
+                e: 500,
+                t: "你".to_string(),
+            },
+            LyricCharacter {
+                s: 500,
+                e: 1000,
+                t: "好".to_string(),
+            },
+        ];
+        let mut draw = |char_idx: usize, advance_lift: bool| {
+            draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
+                canvas: surface.canvas(),
+                chars: &chars,
+                char_idx,
+                current_char_progress: Some(0.5),
+                text_x: 8.0,
+                text_y: 24.0,
+                text_centered: false,
+                lyric_font_sz: 14.0,
+                fade_alpha: 255,
+                resolved_char_played: Color::BLUE,
+                resolved_char_unplayed: Color::WHITE,
+                char_lift_animation: true,
+                advance_lift,
+                dt: 1.0,
+                blur_filter: None,
+            });
+        };
+        for _ in 0..3 {
+            draw(0, true);
+        }
+        let before = CHAR_LIFT_ANIM.with(|cell| *cell.borrow());
+        assert!(
+            before > 0.0 && before < 1.0,
+            "当前行的上浮进度没有推进: {before}"
+        );
+        draw(1, false);
+        let after = CHAR_LIFT_ANIM.with(|cell| *cell.borrow());
+        assert_eq!(before, after, "旧行渲染改动了当前行的上浮进度");
     }
 }

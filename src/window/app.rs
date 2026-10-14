@@ -22,7 +22,7 @@ use crate::core::config::{
     AppConfig, DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE,
 };
 use crate::core::lyrics::{
-    LyricCharacter, current_character_index, current_lyric_index, filtered_lyric_text,
+    LyricCharacter, LyricLine, current_character_index, current_lyric_index, filtered_lyric_text,
 };
 use crate::core::lyrics_ws::normalize_volume_value;
 use crate::core::media_info::MediaInfo;
@@ -89,6 +89,10 @@ pub struct App {
     last_media_playing: bool,
     current_lyric_text: String,
     old_lyric_text: String,
+    /// 本帧的逐字状态；歌词切换时转存到 old_lyric_chars
+    rendered_lyric_chars: Option<LyricCharsSnapshot>,
+    /// 上一行的逐字状态，过渡动画期间用于保留旧行的已唱/未唱配色
+    old_lyric_chars: Option<LyricCharsSnapshot>,
     lyric_transition: f32,
     lyrics_filter_pattern_cache: String,
     lyrics_filter_regex_cache: Option<Regex>,
@@ -159,6 +163,8 @@ impl Default for App {
             last_media_playing: false,
             current_lyric_text: String::new(),
             old_lyric_text: String::new(),
+            rendered_lyric_chars: None,
+            old_lyric_chars: None,
             lyric_transition: 1.0,
             lyrics_filter_pattern_cache: String::new(),
             lyrics_filter_regex_cache: None,
@@ -210,6 +216,17 @@ struct IslandLayout {
     hide_distance: f64,
     hidden_handle_y: f64,
     hidden_handle_h: f64,
+}
+
+/// 逐字渲染状态快照：歌词数据 + 行下标 + 当前字下标与字内进度。
+///
+/// 歌词切换时把它转存为旧行的状态，过渡动画期间旧行才能保持已唱/未唱配色。
+#[derive(Clone)]
+struct LyricCharsSnapshot {
+    lyrics: Arc<Vec<LyricLine>>,
+    line_idx: usize,
+    char_idx: usize,
+    char_progress: f32,
 }
 
 struct MiniLyricCharacterData<'a> {
@@ -1681,6 +1698,17 @@ impl ApplicationHandler for App {
                         let lyric_line_has_characters = char_data.is_some();
                         let current_characters = char_data.as_ref().map(|(c, _)| *c);
                         let current_char_idx = char_data.map(|(_, i)| i);
+                        // 记录本帧逐字状态：歌词切换时它会转存为旧行状态
+                        self.rendered_lyric_chars = current_char_idx.and_then(|char_idx| {
+                            let lyrics = media_info.lyrics.clone()?;
+                            let line_idx = current_lyric_index(&lyrics, lyric_current_pos)?;
+                            Some(LyricCharsSnapshot {
+                                lyrics,
+                                line_idx,
+                                char_idx,
+                                char_progress: current_char_progress.unwrap_or(1.0),
+                            })
+                        });
                         let char_color_unplayed =
                             parse_hex_color(&self.config.lyrics_char_color_unplayed);
                         let char_color_played =
@@ -1691,6 +1719,20 @@ impl ApplicationHandler for App {
                         // 毛玻璃宿主背板：先同步背板形状与磨砂程度，再绘制只含暗色覆盖层的岛
                         let (backdrop_shape, backdrop_blur) = self.host_backdrop_frame(progress);
                         self.update_host_backdrop(backdrop_shape, backdrop_blur);
+
+                        // 旧行的逐字状态：过渡期间保持它的已唱/未唱配色
+                        let old_lyric_chars = self.old_lyric_chars.as_ref().and_then(|snapshot| {
+                            let characters = snapshot
+                                .lyrics
+                                .get(snapshot.line_idx)?
+                                .characters
+                                .as_ref()?;
+                            Some(crate::core::render::OldLyricChars {
+                                characters: characters.as_slice(),
+                                char_idx: snapshot.char_idx,
+                                char_progress: snapshot.char_progress,
+                            })
+                        });
 
                         let params = crate::core::render::DrawIslandParams {
                             layout: crate::core::render::LayoutParams {
@@ -1714,6 +1756,7 @@ impl ApplicationHandler for App {
                             lyrics: crate::core::render::LyricsParams {
                                 current_lyric: &self.current_lyric_text,
                                 old_lyric: &self.old_lyric_text,
+                                old_chars: old_lyric_chars,
                                 lyric_transition: self.lyric_transition,
                                 lyric_scroll_active: self.lyric_scroll_active,
                                 lyric_scroll_offset: self.lyric_scroll_offset,
@@ -2113,6 +2156,7 @@ impl ApplicationHandler for App {
         if let Some(lyric) = current_lyric_opt {
             if lyric != self.current_lyric_text {
                 self.old_lyric_text = self.current_lyric_text.clone();
+                self.old_lyric_chars = self.rendered_lyric_chars.take();
                 self.current_lyric_text = lyric.clone();
                 self.lyric_transition = 0.0;
                 self.lyric_scroll_offset = 0.0;
@@ -2123,6 +2167,7 @@ impl ApplicationHandler for App {
             if self.current_lyric_text != fallback {
                 if !self.current_lyric_text.is_empty() {
                     self.old_lyric_text = self.current_lyric_text.clone();
+                    self.old_lyric_chars = self.rendered_lyric_chars.take();
                 }
                 self.current_lyric_text = fallback;
                 self.lyric_transition = 0.0;
@@ -2131,6 +2176,7 @@ impl ApplicationHandler for App {
             }
         } else if !is_paused && !self.current_lyric_text.is_empty() {
             self.old_lyric_text = self.current_lyric_text.clone();
+            self.old_lyric_chars = self.rendered_lyric_chars.take();
             self.current_lyric_text = String::new();
             self.lyric_transition = 0.0;
             self.lyric_scroll_offset = 0.0;
