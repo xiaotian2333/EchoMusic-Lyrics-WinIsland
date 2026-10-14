@@ -46,6 +46,11 @@ const LYRIC_TRANSITION_BLUR_X_SCALE: f32 = 0.25;
 const LYRIC_TRANSITION_OFFSET: f32 = 10.0;
 /// 低于该模糊量时不再生成图像滤镜。
 const MIN_BLUR_SIGMA: f32 = 0.1;
+/// 逐字上浮动画速度，按 dt/60 归一化；4.0 约等于 0.25 秒完成一次上浮。
+///
+/// 三种切换动画共用同一速度：早期实现里带模糊的分支取了 0.25，比这慢 16 倍，
+/// 当前字在唱完前几乎不动，换字时直接跳到已上浮位置，看起来像瞬移。
+const CHAR_LIFT_SPEED: f32 = 4.0;
 
 /// 歌词切换进度缓动：WinIsland 使用 smoothstep 让进出更自然。
 fn lyric_transition_progress(progress: f32) -> f32 {
@@ -253,6 +258,11 @@ fn lyric_character_boundary_x(
     }
 }
 
+/// 逐字上浮动画的每帧增量；`dt` 以 60fps 为 1.0 归一化。
+fn char_lift_step(dt: f32) -> f32 {
+    CHAR_LIFT_SPEED * dt / 60.0
+}
+
 struct DrawCurrentLyricCharactersParams<'a> {
     canvas: &'a skia_safe::Canvas,
     chars: &'a [LyricCharacter],
@@ -266,7 +276,6 @@ struct DrawCurrentLyricCharactersParams<'a> {
     resolved_char_played: Color,
     resolved_char_unplayed: Color,
     char_lift_animation: bool,
-    lift_speed: f32,
     dt: f32,
     blur_filter: Option<&'a skia_safe::ImageFilter>,
 }
@@ -285,7 +294,6 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
         resolved_char_played,
         resolved_char_unplayed,
         char_lift_animation,
-        lift_speed,
         dt,
         blur_filter,
     } = params;
@@ -316,7 +324,7 @@ fn draw_current_lyric_characters(params: DrawCurrentLyricCharactersParams<'_>) {
             });
             let val = *cell.borrow();
             if val < 1.0 {
-                *cell.borrow_mut() += lift_speed * dt / 60.0;
+                *cell.borrow_mut() += char_lift_step(dt);
                 if *cell.borrow() > 1.0 {
                     *cell.borrow_mut() = 1.0;
                 }
@@ -939,8 +947,6 @@ pub fn draw_island_canvas(
                     lyric_transition_style(lyrics_transition_animation, lyric_transition);
                 let transition = lyric_transition_progress(lyric_transition);
                 let center_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
-                // 逐字上浮速度沿用旧实现：带模糊的过渡更慢，避免拖影与位移叠加
-                let lift_speed = if blur_sigma > 0.0 { 0.25 } else { 4.0 };
 
                 if old_opacity > 0.0 && !old_lyric.is_empty() {
                     let mut text_paint = Paint::default();
@@ -999,7 +1005,6 @@ pub fn draw_island_canvas(
                             resolved_char_played,
                             resolved_char_unplayed,
                             char_lift_animation,
-                            lift_speed,
                             dt,
                             blur_filter: blur_filter.as_ref(),
                         });
@@ -1112,8 +1117,8 @@ pub fn get_mini_control_rects(
 #[cfg(test)]
 mod tests {
     use super::{
-        LYRIC_TRANSITION_BLUR_SIGMA, LYRIC_TRANSITION_OFFSET, lyric_transition_progress,
-        lyric_transition_style,
+        LYRIC_TRANSITION_BLUR_SIGMA, LYRIC_TRANSITION_OFFSET, char_lift_step,
+        lyric_transition_progress, lyric_transition_style,
     };
 
     #[test]
@@ -1152,5 +1157,17 @@ mod tests {
             lyric_transition_style("random", 0.0),
             lyric_transition_style("blur", 0.0)
         );
+    }
+
+    /// 逐字上浮必须在当前字唱完前走完，否则换字时会看到瞬移。
+    #[test]
+    fn char_lift_finishes_quickly_enough() {
+        // dt = 1.0 对应 60fps 下的标准帧步进
+        let frames = 1.0 / char_lift_step(1.0);
+        assert!(
+            frames <= 30.0,
+            "逐字上浮耗时过长，看起来像瞬移: {frames} 帧"
+        );
+        assert!(frames >= 2.0, "逐字上浮过快，会失去动画感: {frames} 帧");
     }
 }
