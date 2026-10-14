@@ -164,6 +164,8 @@ pub struct AppConfig {
     pub liquid_glass_siri: bool,
     #[serde(default = "default_glass_blur")]
     pub glass_blur: f32,
+    #[serde(default = "default_lyrics_transition_animation")]
+    pub lyrics_transition_animation: String,
     #[serde(default = "default_show_lyrics")]
     pub show_lyrics: bool,
     #[serde(default = "default_custom_font")]
@@ -263,6 +265,11 @@ fn default_liquid_glass_siri() -> bool {
 /// 毛玻璃额外模糊量，与 WinIsland 一致默认为 0（只使用宿主背板本身）。
 fn default_glass_blur() -> f32 {
     0.0
+}
+
+/// 迷你歌词切换动画，与 WinIsland 一致默认为「模糊滑动」。
+fn default_lyrics_transition_animation() -> String {
+    "blur".to_string()
 }
 
 fn default_show_lyrics() -> bool {
@@ -431,6 +438,7 @@ impl Default for AppConfig {
             liquid_glass_tint: 100.0,
             liquid_glass_siri: false,
             glass_blur: 0.0,
+            lyrics_transition_animation: "blur".to_string(),
             show_lyrics: true,
             custom_font_path: None,
             auto_start: false,

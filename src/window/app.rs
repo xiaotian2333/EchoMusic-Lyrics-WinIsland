@@ -1756,6 +1756,9 @@ impl ApplicationHandler for App {
                                 liquid_glass_tint: self.config.liquid_glass_tint,
                                 liquid_glass_siri: self.config.liquid_glass_siri,
                                 host_backdrop: self.host_backdrop.is_some(),
+                                lyrics_transition_animation: &self
+                                    .config
+                                    .lyrics_transition_animation,
                             },
                         };
                         let mut gpu_error: Option<String> = None;

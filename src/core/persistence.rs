@@ -34,6 +34,12 @@ pub fn load_config() -> AppConfig {
     config.liquid_glass_dispersion = config.liquid_glass_dispersion.clamp(0.0, 100.0);
     config.liquid_glass_tint = config.liquid_glass_tint.clamp(0.0, 200.0);
     config.glass_blur = config.glass_blur.clamp(0.0, 50.0);
+    if !matches!(
+        config.lyrics_transition_animation.as_str(),
+        "blur" | "slide" | "fade"
+    ) {
+        config.lyrics_transition_animation = AppConfig::default().lyrics_transition_animation;
+    }
     config.lyrics_scroll_max_width = config.lyrics_scroll_max_width.max(config.base_width + 35.0);
     if !config.spectrum_wheel_volume {
         config.non_expanded_wheel_volume = false;

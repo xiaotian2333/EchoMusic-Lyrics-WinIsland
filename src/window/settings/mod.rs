@@ -71,6 +71,10 @@ const TRANSLATION_KEYS: &[&str] = &[
     "liquid_glass_siri",
     "liquid_glass_siri_note",
     "glass_blur",
+    "lyrics_transition_animation",
+    "lyrics_transition_blur",
+    "lyrics_transition_slide",
+    "lyrics_transition_fade",
     "custom_font",
     "font_select",
     "font_reset",
@@ -292,6 +296,12 @@ fn normalize_config(config: &mut AppConfig) {
     config.liquid_glass_dispersion = config.liquid_glass_dispersion.clamp(0.0, 100.0);
     config.liquid_glass_tint = config.liquid_glass_tint.clamp(0.0, 200.0);
     config.glass_blur = config.glass_blur.clamp(0.0, 50.0);
+    if !matches!(
+        config.lyrics_transition_animation.as_str(),
+        "blur" | "slide" | "fade"
+    ) {
+        config.lyrics_transition_animation = AppConfig::default().lyrics_transition_animation;
+    }
     config.font_size = config.font_size.clamp(0.0, 30.0);
     config.auto_hide_delay = config.auto_hide_delay.clamp(1.0, 60.0);
     config.hover_to_hide_distance = config.hover_to_hide_distance.clamp(50.0, 300.0);

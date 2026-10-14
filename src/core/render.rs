@@ -36,6 +36,57 @@ thread_local! {
 
 }
 
+/// 歌词切换动画的模糊强度上限（与 WinIsland 一致）。
+const LYRIC_TRANSITION_BLUR_SIGMA: f32 = 6.0;
+/// 模糊的横向系数；纵向取满强度，形成纵向拖影（与 WinIsland 一致）。
+const LYRIC_TRANSITION_BLUR_X_SCALE: f32 = 0.25;
+/// 歌词切换时旧行滑出、新行滑入的位移（与 WinIsland 一致）。
+const LYRIC_TRANSITION_OFFSET: f32 = 10.0;
+/// 低于该模糊量时不再生成图像滤镜。
+const MIN_BLUR_SIGMA: f32 = 0.1;
+
+/// 歌词切换进度缓动：WinIsland 使用 smoothstep 让进出更自然。
+fn lyric_transition_progress(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    progress * progress * (3.0 - 2.0 * progress)
+}
+
+/// 歌词切换动画参数：模糊强度、滑出位移、旧行透明度、新行透明度。
+///
+/// 与 WinIsland 一致：blur 与 slide 共用 10px 位移，blur 额外叠加模糊；
+/// fade 无位移无模糊，旧行在前半段淡出、新行在后半段淡入。
+fn lyric_transition_style(mode: &str, progress: f32) -> (f32, f32, f32, f32) {
+    let transition = lyric_transition_progress(progress);
+    match mode {
+        "slide" => (0.0, LYRIC_TRANSITION_OFFSET, 1.0 - transition, transition),
+        "fade" => (
+            0.0,
+            0.0,
+            1.0 - lyric_transition_progress(progress * 2.0),
+            lyric_transition_progress(progress * 2.0 - 1.0),
+        ),
+        _ => (
+            LYRIC_TRANSITION_BLUR_SIGMA,
+            LYRIC_TRANSITION_OFFSET,
+            1.0 - transition,
+            transition,
+        ),
+    }
+}
+
+/// 按 WinIsland 的模糊参数（横向 1/4、纵向满强度）生成歌词切换滤镜。
+fn lyric_transition_blur_filter(sigma: f32) -> Option<skia_safe::ImageFilter> {
+    if sigma <= MIN_BLUR_SIGMA {
+        return None;
+    }
+    image_filters::blur(
+        (sigma * LYRIC_TRANSITION_BLUR_X_SCALE, sigma),
+        None,
+        None,
+        None,
+    )
+}
+
 pub struct LayoutParams {
     pub current_w: f32,
     pub current_h: f32,
@@ -101,6 +152,8 @@ pub struct StyleParams<'a> {
     pub liquid_glass_siri: bool,
     /// 毛玻璃宿主背板是否已就绪；就绪时背景由合成视觉提供，这里只画暗色覆盖层
     pub host_backdrop: bool,
+    /// 迷你歌词切换动画：blur / slide / fade（WinIsland 原版三选一）
+    pub lyrics_transition_animation: &'a str,
 }
 
 /// 计算岛屿在窗口内的左上角偏移；`layout.hide_progress` 会把岛屿推出屏幕。
@@ -429,6 +482,7 @@ pub fn draw_island_canvas(
         liquid_glass_tint,
         liquid_glass_siri,
         host_backdrop,
+        lyrics_transition_animation,
     } = style;
     canvas.clear(Color::TRANSPARENT);
 
@@ -872,225 +926,116 @@ pub fn draw_island_canvas(
                 let clip_rect = Rect::from_xywh(space_left, offset_y, available_w, current_h);
                 canvas.clip_rect(clip_rect, ClipOp::Intersect, true);
 
-                if use_blur {
-                    if lyric_transition < 1.0 && !old_lyric.is_empty() {
+                // 歌词切换动画：与 WinIsland 一致，在 blur / slide / fade 三选一
+                let (blur_sigma, offset, old_opacity, new_opacity) =
+                    lyric_transition_style(lyrics_transition_animation, lyric_transition);
+                let transition = lyric_transition_progress(lyric_transition);
+                let center_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
+                // 逐字上浮速度沿用旧实现：带模糊的过渡更慢，避免拖影与位移叠加
+                let lift_speed = if blur_sigma > 0.0 { 0.25 } else { 4.0 };
+
+                if old_opacity > 0.0 && !old_lyric.is_empty() {
+                    let mut text_paint = Paint::default();
+                    text_paint.set_anti_alias(true);
+                    text_paint.set_color(Color::from_argb(
+                        (alpha as f32 * old_opacity) as u8,
+                        text_color.r(),
+                        text_color.g(),
+                        text_color.b(),
+                    ));
+                    if let Some(filter) = lyric_transition_blur_filter(
+                        transition * transition * blur_sigma * non_expanded_scale,
+                    ) {
+                        text_paint.set_image_filter(filter);
+                    }
+                    let text_y = center_y - offset * non_expanded_scale * transition;
+                    let old_lx = if text_centered {
+                        let w = FontManager::global().measure_text_cached(
+                            old_lyric,
+                            lyric_font_sz,
+                            skia_safe::FontStyle::normal(),
+                        );
+                        text_x - w / 2.0
+                    } else {
+                        text_x
+                    };
+                    draw_text_cached(DrawTextCachedParams {
+                        canvas,
+                        text: old_lyric,
+                        x: old_lx,
+                        y: text_y,
+                        size: lyric_font_sz,
+                        bold: false,
+                        paint: &text_paint,
+                    });
+                }
+
+                if new_opacity > 0.0 && !current_lyric.is_empty() {
+                    let fade_alpha = (alpha as f32 * new_opacity) as u8;
+                    let text_y = center_y + offset * non_expanded_scale * (1.0 - transition);
+                    let blur_filter = lyric_transition_blur_filter(
+                        (1.0 - transition) * (1.0 - transition) * blur_sigma * non_expanded_scale,
+                    );
+
+                    if let (Some(chars), Some(char_idx)) = (current_characters, current_char_idx) {
+                        draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
+                            canvas,
+                            chars,
+                            char_idx,
+                            current_char_progress,
+                            text_x,
+                            text_y,
+                            text_centered,
+                            lyric_font_sz,
+                            fade_alpha,
+                            resolved_char_played,
+                            resolved_char_unplayed,
+                            char_lift_animation,
+                            lift_speed,
+                            dt,
+                            blur_filter: blur_filter.as_ref(),
+                        });
+                    } else {
                         let mut text_paint = Paint::default();
                         text_paint.set_anti_alias(true);
-                        let fade_alpha = (alpha as f32 * (1.0 - lyric_transition)) as u8;
                         text_paint.set_color(Color::from_argb(
                             fade_alpha,
                             text_color.r(),
                             text_color.g(),
                             text_color.b(),
                         ));
-
-                        let blur_sigma = lyric_transition * 12.0 * non_expanded_scale;
-                        if blur_sigma > 0.1 {
-                            text_paint.set_image_filter(image_filters::blur(
-                                (blur_sigma, 0.0),
-                                None,
-                                None,
-                                None,
-                            ));
+                        if let Some(ref filter) = blur_filter {
+                            text_paint.set_image_filter(filter.clone());
                         }
-
-                        let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale
-                            - (10.0 * non_expanded_scale * lyric_transition);
-                        let old_lx = if text_centered {
-                            let w = FontManager::global().measure_text_cached(
-                                old_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            text_x - w / 2.0
+                        let current_text_w = FontManager::global().measure_text_cached(
+                            current_lyric,
+                            lyric_font_sz,
+                            skia_safe::FontStyle::normal(),
+                        );
+                        let cur_lx = if text_centered {
+                            text_x - current_text_w / 2.0
                         } else {
                             text_x
                         };
                         draw_text_cached(DrawTextCachedParams {
                             canvas,
-                            text: old_lyric,
-                            x: old_lx,
+                            text: current_lyric,
+                            x: cur_lx,
                             y: text_y,
                             size: lyric_font_sz,
                             bold: false,
                             paint: &text_paint,
                         });
-                    }
-
-                    if !current_lyric.is_empty() {
-                        let mut text_paint = Paint::default();
-                        text_paint.set_anti_alias(true);
-                        let fade_alpha = (alpha as f32 * lyric_transition) as u8;
-
-                        let blur_sigma = (1.0 - lyric_transition) * 12.0 * non_expanded_scale;
-                        let blur_filter = if blur_sigma > 0.1 {
-                            image_filters::blur((blur_sigma, 0.0), None, None, None)
-                        } else {
-                            None
-                        };
-
-                        let text_y = offset_y
-                            + current_h / 2.0
-                            + 4.0 * non_expanded_scale
-                            + (10.0 * non_expanded_scale * (1.0 - lyric_transition));
-
-                        if let (Some(chars), Some(char_idx)) =
-                            (current_characters, current_char_idx)
-                        {
-                            draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
-                                canvas,
-                                chars,
-                                char_idx,
-                                current_char_progress,
-                                text_x,
-                                text_y,
-                                text_centered,
-                                lyric_font_sz,
-                                fade_alpha,
-                                resolved_char_played,
-                                resolved_char_unplayed,
-                                char_lift_animation,
-                                lift_speed: 0.25,
-                                dt,
-                                blur_filter: blur_filter.as_ref(),
-                            });
-                        } else {
-                            text_paint.set_color(Color::from_argb(
-                                fade_alpha,
-                                text_color.r(),
-                                text_color.g(),
-                                text_color.b(),
-                            ));
-                            if let Some(ref filter) = blur_filter {
-                                text_paint.set_image_filter(filter.clone());
-                            }
-                            let current_text_w = FontManager::global().measure_text_cached(
-                                current_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            let cur_lx = if text_centered {
-                                text_x - current_text_w / 2.0
-                            } else {
-                                text_x
-                            };
+                        if lyric_scroll_loop && !text_centered {
                             draw_text_cached(DrawTextCachedParams {
                                 canvas,
                                 text: current_lyric,
-                                x: cur_lx,
+                                x: cur_lx + current_text_w + lyric_scroll_loop_gap,
                                 y: text_y,
                                 size: lyric_font_sz,
                                 bold: false,
                                 paint: &text_paint,
                             });
-                            if lyric_scroll_loop && !text_centered {
-                                draw_text_cached(DrawTextCachedParams {
-                                    canvas,
-                                    text: current_lyric,
-                                    x: cur_lx + current_text_w + lyric_scroll_loop_gap,
-                                    y: text_y,
-                                    size: lyric_font_sz,
-                                    bold: false,
-                                    paint: &text_paint,
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    let text_y = offset_y + current_h / 2.0 + 4.0 * non_expanded_scale;
-                    if lyric_transition < 0.5 && !old_lyric.is_empty() {
-                        let mut text_paint = Paint::default();
-                        text_paint.set_anti_alias(true);
-                        let progress = lyric_transition * 2.0;
-                        let fade_alpha = (alpha as f32 * (1.0 - progress)) as u8;
-                        text_paint.set_color(Color::from_argb(
-                            fade_alpha,
-                            text_color.r(),
-                            text_color.g(),
-                            text_color.b(),
-                        ));
-                        let old_lx2 = if text_centered {
-                            let w = FontManager::global().measure_text_cached(
-                                old_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            text_x - w / 2.0
-                        } else {
-                            text_x
-                        };
-                        draw_text_cached(DrawTextCachedParams {
-                            canvas,
-                            text: old_lyric,
-                            x: old_lx2,
-                            y: text_y,
-                            size: lyric_font_sz,
-                            bold: false,
-                            paint: &text_paint,
-                        });
-                    } else if lyric_transition >= 0.5 && !current_lyric.is_empty() {
-                        let progress = (lyric_transition - 0.5) * 2.0;
-                        let fade_alpha = (alpha as f32 * progress) as u8;
-
-                        if let (Some(chars), Some(char_idx)) =
-                            (current_characters, current_char_idx)
-                        {
-                            draw_current_lyric_characters(DrawCurrentLyricCharactersParams {
-                                canvas,
-                                chars,
-                                char_idx,
-                                current_char_progress,
-                                text_x,
-                                text_y,
-                                text_centered,
-                                lyric_font_sz,
-                                fade_alpha,
-                                resolved_char_played,
-                                resolved_char_unplayed,
-                                char_lift_animation,
-                                lift_speed: 4.0,
-                                dt,
-                                blur_filter: None,
-                            });
-                        } else {
-                            let mut text_paint = Paint::default();
-                            text_paint.set_anti_alias(true);
-                            text_paint.set_color(Color::from_argb(
-                                fade_alpha,
-                                text_color.r(),
-                                text_color.g(),
-                                text_color.b(),
-                            ));
-                            let current_text_w = FontManager::global().measure_text_cached(
-                                current_lyric,
-                                lyric_font_sz,
-                                skia_safe::FontStyle::normal(),
-                            );
-                            let cur_lx2 = if text_centered {
-                                text_x - current_text_w / 2.0
-                            } else {
-                                text_x
-                            };
-                            draw_text_cached(DrawTextCachedParams {
-                                canvas,
-                                text: current_lyric,
-                                x: cur_lx2,
-                                y: text_y,
-                                size: lyric_font_sz,
-                                bold: false,
-                                paint: &text_paint,
-                            });
-                            if lyric_scroll_loop && !text_centered {
-                                draw_text_cached(DrawTextCachedParams {
-                                    canvas,
-                                    text: current_lyric,
-                                    x: cur_lx2 + current_text_w + lyric_scroll_loop_gap,
-                                    y: text_y,
-                                    size: lyric_font_sz,
-                                    bold: false,
-                                    paint: &text_paint,
-                                });
-                            }
                         }
                     }
                 }
@@ -1154,4 +1099,50 @@ pub fn get_mini_control_rects(
 
     // Only the play/pause button is rendered; prev/next are invisible.
     (None, Some(play_rect), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LYRIC_TRANSITION_BLUR_SIGMA, LYRIC_TRANSITION_OFFSET, lyric_transition_progress,
+        lyric_transition_style,
+    };
+
+    #[test]
+    fn lyric_transition_progress_is_smoothstep() {
+        assert_eq!(lyric_transition_progress(0.0), 0.0);
+        assert_eq!(lyric_transition_progress(0.5), 0.5);
+        assert_eq!(lyric_transition_progress(1.0), 1.0);
+        // 越界输入被夹紧，避免过渡结束后继续漂移
+        assert_eq!(lyric_transition_progress(-1.0), 0.0);
+        assert_eq!(lyric_transition_progress(2.0), 1.0);
+    }
+
+    #[test]
+    fn lyric_transition_style_matches_winisland_modes() {
+        let (blur, offset, old_alpha, new_alpha) = lyric_transition_style("blur", 0.0);
+        assert_eq!(blur, LYRIC_TRANSITION_BLUR_SIGMA);
+        assert_eq!(offset, LYRIC_TRANSITION_OFFSET);
+        assert_eq!((old_alpha, new_alpha), (1.0, 0.0));
+
+        let (blur, offset, old_alpha, new_alpha) = lyric_transition_style("slide", 0.0);
+        assert_eq!(blur, 0.0);
+        assert_eq!(offset, LYRIC_TRANSITION_OFFSET);
+        assert_eq!((old_alpha, new_alpha), (1.0, 0.0));
+
+        // fade 无位移无模糊，且前半段只有旧行、后半段只有新行
+        let (blur, offset, old_alpha, new_alpha) = lyric_transition_style("fade", 0.25);
+        assert_eq!((blur, offset), (0.0, 0.0));
+        assert_eq!((old_alpha, new_alpha), (0.5, 0.0));
+        let (_, _, old_alpha, new_alpha) = lyric_transition_style("fade", 0.75);
+        assert_eq!((old_alpha, new_alpha), (0.0, 0.5));
+    }
+
+    #[test]
+    fn lyric_transition_style_unknown_mode_falls_back_to_blur() {
+        assert_eq!(
+            lyric_transition_style("random", 0.0),
+            lyric_transition_style("blur", 0.0)
+        );
+    }
 }

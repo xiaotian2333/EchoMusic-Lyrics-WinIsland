@@ -501,6 +501,16 @@ function musicContent() {
       infoRow(tr("lyrics_ws_source")),
       infoRow(tr("lyrics_ws_address")),
       numberRow(tr("lyrics_delay"), "lyrics_delay", lyricsOn),
+      selectRow(
+        tr("lyrics_transition_animation"),
+        "lyrics_transition_animation",
+        [
+          { value: "blur", label: tr("lyrics_transition_blur") },
+          { value: "slide", label: tr("lyrics_transition_slide") },
+          { value: "fade", label: tr("lyrics_transition_fade") },
+        ],
+        lyricsOn,
+      ),
       switchRow(tr("lyrics_scroll"), "lyrics_scroll", lyricsOn),
       numberRow(tr("lyrics_scroll_max_width"), "lyrics_scroll_max_width", lyricsOn && config.lyrics_scroll),
       switchRow(
