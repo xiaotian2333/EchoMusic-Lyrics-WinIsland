@@ -99,6 +99,48 @@ pub struct StyleParams<'a> {
     pub liquid_glass_dispersion: f32,
     pub liquid_glass_tint: f32,
     pub liquid_glass_siri: bool,
+    /// 毛玻璃宿主背板是否已就绪；就绪时背景由合成视觉提供，这里只画暗色覆盖层
+    pub host_backdrop: bool,
+}
+
+/// 计算岛屿在窗口内的左上角偏移；`layout.hide_progress` 会把岛屿推出屏幕。
+pub fn island_offset(layout: &LayoutParams) -> (f32, f32) {
+    let LayoutParams {
+        current_w,
+        current_h,
+        os_w,
+        os_h,
+        non_expanded_scale,
+        hide_progress,
+        dock_position,
+        ..
+    } = *layout;
+    let dock_bottom = dock_position.is_bottom();
+    let offset_x = if dock_position.is_left() {
+        PADDING / 2.0
+    } else if dock_position.is_right() {
+        (os_w as f32 - PADDING / 2.0 - current_w).max(0.0)
+    } else {
+        (os_w as f32 - current_w) / 2.0
+    };
+    let base_y = if dock_bottom {
+        os_h as f32 - PADDING / 2.0 - current_h
+    } else {
+        PADDING / 2.0
+    };
+    let hidden_peek_h = (5.0 * non_expanded_scale).max(3.0);
+    let hide_distance = if dock_bottom {
+        (current_h - hidden_peek_h).max(0.0)
+    } else {
+        (current_h - hidden_peek_h + TOP_OFFSET as f32).max(0.0)
+    };
+    let hide_y_offset = hide_progress * hide_distance;
+    let offset_y = if dock_bottom {
+        base_y + hide_y_offset
+    } else {
+        base_y - hide_y_offset
+    };
+    (offset_x, offset_y)
 }
 
 pub fn get_mini_visualizer_hit_rect(
@@ -326,6 +368,7 @@ pub fn draw_island_canvas(
         style,
     } = params;
 
+    let (offset_x, offset_y) = island_offset(&layout);
     let LayoutParams {
         current_w,
         current_h,
@@ -338,7 +381,7 @@ pub fn draw_island_canvas(
         non_expanded_scale,
         expanded_scale,
         hide_progress,
-        dock_position,
+        dock_position: _,
     } = layout;
     let MediaParams {
         media,
@@ -385,34 +428,9 @@ pub fn draw_island_canvas(
         liquid_glass_dispersion,
         liquid_glass_tint,
         liquid_glass_siri,
+        host_backdrop,
     } = style;
     canvas.clear(Color::TRANSPARENT);
-
-    let dock_bottom = dock_position.is_bottom();
-    let offset_x = if dock_position.is_left() {
-        PADDING / 2.0
-    } else if dock_position.is_right() {
-        (os_w as f32 - PADDING / 2.0 - current_w).max(0.0)
-    } else {
-        (os_w as f32 - current_w) / 2.0
-    };
-    let base_y = if dock_bottom {
-        os_h as f32 - PADDING / 2.0 - current_h
-    } else {
-        PADDING / 2.0
-    };
-    let hidden_peek_h = (5.0 * non_expanded_scale).max(3.0);
-    let hide_distance = if dock_bottom {
-        (current_h - hidden_peek_h).max(0.0)
-    } else {
-        (current_h - hidden_peek_h + TOP_OFFSET as f32).max(0.0)
-    };
-    let hide_y_offset = hide_progress * hide_distance;
-    let offset_y = if dock_bottom {
-        base_y + hide_y_offset
-    } else {
-        base_y - hide_y_offset
-    };
 
     let rect = Rect::from_xywh(offset_x, offset_y, current_w, current_h);
     let rrect = RRect::new_rect_xy(rect, current_r, current_r);
@@ -532,18 +550,24 @@ pub fn draw_island_canvas(
         canvas.save();
         canvas.clip_rrect(rrect, ClipOp::Intersect, true);
     } else if island_style == "glass" {
-        let screen_x = win_x + offset_x as i32;
-        let screen_y = win_y + offset_y as i32;
         canvas.save();
         canvas.clip_rrect(rrect, ClipOp::Intersect, true);
-        if let Some(bg_img) = get_glass_background(
-            screen_x,
-            screen_y,
+        if host_backdrop {
+            // WinIsland 原版毛玻璃：真实桌面内容由伴随窗口的宿主背板合成视觉提供，
+            // 主岛这里只叠加一层半透明暗色覆盖，保证前景文字可读
+            let mut host_paint = Paint::default();
+            host_paint.set_color(Color::from_argb(150, 10, 10, 14));
+            host_paint.set_anti_alias(true);
+            canvas.draw_rrect(rrect, &host_paint);
+        } else if let Some(bg_img) = get_glass_background(
+            win_x + offset_x as i32,
+            win_y + offset_y as i32,
             current_w as u32,
             current_h as u32,
             40.0 * (non_expanded_scale
                 + (expanded_scale - non_expanded_scale) * expansion_progress),
         ) {
+            // 宿主背板不可用时回退到 CPU 截屏毛玻璃
             let mut paint = Paint::default();
             paint.set_anti_alias(true);
             let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);

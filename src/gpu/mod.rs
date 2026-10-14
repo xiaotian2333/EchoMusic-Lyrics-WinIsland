@@ -4,8 +4,14 @@
 //! 当岛样式为 liquid_glass 时启用：D3D12 设备 + Skia Ganesh D3D12 后端 +
 //! DirectComposition 合成交换链负责整帧渲染；Windows.Graphics.Capture 捕获窗口下方
 //! 屏幕内容，经共享纹理与围栏同步后在 GPU 上完成 frost 模糊与液态玻璃折射。
-//! 其余样式（default/glass/mica/dynamic）继续使用 softbuffer 的 CPU 光栅路径；
-//! GPU 初始化失败时自动回退到 CPU 液态玻璃实现（utils::liquid_glass）。
+//!
+//! 当岛样式为 glass（毛玻璃）时启用 `host_backdrop`：伴随窗口开启 DWM 宿主背板后，
+//! 由 Windows.UI.Composition 的宿主背板画笔在窗口下方合成真实桌面内容并裁剪到岛屿
+//! 形状，主岛窗口仍走 softbuffer 光栅路径。
+//!
+//! 其余样式（default/mica/dynamic）继续使用 softbuffer 的 CPU 光栅路径；
+//! GPU 初始化失败时自动回退到 CPU 液态玻璃实现（utils::liquid_glass），
+//! 宿主背板不可用时回退到 CPU 毛玻璃实现（utils::glass）。
 
 mod backdrop;
 mod capture;
@@ -24,6 +30,9 @@ use crate::utils::liquid_glass::Backdrop as LiquidBackdrop;
 pub(crate) use backdrop::SharedBackdrop;
 pub(crate) use capture::BackdropCapture;
 pub(crate) use device::D3DDevice;
+// 毛玻璃宿主背板由独立 crate 提供：其 #[implement] 需要 windows-core 0.62，
+// 而本 crate 的音频设备通知仍需 windows-core 0.58，两者无法在同一 crate 内共存
+pub(crate) use host_backdrop::{HostBackdrop, HostBackdropShape};
 pub(crate) use target::RenderTarget;
 
 /// 背板捕获创建失败后的重试间隔。

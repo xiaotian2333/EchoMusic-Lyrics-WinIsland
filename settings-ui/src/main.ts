@@ -34,6 +34,7 @@ const numberSpecs = {
   liquid_glass_refraction: { min: 0, max: 400, step: 10, precision: 0 },
   liquid_glass_dispersion: { min: 0, max: 100, step: 5, precision: 0 },
   liquid_glass_tint: { min: 0, max: 200, step: 10, precision: 0 },
+  glass_blur: { min: 0, max: 50, step: 1, precision: 0 },
 };
 
 function numberSpec(field) {
@@ -372,6 +373,13 @@ function liquidGlassRows() {
   ];
 }
 
+function glassRows() {
+  if (config.island_style !== "glass") {
+    return [];
+  }
+  return [numberRow(tr("glass_blur"), "glass_blur")];
+}
+
 function generalEffects() {
   return [
     section(tr("section_effects"), [
@@ -401,6 +409,7 @@ function generalEffects() {
         { value: "dynamic", label: tr("style_dynamic") },
         { value: "liquid_glass", label: tr("style_liquid_glass") },
       ]),
+      ...glassRows(),
       ...liquidGlassRows(),
       fontPicker(),
     ]),

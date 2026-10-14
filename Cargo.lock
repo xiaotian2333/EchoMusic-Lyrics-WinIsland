@@ -12,6 +12,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "futures-util",
+ "host-backdrop",
  "image",
  "log",
  "once_cell",
@@ -2011,6 +2012,17 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "host-backdrop"
+version = "1.2.13"
+dependencies = [
+ "log",
+ "windows 0.62.2",
+ "windows-collections 0.3.2",
+ "windows-core 0.62.2",
+ "windows-numerics 0.3.1",
+]
 
 [[package]]
 name = "html5ever"

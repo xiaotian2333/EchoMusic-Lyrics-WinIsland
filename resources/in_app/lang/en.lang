@@ -40,6 +40,7 @@ font_preview_sample=Hello World
 island_style=Island Style
 style_default=Default
 style_glass=Frosted Glass
+glass_blur=Frosted Glass Extra Blur
 style_mica=Mica (Win11)
 style_dynamic=Dynamic Color
 style_liquid_glass=Liquid Glass

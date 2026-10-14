@@ -54,6 +54,10 @@ use crate::window::tray::{TrayAction, TrayManager};
 const MINI_LYRIC_LOOP_GAP: f32 = 48.0;
 /// GPU 渲染管线初始化失败后的重试间隔。
 const GPU_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// 毛玻璃宿主背板初始化失败后的重试间隔。
+const HOST_BACKDROP_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// 毛玻璃伴随窗口标题；仅用于调试识别，不显示在任务栏。
+const BACKDROP_WINDOW_TITLE: &str = "EchoMusic-Lyrics-WinIsland Backdrop";
 const VOLUME_WHEEL_SLOW_STEP: f32 = 2.0;
 const VOLUME_WHEEL_MEDIUM_STEP: f32 = 4.0;
 const VOLUME_WHEEL_FAST_STEP: f32 = 8.0;
@@ -119,6 +123,10 @@ pub struct App {
     pending_volume: Option<f32>,
     gpu_island: Option<crate::gpu::GpuIsland>,
     gpu_retry_at: Option<Instant>,
+    backdrop_window: Option<Arc<Window>>,
+    backdrop_hwnd_raw: Option<isize>,
+    host_backdrop: Option<crate::gpu::HostBackdrop>,
+    host_backdrop_retry_at: Option<Instant>,
     hwnd_raw: Option<isize>,
 }
 
@@ -185,6 +193,10 @@ impl Default for App {
             pending_volume: None,
             gpu_island: None,
             gpu_retry_at: None,
+            backdrop_window: None,
+            backdrop_hwnd_raw: None,
+            host_backdrop: None,
+            host_backdrop_retry_at: None,
             hwnd_raw: None,
         }
     }
@@ -1022,6 +1034,10 @@ impl App {
                     self.visible = !self.visible;
                     window.set_visible(self.visible);
                     tray.update_item_text(self.visible);
+                    if !self.visible {
+                        // 主岛隐藏时同步收起毛玻璃背板，避免伴随窗口留在屏幕上
+                        self.update_host_backdrop(None, 0.0);
+                    }
                 }
                 TrayAction::OpenSettings => {
                     if let Ok(exe) = std::env::current_exe() {
@@ -1092,6 +1108,87 @@ impl App {
         self.gpu_retry_at = Some(Instant::now());
     }
 
+    /// 按当前样式维护毛玻璃宿主背板：glass 时惰性创建，其他样式释放。
+    fn ensure_host_backdrop(&mut self) {
+        if self.config.island_style != "glass" {
+            // Drop 会隐藏伴随窗口并关闭合成目标
+            self.host_backdrop = None;
+            return;
+        }
+        if self.host_backdrop.is_some() {
+            return;
+        }
+        if let Some(retry_at) = self.host_backdrop_retry_at
+            && retry_at.elapsed() < HOST_BACKDROP_RETRY_INTERVAL
+        {
+            return;
+        }
+        let (Some(main_hwnd), Some(backdrop_hwnd)) = (self.hwnd_raw, self.backdrop_hwnd_raw) else {
+            return;
+        };
+        match crate::gpu::HostBackdrop::new(main_hwnd, backdrop_hwnd) {
+            Ok(host_backdrop) => {
+                self.host_backdrop = Some(host_backdrop);
+                self.host_backdrop_retry_at = None;
+            }
+            Err(error) => {
+                log::warn!("毛玻璃宿主背板初始化失败，使用 CPU 截屏毛玻璃路径: {error}");
+                self.host_backdrop_retry_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 释放宿主背板并进入冷却，下一帧回退到 CPU 截屏毛玻璃。
+    fn fail_host_backdrop(&mut self, error: &str) {
+        log::warn!("毛玻璃宿主背板更新失败，回退到 CPU 截屏毛玻璃路径: {error}");
+        self.host_backdrop = None;
+        self.host_backdrop_retry_at = Some(Instant::now());
+    }
+
+    /// 同步宿主背板形状与磨砂程度；`shape` 为 None 时隐藏背板窗口。
+    fn update_host_backdrop(&mut self, shape: Option<crate::gpu::HostBackdropShape>, blur: f32) {
+        let Some(host_backdrop) = self.host_backdrop.as_ref() else {
+            return;
+        };
+        if let Err(error) = host_backdrop.update(shape, blur) {
+            self.fail_host_backdrop(&error);
+        }
+    }
+
+    /// 岛屿在屏幕上的矩形与磨砂程度；`hide_progress` 会把矩形一起推出屏幕。
+    fn host_backdrop_frame(&self, progress: f32) -> (Option<crate::gpu::HostBackdropShape>, f32) {
+        if !self.visible {
+            return (None, 0.0);
+        }
+        let layout = crate::core::render::LayoutParams {
+            current_w: self.spring_w.value,
+            current_h: self.spring_h.value,
+            current_r: self.spring_r.value,
+            os_w: self.os_w,
+            os_h: self.os_h,
+            sigmas: (0.0, 0.0),
+            expansion_progress: progress,
+            view_offset: self.spring_view.value,
+            non_expanded_scale: self.config.non_expanded_scale,
+            expanded_scale: self.config.expanded_scale,
+            hide_progress: self.spring_hide.value,
+            dock_position: self.effective_dock_position,
+        };
+        let (offset_x, offset_y) = crate::core::render::island_offset(&layout);
+        let scale = self.config.non_expanded_scale
+            + (self.config.expanded_scale - self.config.non_expanded_scale) * progress;
+        (
+            Some(crate::gpu::HostBackdropShape {
+                screen_x: self.win_x as f32 + offset_x,
+                screen_y: self.win_y as f32 + offset_y,
+                width: self.spring_w.value,
+                height: self.spring_h.value,
+                radius: self.spring_r.value,
+            }),
+            self.config.glass_blur * scale,
+        )
+    }
+
     fn reload_config_if_changed(&mut self, window: &Window) {
         if !self.frame_count.is_multiple_of(30) {
             return;
@@ -1136,6 +1233,9 @@ impl App {
                 // 进入液态玻璃时清除冷却，下一帧立即尝试重建
                 self.gpu_island = None;
                 self.gpu_retry_at = None;
+                // 毛玻璃宿主背板同理：Drop 会隐藏伴随窗口并关闭合成目标
+                self.host_backdrop = None;
+                self.host_backdrop_retry_at = None;
             }
 
             if old_mini_shape != self.config.mini_cover_shape
@@ -1372,6 +1472,31 @@ impl ApplicationHandler for App {
 
             self.window = Some(window.clone());
 
+            // 毛玻璃伴随窗口：只承载 DWM 宿主背板合成视觉，始终隐藏，由宿主背板按需显示
+            let backdrop_attrs = Window::default_attributes()
+                .with_title(BACKDROP_WINDOW_TITLE)
+                .with_inner_size(PhysicalSize::new(1, 1))
+                .with_transparent(true)
+                .with_no_redirection_bitmap(true)
+                .with_visible(false)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_enabled_buttons(WindowButtons::empty())
+                .with_window_level(WindowLevel::AlwaysOnTop)
+                .with_skip_taskbar(true);
+            if let Ok(backdrop) = event_loop.create_window(backdrop_attrs) {
+                // 背板窗口只负责合成，不参与命中测试
+                let _ = backdrop.set_cursor_hittest(false);
+                if let Ok(handle) = backdrop.window_handle()
+                    && let RawWindowHandle::Win32(win32_handle) = handle.as_raw()
+                {
+                    self.backdrop_hwnd_raw = Some(win32_handle.hwnd.get());
+                }
+                self.backdrop_window = Some(Arc::new(backdrop));
+            } else {
+                log::warn!("毛玻璃伴随窗口创建失败，毛玻璃将使用 CPU 截屏路径");
+            }
+
             let mut monitor_opt = None;
             for _ in 0..10 {
                 if let Some(monitor) = Self::get_target_monitor(&window, self.config.monitor_index)
@@ -1476,6 +1601,7 @@ impl ApplicationHandler for App {
                     let is_hidden = self.is_hidden();
                     let progress = self.expansion_progress();
                     self.ensure_gpu_island();
+                    self.ensure_host_backdrop();
                     if self.surface.is_some() {
                         let dt =
                             (self.last_frame_time.elapsed().as_secs_f32() * 60.0).clamp(0.1, 3.0);
@@ -1562,6 +1688,10 @@ impl ApplicationHandler for App {
                         let lyric_scroll_loop_gap =
                             MINI_LYRIC_LOOP_GAP * self.config.non_expanded_scale;
 
+                        // 毛玻璃宿主背板：先同步背板形状与磨砂程度，再绘制只含暗色覆盖层的岛
+                        let (backdrop_shape, backdrop_blur) = self.host_backdrop_frame(progress);
+                        self.update_host_backdrop(backdrop_shape, backdrop_blur);
+
                         let params = crate::core::render::DrawIslandParams {
                             layout: crate::core::render::LayoutParams {
                                 current_w: self.spring_w.value,
@@ -1625,6 +1755,7 @@ impl ApplicationHandler for App {
                                 liquid_glass_dispersion: self.config.liquid_glass_dispersion,
                                 liquid_glass_tint: self.config.liquid_glass_tint,
                                 liquid_glass_siri: self.config.liquid_glass_siri,
+                                host_backdrop: self.host_backdrop.is_some(),
                             },
                         };
                         let mut gpu_error: Option<String> = None;

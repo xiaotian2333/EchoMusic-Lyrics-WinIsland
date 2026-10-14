@@ -109,7 +109,9 @@ cargo build --release --verbose --target x86_64-pc-windows-msvc
 ### GPU 渲染模块（WinIsland 原版管线）
 
 - `src/gpu/` 在 `island_style == "liquid_glass"` 时启用：`device.rs`（D3D12 + Skia Ganesh D3D12 上下文）、`target.rs`（DirectComposition 合成交换链）、`backdrop.rs`（共享纹理 + GPU frost 模糊）、`capture.rs`（Windows.Graphics.Capture 捕获）、`mod.rs`（`GpuIsland` 编排与事件循环唤醒代理）。
-- GPU 初始化或渲染失败时自动回退到 `src/utils/liquid_glass.rs` 的 CPU 路径（GDI 截屏 + CPU frost），10 秒后重试；其余样式始终走 softbuffer CPU 路径。
+- `crates/host-backdrop/`（独立 crate）在 `island_style == "glass"` 时启用：伴随窗口开启 DWM 宿主背板画笔后，由 `Windows.UI.Composition` 的 `CreateHostBackdropBrush` 在窗口下方合成真实桌面内容并按岛屿圆角裁剪，`blur.rs` 提供可调的高斯模糊，`styles.rs` 负责 `DWMWA_USE_HOSTBACKDROPBRUSH` 与旧版亚克力回退。主岛窗口仍走 softbuffer 光栅路径，只绘制半透明暗色覆盖层。
+- 独立成 crate 的原因：`#[implement]` 宏展开硬编码 `::windows_core` 绝对路径，而 `src/core/audio.rs` 仍需 windows 0.58 的 `#[implement]`，同一 crate 内无法共存两个 `windows_core` 版本。
+- GPU 初始化或渲染失败时自动回退到 `src/utils/liquid_glass.rs` 的 CPU 路径（GDI 截屏 + CPU frost），10 秒后重试；宿主背板失败时回退到 `src/utils/glass.rs` 的 CPU 毛玻璃路径（GDI 截屏 + 重模糊），同样 10 秒后重试。其余样式始终走 softbuffer CPU 路径。
 - 该模块使用重命名依赖 `windows62`（windows 0.62），其余代码保持 windows 0.58，互不影响。
 
 ### UI、窗口和工具模块

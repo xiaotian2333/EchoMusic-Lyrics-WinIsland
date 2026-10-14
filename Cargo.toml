@@ -3,6 +3,10 @@ name = "EchoMusic-Lyrics-WinIsland"
 version = "1.2.13"
 edition = "2024"
 
+[workspace]
+members = ["crates/host-backdrop"]
+resolver = "3"
+
 [dependencies]
 cpal = "0.15"
 realfft = "3.3"
@@ -36,7 +40,10 @@ windows62 = { package = "windows", version = "0.62", features = [
     "Graphics_DirectX_Direct3D11",
     "Security_Authorization_AppCapabilityAccess",
 ] }
+# windows 0.58 的 #[implement] 宏展开引用 ::windows_core 绝对路径，需与 windows 保持同版本
 windows-core = "0.58"
+# WinIsland 原版毛玻璃宿主背板（DWM 宿主背板画笔 + DirectComposition）
+host-backdrop = { path = "crates/host-backdrop" }
 winit = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

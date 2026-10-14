@@ -162,6 +162,8 @@ pub struct AppConfig {
     pub liquid_glass_tint: f32,
     #[serde(default = "default_liquid_glass_siri")]
     pub liquid_glass_siri: bool,
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: f32,
     #[serde(default = "default_show_lyrics")]
     pub show_lyrics: bool,
     #[serde(default = "default_custom_font")]
@@ -256,6 +258,11 @@ fn default_liquid_glass_tint() -> f32 {
 
 fn default_liquid_glass_siri() -> bool {
     false
+}
+
+/// 毛玻璃额外模糊量，与 WinIsland 一致默认为 0（只使用宿主背板本身）。
+fn default_glass_blur() -> f32 {
+    0.0
 }
 
 fn default_show_lyrics() -> bool {
@@ -423,6 +430,7 @@ impl Default for AppConfig {
             liquid_glass_dispersion: 40.0,
             liquid_glass_tint: 100.0,
             liquid_glass_siri: false,
+            glass_blur: 0.0,
             show_lyrics: true,
             custom_font_path: None,
             auto_start: false,

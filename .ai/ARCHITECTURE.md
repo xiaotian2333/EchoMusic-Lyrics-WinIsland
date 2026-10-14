@@ -55,6 +55,10 @@ src/
 │   ├── target.rs      Composition swap chain render target
 │   ├── backdrop.rs    Shared texture + GPU frost pipeline
 │   └── capture.rs     Windows.Graphics.Capture screen capture
+├── crates/host-backdrop/  WinIsland frosted-glass host backdrop (separate crate)
+│   ├── lib.rs         DWM host backdrop brush + DirectComposition visual tree
+│   ├── blur.rs        D2D1 GaussianBlur IGraphicsEffectD2D1Interop implementation
+│   └── styles.rs      DWMWA_USE_HOSTBACKDROPBRUSH / acrylic fallback
 └── window/
     ├── app.rs         Main App struct — event loop, state, input, orchestration
     ├── tray.rs        System tray icon + context menu
@@ -69,6 +73,7 @@ The application runs on winit's **Poll** event loop in [app.rs](src/window/app.r
 
 ```
 resumed() → create window (transparent, topmost, skip-taskbar)
+           → create hidden companion backdrop window (no redirection bitmap)
            → create softbuffer surface
            → create Skia thread-local surface
 
@@ -97,7 +102,12 @@ RedrawRequested → draw_island():
 ```
 
 Each style draws its background differently:
-- **glass**: GDI screen capture → heavy blur → dark multiply blend
+- **glass**: WinIsland original host backdrop — a companion window with the DWM host
+  backdrop brush (`DWMWA_USE_HOSTBACKDROPBRUSH`) composites the real desktop content
+  below the island through DirectComposition, clipped to the island's rounded rect with
+  an optional D2D Gaussian blur (`glass_blur`); the island itself only paints a
+  translucent dark overlay. Falls back to the CPU path (GDI capture → heavy blur →
+  dark multiply blend) when the host backdrop is unavailable
 - **liquid_glass**: GPU path (WinIsland original) — D3D12 + DirectComposition swap chain, Windows.Graphics.Capture backdrop via shared texture/fences, GPU frost + liquid.sksl refraction; falls back to CPU path (GDI capture → frost → liquid.sksl) when GPU or capture is unavailable
 - **mica**: GDI screen capture (downscaled) → blur → dark overlay
 - **dynamic**: Solid color extracted from album art palette
