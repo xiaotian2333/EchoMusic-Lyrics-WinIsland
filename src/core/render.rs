@@ -14,9 +14,11 @@ use crate::core::lyrics::LyricCharacter;
 use crate::core::media_info::MediaInfo;
 use crate::icons::controls::draw_play_button;
 use crate::ui::expanded::music_view::{
-    DrawMusicPageParams, DrawVisualizerParams, draw_music_page, draw_text_cached, draw_visualizer,
-    get_cached_media_image, get_cached_media_image_with_key, get_media_palette,
-    get_visualizer_hit_rect,
+    DrawMusicPageParams, draw_music_page, draw_text_cached, get_cached_media_image,
+    get_cached_media_image_with_key, get_media_palette, get_visualizer_hit_rect,
+};
+use crate::ui::expanded::spectrum::{
+    DrawVisualizerParams, default_spectrum_fill, draw_visualizer, get_media_spectrum_fill,
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
 use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mica_background};
@@ -706,6 +708,13 @@ pub fn draw_island_canvas(
             .unwrap_or(text_color)
     });
 
+    // 频谱填充：可见时取封面主色网格，不可见时用默认配色（避免无谓的解码开销）
+    let spectrum_fill = if expanded_alpha_f > 0.01 || mini_alpha_f > 0.01 {
+        get_media_spectrum_fill(media)
+    } else {
+        default_spectrum_fill()
+    };
+
     let viz_h_scale = 0.45 + (1.0 - 0.45) * expansion_progress;
 
     let mut widget_animating = false;
@@ -742,7 +751,7 @@ pub fn draw_island_canvas(
             dt,
             text_color,
             text_color_sec,
-            palette: palette.clone(),
+            spectrum_fill: &spectrum_fill,
         });
         canvas.restore();
 
@@ -866,7 +875,6 @@ pub fn draw_island_canvas(
                 widget_animating = true;
             }
         }
-        let palette = &palette;
         let viz_x = offset_x + current_w - 17.0 * non_expanded_scale;
         let viz_y = offset_y + current_h / 2.0;
         draw_visualizer(DrawVisualizerParams {
@@ -875,7 +883,7 @@ pub fn draw_island_canvas(
             y: viz_y,
             alpha,
             is_playing: media.is_playing,
-            palette,
+            fill: &spectrum_fill,
             spectrum: &media.spectrum,
             w_scale: 0.55 * non_expanded_scale,
             h_scale: viz_h_scale * non_expanded_scale,

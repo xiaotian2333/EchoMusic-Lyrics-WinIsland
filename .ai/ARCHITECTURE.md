@@ -33,6 +33,7 @@ src/
 │   └── settings.rs
 ├── ui/expanded/       Expanded island views
 │   ├── music_view.rs  Music player page (album art, controls, progress)
+│   ├── spectrum.rs    WinIsland spectrum visualizer (cover color mesh / default gradient)
 │   └── widget_view.rs Widget/page view for additional content
 ├── utils/             Utilities
 │   ├── autostart.rs   Registry-based auto-start
@@ -112,6 +113,13 @@ Each style draws its background differently:
 - **mica**: GDI screen capture (downscaled) → blur → dark overlay
 - **dynamic**: Solid color extracted from album art palette
 - **default**: Solid black
+
+Mini lyric transitions follow WinIsland's three modes (`lyrics_transition_animation`):
+`blur` (10px offset + smoothstep-driven blur), `slide` (offset only) and `fade`
+(no offset, old line fades out in the first half, new line fades in during the second).
+Spectrum bars use WinIsland's visualizer: a 16x16 color mesh derived from the album
+cover (OKLab/LCh binning → 2x3 dominant colors → smoothstep mesh) sampled per bar, or a
+diagonal three-stop gradient when no cover is available.
 
 ---
 

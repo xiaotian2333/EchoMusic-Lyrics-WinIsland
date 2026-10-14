@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
     Canvas, Color, Data, FilterMode, FontStyle, ISize, Image, ImageInfo, MipmapMode, Paint, Point,
-    RRect, Rect, SamplingOptions, TileMode, gradient_shader, image_filters, images,
+    RRect, Rect, SamplingOptions, image_filters, images,
 };
 
 use crate::core::media_info::MediaInfo;
@@ -17,6 +17,8 @@ use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::physics::Spring;
 use crate::utils::scroll::{ScrollDrawParams, ScrollText};
 
+use super::spectrum::{DrawVisualizerParams, SpectrumFill, clear_spectrum_cache, draw_visualizer};
+
 const CONTROL_BUTTON_GAP: f32 = 75.0;
 const FAVORITE_BUTTON_SCALE: f32 = 1.12;
 
@@ -25,7 +27,6 @@ type PaletteCache = (HashMap<String, Vec<Color>>, VecDeque<String>);
 thread_local! {
     static IMG_CACHE: RefCell<Option<(String, Image)>> = const { RefCell::new(None) };
     static COLOR_CACHE: RefCell<PaletteCache> = RefCell::new((HashMap::new(), VecDeque::new()));
-    static VIZ_HEIGHTS: RefCell<[f32; 6]> = const { RefCell::new([3.0; 6]) };
     static PROGRESS_SMOOTH: RefCell<f32> = const { RefCell::new(-1.0) };
     static PAUSE_ANIM: RefCell<f32> = const { RefCell::new(0.0) };
     static PAUSE_SPRING: RefCell<Spring> = RefCell::new(Spring::new(1.0));
@@ -313,6 +314,8 @@ pub fn clear_cover_cache() {
     COVER_FLIP_OLD_IMG.with(|cell| {
         *cell.borrow_mut() = None;
     });
+    // 频谱填充派生自封面，封面缓存失效时同步失效
+    clear_spectrum_cache();
 }
 
 pub struct DrawMusicPageParams<'a> {
@@ -335,20 +338,8 @@ pub struct DrawMusicPageParams<'a> {
     pub dt: f32,
     pub text_color: Color,
     pub text_color_sec: Color,
-    pub palette: Vec<Color>,
-}
-
-pub struct DrawVisualizerParams<'a> {
-    pub canvas: &'a Canvas,
-    pub x: f32,
-    pub y: f32,
-    pub alpha: u8,
-    pub is_playing: bool,
-    pub palette: &'a [Color],
-    pub spectrum: &'a [f32; 6],
-    pub w_scale: f32,
-    pub h_scale: f32,
-    pub smooth_factors: (f32, f32),
+    /// 频谱条填充来源（WinIsland 原版：封面主色网格或默认配色）
+    pub spectrum_fill: &'a SpectrumFill,
 }
 
 pub fn get_visualizer_hit_rect(x: f32, y: f32, w_scale: f32, h_scale: f32) -> (f32, f32, f32, f32) {
@@ -408,7 +399,7 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         dt,
         text_color,
         text_color_sec,
-        palette,
+        spectrum_fill,
     } = params;
 
     let arrow_alpha = (alpha as f32 * (1.0 - view_offset * 5.0).clamp(0.0, 1.0)) as u8;
@@ -1020,7 +1011,7 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         y: title_y - 4.0 * scale,
         alpha,
         is_playing: music_active && media.is_playing,
-        palette: &palette,
+        fill: spectrum_fill,
         spectrum: &media.spectrum,
         w_scale: scale,
         h_scale: viz_h_scale,
@@ -1028,78 +1019,6 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
     });
 
     is_rotating
-}
-
-pub fn draw_visualizer(params: DrawVisualizerParams<'_>) {
-    let DrawVisualizerParams {
-        canvas,
-        x,
-        y,
-        alpha,
-        is_playing,
-        palette,
-        spectrum,
-        w_scale,
-        h_scale,
-        smooth_factors,
-    } = params;
-
-    let (rise, fall) = smooth_factors;
-    let bar_count = 6;
-    let bar_w = 3.0 * w_scale;
-    let spacing = 2.0 * w_scale;
-    let max_h = 28.0 * h_scale;
-    VIZ_HEIGHTS.with(|h_cell| {
-        let mut heights = h_cell.borrow_mut();
-        for i in 0..bar_count {
-            let target = if is_playing {
-                (spectrum[i] * max_h).max(3.0 * h_scale)
-            } else {
-                3.0 * h_scale
-            };
-            if target > heights[i] {
-                heights[i] = heights[i] * (1.0 - rise) + target * rise;
-            } else {
-                heights[i] = heights[i] * (1.0 - fall) + target * fall;
-            }
-            heights[i] = heights[i].max(3.0 * h_scale);
-        }
-        let start_x = x - (bar_count as f32 * (bar_w + spacing)) / 2.0;
-        let mut paint = Paint::default();
-        paint.set_anti_alias(true);
-        let colors_with_alpha: Vec<Color> = palette
-            .iter()
-            .map(|c| Color::from_argb(alpha, c.r(), c.g(), c.b()))
-            .collect();
-        if colors_with_alpha.len() >= 2 {
-            let shader = gradient_shader::linear(
-                (
-                    Point::new(start_x, y - max_h / 2.0),
-                    Point::new(start_x + (20.0 * w_scale), y + max_h / 2.0),
-                ),
-                colors_with_alpha.as_slice(),
-                None,
-                TileMode::Mirror,
-                None,
-                None,
-            )
-            .unwrap();
-            paint.set_shader(shader);
-        } else {
-            paint.set_color(colors_with_alpha.first().cloned().unwrap_or(Color::WHITE));
-        }
-        for i in 0..bar_count {
-            let h = heights[i];
-            let rect = Rect::from_xywh(
-                start_x + i as f32 * (bar_w + spacing),
-                y - h / 2.0,
-                bar_w,
-                h,
-            );
-            let r = bar_w / 2.0;
-            canvas.draw_round_rect(rect, r, r, &paint);
-        }
-    });
 }
 
 fn get_palette_from_image(img: &Image, cache_key: &str) -> Vec<Color> {

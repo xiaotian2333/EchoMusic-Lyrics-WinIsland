@@ -117,6 +117,7 @@ cargo build --release --verbose --target x86_64-pc-windows-msvc
 ### UI、窗口和工具模块
 
 - `src/ui/expanded/music_view.rs` 绘制展开态音乐页，包含封面、标题/歌手滚动、进度条、播放控制、频谱、封面翻转/旋转等缓存和动画状态；也提供按钮/进度条 hit rect。
+- `src/ui/expanded/spectrum.rs` 是 WinIsland 原版频谱可视化（移植自其 `music_view/visualizer.rs` 与 `palette.rs`）：六根圆角竖条，填充来自封面主色网格（24x24 采样 → OKLab/LCh 分箱取 2x3 主色 → 插值成 16x16 色块图，按条裁剪取切片）或默认三段灰阶对角渐变。
 - `src/ui/expanded/widget_view.rs` 绘制展开态的另一页内容。
 - `src/window/tray.rs` 创建系统托盘图标和菜单，菜单动作包括显示/隐藏、打开设置、重启和退出。
 - `src/window/settings/` 是独立设置窗口，使用 Skia 渲染配置界面。
