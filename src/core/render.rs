@@ -22,7 +22,7 @@ use crate::ui::expanded::spectrum::{
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
 use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mica_background};
-use crate::utils::color::{color_with_alpha, lyric_boundary_gradient_shader};
+use crate::utils::color::{color_with_alpha, lyric_boundary_gradient_shader, pick_played_color};
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
 use crate::utils::liquid_glass::{
@@ -722,13 +722,8 @@ pub fn draw_island_canvas(
     };
 
     let resolved_char_unplayed = char_color_unplayed.unwrap_or(text_color);
-    let resolved_char_played = char_color_played.unwrap_or_else(|| {
-        palette
-            .first()
-            .filter(|c| !(c.r() >= 250 && c.g() >= 250 && c.b() >= 250))
-            .copied()
-            .unwrap_or(text_color)
-    });
+    // 自动取值：跳过封面里的黑白灰，偏淡的封面颜色提升饱和度，只有黑白灰时用浅蓝兜底
+    let resolved_char_played = char_color_played.unwrap_or_else(|| pick_played_color(&palette));
 
     // 频谱填充：可见时取封面主色网格，不可见时用默认配色（避免无谓的解码开销）
     let spectrum_fill = if expanded_alpha_f > 0.01 || mini_alpha_f > 0.01 {

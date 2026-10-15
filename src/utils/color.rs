@@ -6,9 +6,37 @@ const ACHROMATIC_SATURATION: f32 = 0.05;
 const COMPLEMENTARY_HUE_SPAN: f32 = 120.0;
 /// 色相环插值的取样点数，取奇数以便有一个精确的中点色。
 const HUE_RING_STEPS: usize = 9;
+/// 自动取色时饱和度低于该值即视为黑白灰，跳过该候选。
+const PLAYED_MIN_SATURATION: f32 = 0.15;
+/// 偏淡的封面颜色提升到的目标饱和度上限，避免粉彩配色被推得过艳。
+const PLAYED_SATURATION_TARGET: f32 = 0.55;
+/// 已播放色提升后的最低明度，保证在深色岛上清晰可读。
+const PLAYED_MIN_VALUE: f32 = 0.75;
+/// 封面确实只有黑白灰时的兜底浅蓝。
+const PLAYED_FALLBACK_COLOR: Color = Color::from_rgb(120, 190, 255);
 
 pub fn color_with_alpha(color: Color, alpha: u8) -> Color {
     Color::from_argb(alpha, color.r(), color.g(), color.b())
+}
+
+/// 逐字歌词已播放色的自动取值：从封面调色板中挑出第一支有色彩感的颜色。
+///
+/// 黑白灰（饱和度低于 [`PLAYED_MIN_SATURATION`]）一律跳过；挑中的颜色若偏淡，
+/// 提升饱和度保证高亮可辨。整张封面只有黑白灰、或调色板为空时，返回浅蓝兜底色。
+pub fn pick_played_color(palette: &[Color]) -> Color {
+    palette
+        .iter()
+        .map(|color| color.to_hsv())
+        .find(|hsv| hsv.s >= PLAYED_MIN_SATURATION)
+        .map(|hsv| {
+            HSV {
+                h: hsv.h,
+                s: hsv.s.max(PLAYED_SATURATION_TARGET),
+                v: hsv.v.max(PLAYED_MIN_VALUE),
+            }
+            .to_color(255)
+        })
+        .unwrap_or(PLAYED_FALLBACK_COLOR)
 }
 
 pub fn parse_hex_color(hex: &str) -> Option<Color> {
@@ -101,7 +129,10 @@ fn linear_gradient_colors(played: Color, unplayed: Color, alpha: u8) -> Vec<Colo
 
 #[cfg(test)]
 mod tests {
-    use super::{HUE_RING_STEPS, boundary_gradient_colors};
+    use super::{
+        HUE_RING_STEPS, PLAYED_FALLBACK_COLOR, PLAYED_MIN_VALUE, PLAYED_SATURATION_TARGET,
+        boundary_gradient_colors, pick_played_color,
+    };
     use skia_safe::Color;
 
     /// 互补色之间的过渡必须保持色彩，不能退化成灰色。
@@ -158,5 +189,64 @@ mod tests {
         assert_eq!(colors.len(), 2);
         assert_eq!(colors[0], Color::from_rgb(128, 128, 128));
         assert_eq!(colors[1], Color::from_rgb(255, 0, 0));
+    }
+
+    /// 封面只有黑白灰（或调色板为空）时使用浅蓝兜底，不能把黑白灰当成已播放色。
+    #[test]
+    fn played_color_falls_back_to_light_blue_for_achromatic_covers() {
+        let achromatic = [
+            Color::from_rgb(200, 200, 200),
+            Color::from_rgb(30, 30, 30),
+            Color::from_rgb(128, 128, 128),
+        ];
+        assert_eq!(pick_played_color(&achromatic), PLAYED_FALLBACK_COLOR);
+        assert_eq!(pick_played_color(&[]), PLAYED_FALLBACK_COLOR);
+
+        let fallback_hsv = PLAYED_FALLBACK_COLOR.to_hsv();
+        assert!(
+            fallback_hsv.s > 0.5,
+            "兜底色必须是彩色而不是灰: {fallback_hsv:?}"
+        );
+    }
+
+    /// 偏淡的封面颜色被挑中后要提升饱和度与明度，保证高亮清晰可辨。
+    #[test]
+    fn played_color_boosts_pale_cover_colors() {
+        // 淡粉：饱和度约 0.22，够低算"偏淡"，又高于黑白灰筛选阈值
+        let pale = Color::from_rgb(230, 180, 180);
+        let picked = pick_played_color(&[pale]);
+        let hsv = picked.to_hsv();
+        assert!(
+            hsv.s >= PLAYED_SATURATION_TARGET - 0.04,
+            "偏淡颜色的饱和度没有被提升: {hsv:?}"
+        );
+        assert!(
+            hsv.v >= PLAYED_MIN_VALUE - 0.01,
+            "偏淡颜色的明度没有被提升: {hsv:?}"
+        );
+        let hue_before = pale.to_hsv().h;
+        let hue_after = hsv.h;
+        assert!(
+            (hue_before - hue_after).abs() < 2.0,
+            "提升饱和度时不应明显改变色相: {hue_before} -> {hue_after}"
+        );
+    }
+
+    /// 调色板里黑白灰在前、彩色在后时，应跳过无彩色候选挑中第一支彩色。
+    #[test]
+    fn played_color_skips_achromatic_candidates() {
+        let palette = [
+            Color::from_rgb(250, 250, 250),
+            Color::from_rgb(60, 60, 60),
+            Color::from_rgb(20, 120, 60),
+        ];
+        let picked = pick_played_color(&palette);
+        let target = Color::from_rgb(20, 120, 60).to_hsv();
+        let hsv = picked.to_hsv();
+        assert!(
+            (hsv.h - target.h).abs() < 1.0,
+            "没有挑中调色板里的彩色候选: {hsv:?}"
+        );
+        assert!(hsv.s >= PLAYED_SATURATION_TARGET - 0.04, "{hsv:?}");
     }
 }
