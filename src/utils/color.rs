@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use skia_safe::{Color, HSV, Point, TileMode, gradient_shader};
 
 /// 饱和度低于该值的颜色视为无彩色，色相没有意义，插值时退回 RGB 线性过渡。
@@ -14,6 +16,22 @@ const PLAYED_SATURATION_TARGET: f32 = 0.55;
 const PLAYED_MIN_VALUE: f32 = 0.75;
 /// 封面确实只有黑白灰时的兜底浅蓝。
 const PLAYED_FALLBACK_COLOR: Color = Color::from_rgb(120, 190, 255);
+
+/// 液态玻璃未播放歌词的浅色档：背景偏暗时使用。
+const LIQUID_UNPLAYED_LIGHT: Color = Color::WHITE;
+/// 液态玻璃未播放歌词的深色档：背景偏亮时使用；纯黑落在玻璃上过于生硬。
+const LIQUID_UNPLAYED_DARK: Color = Color::from_rgb(20, 20, 20);
+/// 背景显示亮度低于该值即切到浅色档。
+const LIQUID_UNPLAYED_LIGHT_BELOW: f32 = 0.45;
+/// 背景显示亮度高于该值即切到深色档；两阈值之间是滞回区。
+const LIQUID_UNPLAYED_DARK_ABOVE: f32 = 0.55;
+/// 换档时灰度的过渡速度，按 dt/60 归一化；4.0 约等于 0.25 秒走完全程。
+const LIQUID_UNPLAYED_FADE_SPEED: f32 = 4.0;
+
+thread_local! {
+    /// 未播放歌词的当前档位（true = 亮背景档，深色文字）与显示中的灰度值。
+    static LIQUID_UNPLAYED: Cell<(bool, f32)> = const { Cell::new((false, 255.0)) };
+}
 
 pub fn color_with_alpha(color: Color, alpha: u8) -> Color {
     Color::from_argb(alpha, color.r(), color.g(), color.b())
@@ -37,6 +55,40 @@ pub fn pick_played_color(palette: &[Color]) -> Color {
             .to_color(255)
         })
         .unwrap_or(PLAYED_FALLBACK_COLOR)
+}
+
+/// 液态玻璃模式下未播放歌词的自动颜色：按背景显示亮度在黑白两档间取值。
+///
+/// 背景越亮文字越深，两档各自是无彩色，保证任何背景下都清晰。两阈值之间是
+/// 滞回区：亮度在其中波动时保持上一档，避免文字在临界亮度上反复跳色；换档
+/// 本身也按 `dt` 平滑过渡而非硬切。
+///
+/// `display_luma` 是玻璃着色**之后**的显示亮度而非桌面内容亮度，换算见
+/// [`crate::utils::liquid_glass::display_luminance`]。
+pub fn liquid_unplayed_color(display_luma: f32, dt: f32) -> Color {
+    LIQUID_UNPLAYED.with(|cell| {
+        let (mut on_light, mut gray) = cell.get();
+        // 只有越过对侧阈值才换档，两阈值之间维持上一档
+        if display_luma >= LIQUID_UNPLAYED_DARK_ABOVE {
+            on_light = true;
+        } else if display_luma <= LIQUID_UNPLAYED_LIGHT_BELOW {
+            on_light = false;
+        }
+        let target = f32::from(if on_light {
+            LIQUID_UNPLAYED_DARK.b()
+        } else {
+            LIQUID_UNPLAYED_LIGHT.b()
+        });
+        let step = LIQUID_UNPLAYED_FADE_SPEED * dt / 60.0 * 255.0;
+        gray = if (target - gray).abs() <= step {
+            target
+        } else {
+            gray + step.copysign(target - gray)
+        };
+        cell.set((on_light, gray));
+        let value = gray.round().clamp(0.0, 255.0) as u8;
+        Color::from_rgb(value, value, value)
+    })
 }
 
 pub fn parse_hex_color(hex: &str) -> Option<Color> {
@@ -130,10 +182,88 @@ fn linear_gradient_colors(played: Color, unplayed: Color, alpha: u8) -> Vec<Colo
 #[cfg(test)]
 mod tests {
     use super::{
-        HUE_RING_STEPS, PLAYED_FALLBACK_COLOR, PLAYED_MIN_VALUE, PLAYED_SATURATION_TARGET,
-        boundary_gradient_colors, pick_played_color,
+        HUE_RING_STEPS, LIQUID_UNPLAYED, LIQUID_UNPLAYED_DARK, LIQUID_UNPLAYED_LIGHT,
+        PLAYED_FALLBACK_COLOR, PLAYED_MIN_VALUE, PLAYED_SATURATION_TARGET,
+        boundary_gradient_colors, liquid_unplayed_color, pick_played_color,
     };
     use skia_safe::Color;
+
+    /// 复位未播放歌词的档位与灰度状态，避免用例之间互相影响。
+    fn reset_liquid_unplayed() {
+        LIQUID_UNPLAYED.with(|cell| cell.set((false, 255.0)));
+    }
+
+    /// 以固定背景亮度推进 1 秒（60 帧），返回最终颜色；过渡此时必然已走完。
+    fn liquid_unplayed_after_one_second(display_luma: f32) -> Color {
+        (0..60).fold(Color::WHITE, |_, _| {
+            liquid_unplayed_color(display_luma, 1.0)
+        })
+    }
+
+    /// 暗背景取浅色档、亮背景取深色档，且两档都不掺色相。
+    #[test]
+    fn liquid_unplayed_color_follows_background_luminance() {
+        reset_liquid_unplayed();
+        let dark_background = liquid_unplayed_after_one_second(0.1);
+        assert_eq!(dark_background, LIQUID_UNPLAYED_LIGHT);
+
+        reset_liquid_unplayed();
+        let light_background = liquid_unplayed_after_one_second(0.9);
+        assert_eq!(light_background, LIQUID_UNPLAYED_DARK);
+
+        for color in [dark_background, light_background] {
+            let hsv = color.to_hsv();
+            assert!(hsv.s < 0.05, "未播放歌词色必须落在黑白灰里: {hsv:?}");
+        }
+    }
+
+    /// 亮度落在滞回区内时保持上一档，避免文字在临界亮度上反复跳色。
+    #[test]
+    fn liquid_unplayed_color_holds_band_inside_hysteresis() {
+        reset_liquid_unplayed();
+        assert_eq!(liquid_unplayed_after_one_second(0.9), LIQUID_UNPLAYED_DARK);
+        assert_eq!(
+            liquid_unplayed_after_one_second(0.5),
+            LIQUID_UNPLAYED_DARK,
+            "滞回区内不应换档"
+        );
+
+        reset_liquid_unplayed();
+        assert_eq!(liquid_unplayed_after_one_second(0.1), LIQUID_UNPLAYED_LIGHT);
+        assert_eq!(
+            liquid_unplayed_after_one_second(0.5),
+            LIQUID_UNPLAYED_LIGHT,
+            "滞回区内不应换档"
+        );
+    }
+
+    /// 换档是渐变而非硬切：单帧不会直接跳到目标灰度。
+    #[test]
+    fn liquid_unplayed_color_fades_instead_of_jumping() {
+        reset_liquid_unplayed();
+        let first_frame = liquid_unplayed_color(0.9, 1.0);
+        assert!(
+            first_frame.to_hsv().v > 0.6,
+            "单帧就跳到深色档会显得生硬: {first_frame:?}"
+        );
+        assert_eq!(liquid_unplayed_after_one_second(0.9), LIQUID_UNPLAYED_DARK);
+    }
+
+    /// 采样缺失（`None` 由调用方回退）时不应把状态推进到目标档之外。
+    #[test]
+    fn liquid_unplayed_color_stays_within_band_bounds() {
+        reset_liquid_unplayed();
+        for luma in [0.0, 0.3, 0.45, 0.55, 0.7, 1.0] {
+            for _ in 0..120 {
+                let color = liquid_unplayed_color(luma, 1.0);
+                let value = color.b();
+                assert!(
+                    value >= LIQUID_UNPLAYED_DARK.b() && value <= LIQUID_UNPLAYED_LIGHT.b(),
+                    "灰度越出两档范围: {value}"
+                );
+            }
+        }
+    }
 
     /// 互补色之间的过渡必须保持色彩，不能退化成灰色。
     #[test]
