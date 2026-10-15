@@ -1,3 +1,5 @@
+import { initColorPicker, isAutoColor, normalizeHex, openColorPicker, repositionColorPicker } from "./color-picker";
+
 const root = document.querySelector("#app");
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 
@@ -13,6 +15,8 @@ let appIconDarkUrl = "";
 let customFontStyle = null;
 let customFontUrl = "";
 let customFontPath = "";
+
+const COLOR_FIELDS = ["lyrics_char_color_unplayed", "lyrics_char_color_played"];
 
 const numberSpecs = {
   non_expanded_scale: { min: 0.5, max: 5, step: 0.05, precision: 2 },
@@ -94,11 +98,19 @@ function updateAppIconUrls() {
   }
 }
 
+const colorPickerHooks = {
+  tr,
+  getValue: (field) => config?.[field],
+  onCommit: (field, value) => setField(field, value),
+};
+
 function applyState(nextState) {
   state = nextState;
   config = clone(state.config);
   updateAppIconUrls();
   applyTheme();
+  // 面板 DOM 常驻，每次状态刷新都要按当前翻译与配置重建文案
+  initColorPicker(colorPickerHooks);
   render();
   void loadCustomFont();
 }
@@ -295,6 +307,38 @@ function textRow(label, field, placeholder, enabled = true, invalid = false) {
       </div>
     </label>
   `;
+}
+
+function colorRow(label, field, enabled = true) {
+  const raw = String(config[field] ?? "auto");
+  // 非法值按 auto 展示，与后端 normalize_config 的回退保持一致
+  const hex = isAutoColor(raw) ? null : normalizeHex(raw);
+  const disabled = enabled ? "" : "disabled";
+  const dim = enabled ? "" : " disabled";
+  const style = hex ? ` style="background:${h(hex)}"` : "";
+  const mark = hex ? "" : `<span class="color-swatch-mark">A</span>`;
+  return `
+    <div class="row color-row${dim}">
+      <span>${h(label)}</span>
+      <button class="color-swatch${hex ? "" : " auto"}"${style} data-action="open-color-picker" data-color-field="${h(field)}" title="${h(hex ?? tr("color_picker_auto"))}" aria-haspopup="dialog" aria-label="${h(label)}" ${disabled}>
+        ${mark}
+      </button>
+    </div>
+  `;
+}
+
+/** auto 状态下的起始颜色：借用另一个颜色项的当前值，避免每次都从同一个默认蓝开始 */
+function colorFieldSeed(field) {
+  for (const other of COLOR_FIELDS) {
+    if (other === field) {
+      continue;
+    }
+    const hex = normalizeHex(String(config[other] ?? ""));
+    if (hex) {
+      return hex;
+    }
+  }
+  return null;
 }
 
 function infoRow(text) {
@@ -540,8 +584,8 @@ function musicContent() {
     section(tr("lyrics_char_highlight"), [
       switchRow(tr("lyrics_char_highlight"), "lyrics_char_highlight", lyricsOn),
       switchRow(tr("lyrics_char_lift_animation"), "lyrics_char_lift_animation", charColorEnabled),
-      textRow(tr("lyrics_char_color_unplayed"), "lyrics_char_color_unplayed", tr("lyrics_char_color_placeholder"), charColorEnabled),
-      textRow(tr("lyrics_char_color_played"), "lyrics_char_color_played", tr("lyrics_char_color_placeholder"), charColorEnabled),
+      colorRow(tr("lyrics_char_color_unplayed"), "lyrics_char_color_unplayed", charColorEnabled),
+      colorRow(tr("lyrics_char_color_played"), "lyrics_char_color_played", charColorEnabled),
     ]),
   ].join("");
 }
@@ -621,6 +665,8 @@ function render() {
     if (el) {
       el.scrollTop = scrollPos;
     }
+    // 滚动位置恢复之后再定位，顺序不能颠倒
+    repositionColorPicker();
   });
 }
 
@@ -662,6 +708,16 @@ function handleClick(event) {
       config.process_dock_rules.splice(index, 1);
       render();
       void saveConfig();
+    }
+  } else if (action === "open-color-picker") {
+    const field = button.dataset.colorField;
+    if (field) {
+      openColorPicker({
+        field,
+        value: String(config[field] ?? "auto"),
+        anchor: button,
+        seedHex: colorFieldSeed(field),
+      });
     }
   }
 }

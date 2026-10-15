@@ -606,6 +606,179 @@ input:focus {
   color: var(--danger);
 }
 
+/* ── 行内颜色色块 ── */
+
+.color-swatch {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+
+.color-swatch:hover:not(:disabled) {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.color-swatch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.color-swatch-mark {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-shadow: 0 0 2px var(--panel);
+}
+
+/* auto：斜纹底，两种主题下都能和具体色区分开 */
+.color-swatch.auto {
+  background: repeating-linear-gradient(45deg, var(--accent-soft) 0 5px, var(--panel) 5px 10px);
+}
+
+:root[data-theme="dark"] .color-swatch {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+/* ── 颜色面板（挂在 body 上，不受 render 重建影响） ── */
+
+.color-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: none;
+  background: rgba(24, 30, 40, 0.16);
+}
+
+:root[data-theme="dark"] .color-picker-backdrop {
+  background: rgba(0, 0, 0, 0.42);
+}
+
+.color-picker-backdrop.open {
+  display: block;
+}
+
+.color-picker {
+  position: fixed;
+  z-index: 9001;
+  display: none;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 18px 44px rgba(16, 22, 32, 0.28);
+  outline: none;
+  user-select: none;
+}
+
+.color-picker.open {
+  display: grid;
+}
+
+.color-picker-body {
+  display: grid;
+  grid-template-columns: 184px 150px;
+  gap: 14px;
+  align-items: start;
+}
+
+/* 边框只能画在 canvas 内部：一旦有 CSS border，指针坐标映射就会整体偏移 */
+.color-wheel {
+  display: block;
+  width: 184px;
+  height: 184px;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.color-picker-side {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+
+.color-preview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  height: 32px;
+}
+
+.color-preview-cell {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.color-preview-cell.auto {
+  background: repeating-linear-gradient(45deg, var(--accent-soft) 0 5px, var(--panel) 5px 10px);
+}
+
+/* 前缀提高特异性，压过全局 input[type="text"] 的固定宽度 */
+.color-picker .color-field {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.color-picker .color-field input {
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  text-align: center;
+  user-select: text;
+}
+
+.color-auto-button {
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.color-auto-button:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.color-auto-button.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.color-picker-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.color-picker-hint {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 620px) {
   .settings-shell {
     grid-template-columns: 1fr;

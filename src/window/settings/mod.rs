@@ -139,6 +139,12 @@ const TRANSLATION_KEYS: &[&str] = &[
     "tray_exit",
     "action_copy",
     "action_paste",
+    "color_picker_auto",
+    "color_picker_auto_hint",
+    "color_picker_ok",
+    "color_picker_cancel",
+    "color_picker_current",
+    "color_picker_original",
 ];
 
 #[derive(Serialize)]
