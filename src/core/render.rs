@@ -22,12 +22,15 @@ use crate::ui::expanded::spectrum::{
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
 use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mica_background};
-use crate::utils::color::{color_with_alpha, lyric_boundary_gradient_shader};
+use crate::utils::color::{
+    PLAYED_FALLBACK_COLOR, color_with_alpha, liquid_unplayed_color, lyric_boundary_gradient_shader,
+    pick_played_color,
+};
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
 use crate::utils::liquid_glass::{
-    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams,
-    draw_liquid_glass_with_backdrop, get_liquid_glass_background,
+    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams, backdrop_luminance,
+    display_luminance, draw_liquid_glass_with_backdrop, get_liquid_glass_background,
 };
 
 thread_local! {
@@ -710,24 +713,33 @@ pub fn draw_island_canvas(
     let expanded_alpha_f = (expansion_progress.powf(2.0)).clamp(0.0, 1.0) * (1.0 - hide_progress);
     let mini_alpha_f = (1.0 - expansion_progress * 1.5).clamp(0.0, 1.0) * (1.0 - hide_progress);
 
-    let palette = if island_style == "liquid_glass" {
-        liquid_palette.clone()
-    } else if expanded_alpha_f > 0.01 || mini_alpha_f > 0.01 {
-        get_media_palette(media)
+    // 液态玻璃未播放色的自动取值：按玻璃着色后的背景亮度在黑白两档间切换。
+    // 背景是实时折射的桌面内容，固定的浅色在亮背景上会糊；采样不可用时回退到默认文字色。
+    let liquid_unplayed = if island_style == "liquid_glass" && char_color_unplayed.is_none() {
+        let island_rect = (
+            win_x + offset_x.round() as i32,
+            win_y + offset_y.round() as i32,
+            current_w.round() as i32,
+            current_h.round() as i32,
+        );
+        let monitor_rect = (monitor_x, monitor_y, monitor_w as i32, monitor_h as i32);
+        backdrop_luminance(island_rect, monitor_rect).map(|content| {
+            liquid_unplayed_color(
+                display_luminance(content, liquid_glass_tint / 100.0, liquid_glass_siri),
+                dt,
+            )
+        })
     } else {
-        vec![
-            Color::from_rgb(180, 180, 180),
-            Color::from_rgb(100, 100, 100),
-        ]
+        None
     };
-
-    let resolved_char_unplayed = char_color_unplayed.unwrap_or(text_color);
+    let resolved_char_unplayed = char_color_unplayed
+        .or(liquid_unplayed)
+        .unwrap_or(text_color);
+    // 自动取值：从封面图像按色相投票选出主色，只有黑白灰的封面用浅蓝兜底
     let resolved_char_played = char_color_played.unwrap_or_else(|| {
-        palette
-            .first()
-            .filter(|c| !(c.r() >= 250 && c.g() >= 250 && c.b() >= 250))
-            .copied()
-            .unwrap_or(text_color)
+        get_cached_media_image_with_key(media)
+            .map(|(image, key)| pick_played_color(&image, &key))
+            .unwrap_or(PLAYED_FALLBACK_COLOR)
     });
 
     // 频谱填充：可见时取封面主色网格，不可见时用默认配色（避免无谓的解码开销）

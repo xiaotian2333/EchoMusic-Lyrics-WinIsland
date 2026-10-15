@@ -42,6 +42,24 @@ const MAX_WORK_SPAN: f32 = 12.0;
 const CAPTURE_TTL_MS: u128 = 1000;
 const FRAME_TTL_MS: u128 = 200;
 
+/// 岛屿材质的暗色遮罩颜色（`LiquidMaterial::island`，着色器里按 tint 混合）。
+const ISLAND_TINT: Color = Color::from_argb(95, 10, 11, 15);
+/// 岛屿材质按背景亮度追加的暗色遮罩强度上限（`LiquidMaterial::island`）。
+const ISLAND_LEGIBILITY: f32 = 0.32;
+
+// 岛屿下方内容亮度采样的参数。
+/// 采样结果的有效期：液态玻璃每帧都会来问一次，避免每帧截屏。
+const LUMINANCE_TTL_MS: u128 = 500;
+/// 采样时把岛屿矩形缩小的倍数，降低 GDI 读回量。
+const LUMINANCE_DOWNSCALE: i32 = 4;
+/// 采样区域短边小于该值时不采信（岛屿几乎完全离屏）。
+const LUMINANCE_MIN_SIDE: i32 = 4;
+
+thread_local! {
+    /// 最近一次采样到的岛屿下方内容亮度（None 表示这次采样失败）与时间戳。
+    static LUMINANCE_CACHE: RefCell<Option<(Option<f32>, Instant)>> = const { RefCell::new(None) };
+}
+
 /// 将岛屿窗口从 GDI 屏幕截图中排除（或恢复）。
 ///
 /// 液态玻璃需要截取窗口下方内容，必须排除自身避免自捕获反馈。
@@ -59,6 +77,112 @@ pub fn set_exclude_from_capture(hwnd: HWND, exclude: bool) {
             },
         );
     }
+}
+
+/// 岛屿下方桌面内容的平均亮度（0.0~1.0）；采样不可用时返回 None。
+///
+/// 窗口已通过 [`set_exclude_from_capture`] 排除在屏幕捕获之外，采到的是岛屿
+/// **下方**的内容，不会把岛上渲染的歌词算进来（否则会形成「白字抬高亮度 →
+/// 判定为亮背景 → 换成深色字」的自反馈抖动）。结果按 TTL 缓存：液态玻璃每帧
+/// 都会来问一次，不能每帧截屏；采样失败时沿用上一次的有效值，并且失败本身也
+/// 记进缓存，避免持续失败时每帧重试。
+///
+/// `island` 与 `monitor` 都是屏幕物理像素下的 (x, y, 宽, 高)。
+pub fn backdrop_luminance(
+    island: (i32, i32, i32, i32),
+    monitor: (i32, i32, i32, i32),
+) -> Option<f32> {
+    let cached = LUMINANCE_CACHE.with(|cell| *cell.borrow());
+    if let Some((value, at)) = cached
+        && at.elapsed().as_millis() < LUMINANCE_TTL_MS
+    {
+        return value;
+    }
+    let value = sample_content_luminance(island, monitor).or(cached.and_then(|(value, _)| value));
+    LUMINANCE_CACHE.with(|cell| *cell.borrow_mut() = Some((value, Instant::now())));
+    value
+}
+
+/// 截取岛屿矩形下方的屏幕内容并求平均亮度；区域离屏或截屏失败时返回 None。
+fn sample_content_luminance(
+    island: (i32, i32, i32, i32),
+    monitor: (i32, i32, i32, i32),
+) -> Option<f32> {
+    let (x, y, w, h) = island;
+    let (mon_x, mon_y, mon_w, mon_h) = monitor;
+    // 截屏源区域必须裁到显示器内：越界时 BitBlt 会失败并静默返回全黑图
+    let left = x.max(mon_x);
+    let top = y.max(mon_y);
+    let right = (x + w).min(mon_x + mon_w);
+    let bottom = (y + h).min(mon_y + mon_h);
+    let width = right - left;
+    let height = bottom - top;
+    if width < LUMINANCE_MIN_SIDE || height < LUMINANCE_MIN_SIDE {
+        return None;
+    }
+    let capture = capture_screen_bgra(ScreenCaptureRequest {
+        src_x: left,
+        src_y: top,
+        src_w: width,
+        src_h: height,
+        dst_w: (width / LUMINANCE_DOWNSCALE).max(1),
+        dst_h: (height / LUMINANCE_DOWNSCALE).max(1),
+        use_halftone: false,
+        force_opaque_alpha: true,
+    })?;
+    Some(average_luminance_bgra(&capture.pixels))
+}
+
+/// BGRA 像素缓冲的平均亮度（0.0~1.0）；权重取 BT.601，与封面取色口径一致。
+fn average_luminance_bgra(pixels: &[u8]) -> f32 {
+    let mut sum = 0.0_f32;
+    let mut count = 0_u32;
+    for pixel in pixels.chunks_exact(4) {
+        sum +=
+            0.299 * f32::from(pixel[2]) + 0.587 * f32::from(pixel[1]) + 0.114 * f32::from(pixel[0]);
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    sum / count as f32 / 255.0
+}
+
+/// 把岛屿下方内容的平均亮度换算成玻璃着色后的显示亮度。
+///
+/// 着色器会按内容亮度叠加暗色遮罩（`liquid.sksl`：
+/// `tintAmount = min(tint.a + legibility * smoothstep(0.35, 0.95, luma), 1.0)`），
+/// 亮背景经玻璃后会被明显压暗；判断前景文字该用深色还是浅色必须基于压暗后的
+/// 亮度，否则会在亮背景上错误地选深色字，反而更糊。
+///
+/// `siri` 样式把岛屿整体渐变压向黑色（迷你态几乎全黑），直接按最暗处理。
+pub fn display_luminance(content: f32, tint_strength: f32, siri: bool) -> f32 {
+    if siri {
+        return 0.0;
+    }
+    let content = content.clamp(0.0, 1.0);
+    let strength = tint_strength.max(0.0);
+    // 与 LiquidMaterial::with_tint 一致：遮罩不透明度与可读性强度都随 tint 缩放
+    let alpha = (f32::from(ISLAND_TINT.a()) * strength)
+        .round()
+        .clamp(0.0, 255.0)
+        / 255.0;
+    let legibility = ISLAND_LEGIBILITY * strength;
+    let amount = (alpha + legibility * smoothstep(0.35, 0.95, content)).min(1.0);
+    content + (tint_luminance() - content) * amount
+}
+
+/// 暗色遮罩 [`ISLAND_TINT`] 自身的 Rec.709 亮度，用于混合计算。
+fn tint_luminance() -> f32 {
+    let tint = ISLAND_TINT;
+    (0.2126 * f32::from(tint.r()) + 0.7152 * f32::from(tint.g()) + 0.0722 * f32::from(tint.b()))
+        / 255.0
+}
+
+/// 与 GLSL `smoothstep` 一致：`x` 在 `[edge0, edge1]` 之间时平滑过渡到 0..1。
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// 玻璃材质参数，移植自 WinIsland 的 LiquidMaterial。
@@ -99,8 +223,8 @@ impl LiquidMaterial {
             displacement_factor: 1.1,
             dispersion: 0.08,
             morph_dispersion: 0.06,
-            tint: Color::from_argb(95, 10, 11, 15),
-            legibility: 0.32,
+            tint: ISLAND_TINT,
+            legibility: ISLAND_LEGIBILITY,
             light: (-FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
             specular_strength: 0.75,
             opposite_specular_strength: 0.38,
@@ -875,5 +999,73 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    /// BGRA 缓冲的平均亮度按 BT.601 权重计算（字节序为 B、G、R、A）。
+    #[test]
+    fn average_luminance_bgra_uses_bt601_weights() {
+        assert!((average_luminance_bgra(&[255_u8; 4]) - 1.0).abs() < 1e-6);
+        assert_eq!(average_luminance_bgra(&[0_u8; 4]), 0.0);
+        assert!((average_luminance_bgra(&[0, 0, 255, 255]) - 0.299).abs() < 1e-6);
+        assert!((average_luminance_bgra(&[0, 255, 0, 255]) - 0.587).abs() < 1e-6);
+        assert!((average_luminance_bgra(&[255, 0, 0, 255]) - 0.114).abs() < 1e-6);
+        // 空缓冲不应 panic
+        assert_eq!(average_luminance_bgra(&[]), 0.0);
+    }
+
+    /// 玻璃越通透（tint 越低），越亮的桌面内容才会被判成「亮背景」。
+    ///
+    /// 默认 tint 的玻璃本身就把亮内容压到暗端，所以亮背景档只在用户调低 tint
+    /// 时才会出现——这是着色器行为决定的，不是阈值取错。
+    #[test]
+    fn display_luminance_reaches_light_band_only_with_weak_tint() {
+        // 默认 tint：纯白桌面经玻璃后仍是暗背景
+        assert!(display_luminance(1.0, 1.0, false) < 0.45);
+        // 通透玻璃：同样的白桌面足以越过深色档阈值
+        assert!(display_luminance(1.0, 0.6, false) > 0.55);
+        // 完全不压暗时保持内容本身的亮度
+        assert_eq!(display_luminance(0.9, 0.0, false), 0.9);
+    }
+
+    /// 显示亮度必须复现着色器的 tint 压暗：默认 tint 下纯白内容也会落到暗端。
+    #[test]
+    fn display_luminance_matches_shader_tint_model() {
+        // 默认配置：tint.a = 95/255、legibility = 0.32、smoothstep 在亮端取满
+        let default_tint = display_luminance(1.0, 1.0, false);
+        assert!(
+            (default_tint - 0.338).abs() < 0.005,
+            "与 liquid.sksl 的 tint 模型不符: {default_tint}"
+        );
+        assert!(
+            default_tint < 0.45,
+            "默认 tint 下亮桌面经玻璃后仍属暗背景，不该判成亮背景: {default_tint}"
+        );
+
+        // 完全透明的玻璃不压暗，亮桌面必须保持亮
+        assert_eq!(display_luminance(1.0, 0.0, false), 1.0);
+        // siri 样式整体压向黑色，按最暗处理
+        assert_eq!(display_luminance(1.0, 1.0, true), 0.0);
+
+        // 玻璃只把内容压向遮罩色，不会提亮：亮内容必被压暗
+        assert!(display_luminance(0.5, 1.0, false) < 0.5);
+        assert!(display_luminance(1.0, 1.0, false) < 1.0);
+        // 默认 tint 下亮背景已被压暗，任何内容亮度都不该判成「亮背景」，
+        // 否则会在深色玻璃上错用深色字
+        for step in 0..=10 {
+            let value = display_luminance(step as f32 / 10.0, 1.0, false);
+            assert!(value < 0.45, "默认 tint 下不该出现亮背景判定: {value}");
+        }
+        // tint 越强压得越暗
+        assert!(display_luminance(0.8, 2.0, false) < display_luminance(0.8, 0.5, false));
+    }
+
+    /// smoothstep 与 GLSL 语义一致：两端夹取，中点取 0.5。
+    #[test]
+    fn smoothstep_matches_glsl() {
+        assert_eq!(smoothstep(0.0, 1.0, -1.0), 0.0);
+        assert_eq!(smoothstep(0.0, 1.0, 2.0), 1.0);
+        assert!((smoothstep(0.0, 1.0, 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(smoothstep(0.35, 0.95, 0.2), 0.0);
+        assert_eq!(smoothstep(0.35, 0.95, 1.0), 1.0);
     }
 }
