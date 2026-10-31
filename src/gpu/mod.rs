@@ -17,6 +17,7 @@
 mod backdrop;
 mod capture;
 mod capture_dda;
+mod capture_magnifier;
 mod device;
 mod target;
 
@@ -123,6 +124,8 @@ pub(crate) struct BackdropCaptureFrame {
 pub(crate) struct GpuIsland {
     hwnd_raw: isize,
     backend: CaptureBackend,
+    /// 液态玻璃-WGC 兼容模式：放大镜采集背景，岛对截图与录屏可见。
+    wgc_compat: bool,
     device: D3DDevice,
     target: RenderTarget,
     backdrop: Option<SharedBackdrop>,
@@ -137,15 +140,17 @@ impl GpuIsland {
         width: u32,
         height: u32,
         backend: CaptureBackend,
+        wgc_compat: bool,
     ) -> Result<Self, String> {
         let mut device = D3DDevice::new()?;
         let target = device.create_target(hwnd_raw, width.max(1), height.max(1))?;
         log::info!(
-            "GPU 渲染管线已启用（D3D12 + DirectComposition 合成交换链，背板后端 {backend:?}）"
+            "GPU 渲染管线已启用（D3D12 + DirectComposition 合成交换链，背板后端 {backend:?}，兼容模式 {wgc_compat}）"
         );
         Ok(Self {
             hwnd_raw,
             backend,
+            wgc_compat,
             device,
             target,
             backdrop: None,
@@ -217,7 +222,12 @@ impl GpuIsland {
             if !ready {
                 return None;
             }
-            match BackdropCapture::new(self.hwnd_raw, self.device.adapter_luid(), self.backend) {
+            match BackdropCapture::new(
+                self.hwnd_raw,
+                self.device.adapter_luid(),
+                self.backend,
+                self.wgc_compat,
+            ) {
                 Ok(capture) => {
                     self.capture = Some(capture);
                     self.capture_retry_at = None;

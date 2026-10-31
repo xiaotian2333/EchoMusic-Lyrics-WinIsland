@@ -5,11 +5,14 @@
 //!
 //! 在渲染适配器上创建 D3D11 设备；变化探针与脏区域用于节流，仅当窗口下方
 //! 内容变化时才唤醒渲染线程。捕获端不管理窗口的捕获排除标志
-//! （WDA / WCA_EXCLUDED_FROM_DDA 由应用层按样式统一设置）。
+//! （WDA / WCA_EXCLUDED_FROM_DDA 由应用层按样式统一设置），但兼容模式的
+//! 放大镜链路全部失效时会在运行时自行设置 WDA 以回退整屏捕获，并在 Drop
+//! 时清除这一自设标志（self_excluded）。
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows62::{
     Foundation::Metadata::ApiInformation,
@@ -23,14 +26,14 @@ use windows62::{
     Graphics::SizeInt32,
     Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus,
     Win32::{
-        Foundation::{HANDLE, HMODULE, HWND, LUID},
+        Foundation::{HANDLE, HMODULE, HWND, LUID, RECT},
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1},
             Direct3D11::{
                 D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
-                ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
+                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+                D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
                 ID3D11DeviceContext4, ID3D11Fence, ID3D11Multithread, ID3D11Texture2D,
             },
             Dxgi::{
@@ -52,11 +55,14 @@ use windows62::{
 
 use super::CaptureBackend;
 use super::capture_dda::DdaSession;
+use super::capture_magnifier::{FrameSink, Magnifier, PixelFrame};
 use super::{BackdropCaptureFrame, BackdropCaptureRequest, BackdropShare, Rect};
 
 const FRAME_BUFFERS: i32 = 2;
 const PROBE_STEP: usize = 2;
 const PROBE_ALIGN: u32 = 64;
+/// 像素回调子模式的帧率上限（CPU 读回成本高）。
+const PIXEL_RATE_LIMIT: u32 = 60;
 const BORDER_UNKNOWN: u8 = 0;
 const BORDER_PENDING: u8 = 1;
 const BORDER_OPTIONAL: u8 = 2;
@@ -87,7 +93,7 @@ pub(super) struct Shared {
     probe: Mutex<Probe>,
 }
 
-/// 最新背板帧的来源：WGC 帧池帧或 DDA 内部纹理拷贝。
+/// 最新背板帧的来源：WGC 帧池帧、DDA 内部纹理拷贝或放大镜像素回调帧。
 #[derive(Clone)]
 pub(super) enum FrameSource {
     Wgc(Direct3D11CaptureFrame),
@@ -95,6 +101,7 @@ pub(super) enum FrameSource {
         texture: ID3D11Texture2D,
         size: (u32, u32),
     },
+    Magnifier(Arc<PixelFrame>),
 }
 
 impl FrameSource {
@@ -103,6 +110,8 @@ impl FrameSource {
         match self {
             Self::Wgc(frame) => frame_texture(frame),
             Self::Dda { texture, .. } => Ok(texture.clone()),
+            // 放大镜像素帧由 copy() 经 upload_pixels 上传，不走纹理接口
+            Self::Magnifier(_) => Err(windows62::core::Error::empty()),
         }
     }
 
@@ -114,6 +123,7 @@ impl FrameSource {
                 Width: size.0 as i32,
                 Height: size.1 as i32,
             }),
+            Self::Magnifier(_) => Err(windows62::core::Error::empty()),
         }
     }
 }
@@ -130,6 +140,19 @@ struct Probe {
 enum Session {
     Wgc(WgcSession),
     Dda(DdaSession),
+    Magnifier(MagnifierSession),
+}
+
+/// 放大镜捕获会话：`capture` 为 Some 时宿主窗口由 WGC 捕捉，None 时帧经
+/// 放大镜像素回调直接送达（无 WGC 会话）。`magnifier` 声明在 `capture` 之后，
+/// Drop 时先关闭 WGC 会话再销毁放大镜宿主窗口。
+struct MagnifierSession {
+    monitor: HMONITOR,
+    origin: Cell<(i32, i32)>,
+    source: Cell<(i32, i32, i32, i32)>,
+    rate_hz: Cell<u32>,
+    capture: Option<WgcSession>,
+    magnifier: Magnifier,
 }
 
 impl Session {
@@ -137,6 +160,7 @@ impl Session {
         match self {
             Self::Wgc(session) => session.monitor,
             Self::Dda(session) => session.monitor(),
+            Self::Magnifier(session) => session.monitor,
         }
     }
 
@@ -144,6 +168,7 @@ impl Session {
         match self {
             Self::Wgc(session) => session.origin,
             Self::Dda(session) => session.origin(),
+            Self::Magnifier(session) => session.origin.get(),
         }
     }
 
@@ -156,6 +181,15 @@ impl Session {
                 }
             }
             Self::Dda(session) => session.sync_rate(rate_hz),
+            Self::Magnifier(session) => {
+                if session.rate_hz.get() != rate_hz {
+                    session.rate_hz.set(rate_hz);
+                    if let Some(capture) = &session.capture {
+                        set_rate(&capture.session, rate_hz);
+                    }
+                    session.magnifier.set_rate(rate_hz);
+                }
+            }
         }
     }
 
@@ -173,6 +207,19 @@ impl Session {
                 Ok(())
             }
             Self::Dda(_) => Ok(()),
+            Self::Magnifier(session) => match &session.capture {
+                Some(capture) => {
+                    if !capture.borderless.get() && borderless_allowed() {
+                        capture.borderless.set(true);
+                        hide_border(&capture.session);
+                    }
+                    if border_access_required() {
+                        return Err("无边框屏幕捕获权限不可用".to_string());
+                    }
+                    Ok(())
+                }
+                None => Ok(()),
+            },
         }
     }
 
@@ -223,14 +270,23 @@ pub(crate) struct BackdropCapture {
     verified: Cell<Rect>,
     write_value: AtomicU64,
     serial: Cell<u64>,
+    /// 兼容模式：优先经放大镜采集背景，岛窗口对捕获可见。
+    magnifier_mode: Cell<bool>,
+    /// 放大镜窗口捕捉不可用（如 Windows 10）时的像素回调子模式。
+    pixel_mode: Cell<bool>,
+    /// 放大镜像素帧的暂存上传纹理。
+    upload: RefCell<Option<(ID3D11Texture2D, u32, u32)>>,
+    /// 捕获端在放大镜链路全部失效回退整屏时自设的 WDA 标记；Drop 时据此清除。
+    self_excluded: Cell<bool>,
 }
 
 impl BackdropCapture {
-    /// 创建捕获端并按后端启动显示器捕获会话。
+    /// 创建捕获端并按后端启动显示器捕获会话；`wgc_compat` 仅对 WGC 后端生效。
     pub(crate) fn new(
         hwnd_raw: isize,
         adapter_luid: u64,
         backend: CaptureBackend,
+        wgc_compat: bool,
     ) -> Result<Self, String> {
         if backend == CaptureBackend::Wgc && !GraphicsCaptureSession::IsSupported().unwrap_or(false)
         {
@@ -267,6 +323,10 @@ impl BackdropCapture {
             verified: Cell::new(Rect::default()),
             write_value: AtomicU64::new(0),
             serial: Cell::new(0),
+            magnifier_mode: Cell::new(backend == CaptureBackend::Wgc && wgc_compat),
+            pixel_mode: Cell::new(false),
+            upload: RefCell::new(None),
+            self_excluded: Cell::new(false),
         };
         capture.ensure_session(60)?;
         Ok(capture)
@@ -278,7 +338,22 @@ impl BackdropCapture {
             log::warn!("背板捕获会话重启失败: {error}");
             return None;
         }
-        let origin = self.session.borrow().as_ref()?.origin();
+        // 像素回调子模式：放大镜源取 interest 与所在显示器的交集（屏幕外无内容）
+        if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref()
+            && session.capture.is_none()
+            && let Some(source) = monitor_clamped(self.hwnd, request.interest)
+        {
+            session.magnifier.set_source(source);
+        }
+        let (source, sequence) = {
+            let latest = lock(&self.shared.latest);
+            (latest.source.clone()?, latest.sequence)
+        };
+        // 放大镜像素帧的坐标基准跟随其源矩形；其余来源以会话原点为准
+        let origin = match &source {
+            FrameSource::Magnifier(frame) => frame.origin,
+            _ => self.session.borrow().as_ref()?.origin(),
+        };
         let interest = Rect {
             left: request.interest.left - origin.0,
             top: request.interest.top - origin.1,
@@ -288,10 +363,6 @@ impl BackdropCapture {
         *lock(&self.shared.interest) = interest;
         self.shared.pending.store(false, Ordering::Release);
         self.ensure_import(request.share)?;
-        let (source, sequence) = {
-            let latest = lock(&self.shared.latest);
-            (latest.source.clone()?, latest.sequence)
-        };
         let key = (
             request.share.generation,
             sequence,
@@ -319,8 +390,16 @@ impl BackdropCapture {
     ) -> Option<()> {
         let import = self.import.borrow();
         let import = import.as_ref()?;
-        let source = frame_source.texture().ok()?;
-        let content = frame_source.content_size().ok()?;
+        let (source, content) = match frame_source {
+            FrameSource::Magnifier(pixels) => (
+                self.upload_pixels(pixels)?,
+                SizeInt32 {
+                    Width: pixels.width as i32,
+                    Height: pixels.height as i32,
+                },
+            ),
+            other => (other.texture().ok()?, other.content_size().ok()?),
+        };
         let (local_x, local_y) = (key.2, key.3);
         let left = local_x.max(0);
         let top = local_y.max(0);
@@ -373,6 +452,60 @@ impl BackdropCapture {
         Some(())
     }
 
+    /// 把放大镜像素帧上传为 GPU 纹理；纹理按需创建并随帧尺寸复用。
+    fn upload_pixels(&self, pixels: &PixelFrame) -> Option<ID3D11Texture2D> {
+        if self
+            .upload
+            .borrow()
+            .as_ref()
+            .is_none_or(|(_, width, height)| *width < pixels.width || *height < pixels.height)
+        {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: pixels.width.max(1),
+                Height: pixels.height.max(1),
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture = None;
+            // SAFETY: 描述符已初始化，输出 Option 由本次调用初始化并拥有。
+            if let Err(error) =
+                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            {
+                log::warn!("放大镜像素上传纹理创建失败: {error}");
+                return None;
+            }
+            *self.upload.borrow_mut() = Some((texture?, desc.Width, desc.Height));
+        }
+        let texture = self.upload.borrow().as_ref()?.0.clone();
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: pixels.width,
+            bottom: pixels.height,
+            back: 1,
+        };
+        // SAFETY: 拷贝盒位于纹理内；pixels 持有 width 行、每行 width*4 字节的 BGRA 数据。
+        unsafe {
+            self.context.UpdateSubresource(
+                &texture,
+                0,
+                Some(&region),
+                pixels.pixels.as_ptr().cast(),
+                pixels.width * 4,
+                0,
+            );
+        }
+        Some(texture)
+    }
+
     fn ensure_import(&self, share: BackdropShare) -> Option<()> {
         if self
             .import
@@ -417,6 +550,22 @@ impl BackdropCapture {
     }
 
     fn ensure_session(&self, rate_hz: u32) -> Result<(), String> {
+        if self.pixel_mode.get() {
+            return self.ensure_pixel_session(rate_hz);
+        }
+        if self.magnifier_mode.get() {
+            match self.ensure_magnifier_session(rate_hz) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    log::warn!("放大镜背景不可用，回退整屏捕获: {error}");
+                    self.magnifier_mode.set(false);
+                    self.session.borrow_mut().take();
+                    *lock(&self.shared.latest) = Latest::default();
+                    self.copied.set(None);
+                    self.exclude_self();
+                }
+            }
+        }
         // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
         let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
         if let Some(session) = self.session.borrow().as_ref()
@@ -443,6 +592,121 @@ impl BackdropCapture {
         *self.session.borrow_mut() = Some(session);
         Ok(())
     }
+
+    /// 兼容模式主路径：放大镜宿主窗口渲染背景，再由 WGC 捕捉该宿主窗口。
+    fn ensure_magnifier_session(&self, rate_hz: u32) -> Result<(), String> {
+        let rect = window_rect(self.hwnd)?;
+        let source = (rect.left, rect.top, rect.right, rect.bottom);
+        if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref() {
+            if session.rate_hz.get() != rate_hz {
+                session.rate_hz.set(rate_hz);
+                if let Some(capture) = &session.capture {
+                    set_rate(&capture.session, rate_hz);
+                }
+                session.magnifier.set_rate(rate_hz);
+            }
+            if session.source.get() != source {
+                session.source.set(source);
+                session.origin.set((rect.left, rect.top));
+                session.magnifier.set_source(rect);
+            }
+            if let Some(capture) = &session.capture {
+                if !capture.borderless.get() && borderless_allowed() {
+                    capture.borderless.set(true);
+                    hide_border(&capture.session);
+                }
+                if border_access_required() {
+                    return Err("无边框屏幕捕获权限不可用".to_string());
+                }
+            }
+            return Ok(());
+        }
+        self.session.borrow_mut().take();
+        *lock(&self.shared.latest) = Latest::default();
+        self.copied.set(None);
+        let magnifier = Magnifier::start(rect, rate_hz, None)?;
+        let interop =
+            windows62::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .map_err(|error| format!("捕获互操作接口不可用: {error}"))?;
+        // SAFETY: 放大镜宿主是本进程拥有的存活窗口；WinRT 返回拥有的捕获项。
+        let item: GraphicsCaptureItem = match unsafe { interop.CreateForWindow(magnifier.host()) } {
+            Ok(item) => item,
+            Err(error) => {
+                log::info!("放大镜窗口捕捉不可用（{error}），改用像素回调直接读取放大镜帧");
+                drop(magnifier);
+                self.pixel_mode.set(true);
+                return self.ensure_pixel_session(rate_hz);
+            }
+        };
+        // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let (pool, capture_session, token, borderless) =
+            WgcSession::open(&item, &self.shared, rate_hz)?;
+        let origin = (rect.left, rect.top);
+        *self.session.borrow_mut() = Some(Session::Magnifier(MagnifierSession {
+            monitor,
+            origin: Cell::new(origin),
+            source: Cell::new(source),
+            rate_hz: Cell::new(rate_hz),
+            magnifier,
+            capture: Some(WgcSession {
+                monitor,
+                origin,
+                pool,
+                session: capture_session,
+                token,
+                rate_hz: Cell::new(rate_hz),
+                borderless: Cell::new(borderless),
+            }),
+        }));
+        Ok(())
+    }
+
+    /// 像素回调子模式：隐藏宿主经图像回调直接产出 BGRA 帧（无 WGC 会话）。
+    fn ensure_pixel_session(&self, rate_hz: u32) -> Result<(), String> {
+        let rate_hz = rate_hz.min(PIXEL_RATE_LIMIT);
+        if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref()
+            && session.capture.is_none()
+        {
+            if session.rate_hz.get() != rate_hz {
+                session.rate_hz.set(rate_hz);
+                session.magnifier.set_rate(rate_hz);
+            }
+            return Ok(());
+        }
+        self.session.borrow_mut().take();
+        *lock(&self.shared.latest) = Latest::default();
+        self.copied.set(None);
+        let weak = Arc::downgrade(&self.shared);
+        let sink: FrameSink = Box::new(move |frame| {
+            if let Some(shared) = weak.upgrade() {
+                shared.receive_pixels(frame);
+            }
+        });
+        let rect = window_rect(self.hwnd)?;
+        let magnifier = Magnifier::start(rect, rate_hz, Some(sink))?;
+        // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let origin = (rect.left, rect.top);
+        *self.session.borrow_mut() = Some(Session::Magnifier(MagnifierSession {
+            monitor,
+            origin: Cell::new(origin),
+            source: Cell::new((rect.left, rect.top, rect.right, rect.bottom)),
+            rate_hz: Cell::new(rate_hz),
+            magnifier,
+            capture: None,
+        }));
+        Ok(())
+    }
+
+    /// 放大镜链路全部失效回退整屏时，由捕获端自行设置 WDA 排除（岛对捕获隐身）。
+    fn exclude_self(&self) {
+        crate::utils::liquid_glass::set_exclude_from_capture(
+            windows::Win32::Foundation::HWND(self.hwnd.0),
+            true,
+        );
+        self.self_excluded.set(true);
+    }
 }
 
 impl WgcSession {
@@ -461,6 +725,32 @@ impl WgcSession {
         // SAFETY: monitor 是存活的显示器句柄；WinRT 返回拥有的捕获项。
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor) }
             .map_err(|error| format!("显示器捕获项创建失败: {error}"))?;
+        let (pool, session, token, borderless) = Self::open(&item, shared, rate_hz)?;
+        Ok(Self {
+            monitor,
+            origin: (info.rcMonitor.left, info.rcMonitor.top),
+            pool,
+            session,
+            token,
+            rate_hz: Cell::new(rate_hz),
+            borderless: Cell::new(borderless),
+        })
+    }
+
+    /// 从既有捕获项构建帧池与会话；整屏与放大镜宿主窗口捕捉共用。
+    fn open(
+        item: &GraphicsCaptureItem,
+        shared: &Arc<Shared>,
+        rate_hz: u32,
+    ) -> Result<
+        (
+            Direct3D11CaptureFramePool,
+            GraphicsCaptureSession,
+            i64,
+            bool,
+        ),
+        String,
+    > {
         let size = item
             .Size()
             .map_err(|error| format!("捕获尺寸不可用: {error}"))?;
@@ -484,7 +774,7 @@ impl WgcSession {
             ))
             .map_err(|error| format!("捕获帧回调注册失败: {error}"))?;
         let session = pool
-            .CreateCaptureSession(&item)
+            .CreateCaptureSession(item)
             .map_err(|error| format!("捕获会话创建失败: {error}"))?;
         let _ = session.SetIsCursorCaptureEnabled(false);
         let borderless = borderless_allowed();
@@ -499,15 +789,7 @@ impl WgcSession {
         session
             .StartCapture()
             .map_err(|error| format!("捕获启动失败: {error}"))?;
-        Ok(Self {
-            monitor,
-            origin: (info.rcMonitor.left, info.rcMonitor.top),
-            pool,
-            session,
-            token,
-            rate_hz: Cell::new(rate_hz),
-            borderless: Cell::new(borderless),
-        })
+        Ok((pool, session, token, borderless))
     }
 }
 
@@ -520,6 +802,23 @@ impl Drop for WgcSession {
 }
 
 impl Shared {
+    /// 放大镜像素回调（放大镜线程）：与上一帧完全相同则忽略，否则发布新帧。
+    fn receive_pixels(&self, frame: PixelFrame) {
+        {
+            let mut latest = lock(&self.latest);
+            if let Some(FrameSource::Magnifier(previous)) = latest.source.as_ref()
+                && **previous == frame
+            {
+                return;
+            }
+            latest.source = Some(FrameSource::Magnifier(Arc::new(frame)));
+            latest.sequence += 1;
+        }
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            crate::gpu::wake();
+        }
+    }
+
     /// 采样窗口下方内容判断是否变化（探针），避免无谓重绘。
     fn probe_changed(&self, frame: &Direct3D11CaptureFrame, interest: Rect) -> bool {
         let content = *lock(&self.content);
@@ -697,6 +996,14 @@ impl Drop for BackdropCapture {
         self.session.borrow_mut().take();
         *lock(&self.shared.latest) = Latest::default();
         self.import.borrow_mut().take();
+        self.upload.borrow_mut().take();
+        // 仅清除捕获端回退时自设的 WDA；应用层管理的标志由应用层负责
+        if self.self_excluded.get() {
+            crate::utils::liquid_glass::set_exclude_from_capture(
+                windows::Win32::Foundation::HWND(self.hwnd.0),
+                false,
+            );
+        }
     }
 }
 
@@ -775,6 +1082,40 @@ fn intersection(a: Rect, b: Rect) -> Rect {
 
 pub(super) fn intersects(a: Rect, b: Rect) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// 读取悬浮窗的屏幕矩形；矩形为空或不可用时返回错误。
+fn window_rect(hwnd: HWND) -> Result<RECT, String> {
+    let mut rect = RECT::default();
+    // SAFETY: hwnd 是存活的悬浮窗且 rect 是有效输出。
+    unsafe { windows62::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) }
+        .map_err(|error| format!("悬浮窗边界不可用: {error}"))?;
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return Err("悬浮窗边界为空".to_string());
+    }
+    Ok(rect)
+}
+
+/// 把屏幕矩形裁剪到悬浮窗所在显示器内；放大镜像素回调只产出屏幕内区域。
+fn monitor_clamped(hwnd: HWND, rect: Rect) -> Option<RECT> {
+    // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: monitor 来自 MonitorFromWindow，info 是尺寸正确的输出结构。
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let bounds = info.rcMonitor;
+    let clamped = RECT {
+        left: rect.left.max(bounds.left),
+        top: rect.top.max(bounds.top),
+        right: rect.right.min(bounds.right),
+        bottom: rect.bottom.min(bounds.bottom),
+    };
+    (clamped.right > clamped.left && clamped.bottom > clamped.top).then_some(clamped)
 }
 
 struct AgileDevice(IDirect3DDevice);

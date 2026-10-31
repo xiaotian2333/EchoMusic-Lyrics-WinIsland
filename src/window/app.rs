@@ -1107,7 +1107,13 @@ impl App {
         } else {
             crate::gpu::CaptureBackend::Wgc
         };
-        match crate::gpu::GpuIsland::new(hwnd_raw, self.os_w, self.os_h, backend) {
+        match crate::gpu::GpuIsland::new(
+            hwnd_raw,
+            self.os_w,
+            self.os_h,
+            backend,
+            self.config.liquid_glass_compat_capture,
+        ) {
             Ok(gpu) => {
                 self.gpu_island = Some(gpu);
                 self.gpu_retry_at = None;
@@ -1230,6 +1236,7 @@ impl App {
             let old_max_h = self.config.expanded_height;
             let old_lyrics_scroll_max_width = self.config.lyrics_scroll_max_width;
             let old_style = self.config.island_style.clone();
+            let old_compat = self.config.liquid_glass_compat_capture;
             let old_mini_shape = self.config.mini_cover_shape.clone();
             let old_expanded_shape = self.config.expanded_cover_shape.clone();
             let old_font = self.config.custom_font_path.clone();
@@ -1237,10 +1244,20 @@ impl App {
             self.config = current_config;
             self.last_foreground_process = None;
             self.effective_dock_position = self.config.dock_position;
-            if old_style != self.config.island_style {
+            if old_style != self.config.island_style
+                || old_compat != self.config.liquid_glass_compat_capture
+            {
                 crate::utils::backdrop::clear_dynamic_bg_cache();
                 clear_mica_cache();
                 clear_liquid_glass_cache();
+                // 先释放 GPU 管线（Drop 会分离合成视觉树并关闭捕获会话）：
+                // 兼容模式下旧捕获可能在放大镜回退时自设过 WDA，Drop 会将其清除，
+                // 因此必须在重新设置排除标志之前完成释放
+                self.gpu_island = None;
+                self.gpu_retry_at = None;
+                // 毛玻璃宿主背板同理：Drop 会隐藏伴随窗口并关闭合成目标
+                self.host_backdrop = None;
+                self.host_backdrop_retry_at = None;
                 if let Ok(handle) = window.window_handle() {
                     let raw = handle.as_raw();
                     if let RawWindowHandle::Win32(win32_handle) = raw {
@@ -1249,9 +1266,12 @@ impl App {
                             disable_mica(hwnd);
                         }
                         // 离开/进入液态玻璃时按变体切换对应的捕获排除标志：
-                        // WGC 变体用 WDA（对全部捕获隐身），DXGI 变体用
+                        // WGC 变体用 WDA（兼容模式关闭时对全部捕获隐身，开启时
+                        // 保持可见由放大镜提供背景），DXGI 变体用
                         // WCA_EXCLUDED_FROM_DDA（仅 DXGI 捕获隐身，录屏软件仍可见）
-                        if old_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
+                        if old_style == ISLAND_STYLE_LIQUID_GLASS_WGC
+                            || old_compat != self.config.liquid_glass_compat_capture
+                        {
                             set_exclude_from_capture(hwnd, false);
                         }
                         if old_style == ISLAND_STYLE_LIQUID_GLASS_DXGI
@@ -1260,7 +1280,10 @@ impl App {
                             crate::gpu::set_excluded_from_dda(hwnd_raw, false);
                         }
                         if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
-                            set_exclude_from_capture(hwnd, true);
+                            set_exclude_from_capture(
+                                hwnd,
+                                !self.config.liquid_glass_compat_capture,
+                            );
                         }
                         if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI
                             && let Some(hwnd_raw) = self.hwnd_raw
@@ -1269,13 +1292,6 @@ impl App {
                         }
                     }
                 }
-                // 样式切换时释放 GPU 管线（Drop 会分离合成视觉树并关闭捕获会话）；
-                // 进入液态玻璃时清除冷却，下一帧立即尝试重建
-                self.gpu_island = None;
-                self.gpu_retry_at = None;
-                // 毛玻璃宿主背板同理：Drop 会隐藏伴随窗口并关闭合成目标
-                self.host_backdrop = None;
-                self.host_backdrop_retry_at = None;
             }
 
             if old_mini_shape != self.config.mini_cover_shape
@@ -1506,7 +1522,8 @@ impl ApplicationHandler for App {
                     WS_MAXIMIZEBOX.0 as isize | WS_THICKFRAME.0 as isize,
                 );
                 if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
-                    set_exclude_from_capture(hwnd, true);
+                    // 兼容模式开启时不设 WDA：岛对截图与录屏可见，背景由放大镜提供
+                    set_exclude_from_capture(hwnd, !self.config.liquid_glass_compat_capture);
                 }
                 if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
                     crate::gpu::set_excluded_from_dda(win32_handle.hwnd.get(), true);

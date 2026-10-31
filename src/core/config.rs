@@ -179,6 +179,9 @@ pub struct AppConfig {
     pub liquid_glass_tint: f32,
     #[serde(default = "default_liquid_glass_siri")]
     pub liquid_glass_siri: bool,
+    /// 液态玻璃-WGC 兼容模式：放大镜采集背景，截图与录屏中灵动岛可见。
+    #[serde(default = "default_liquid_glass_compat_capture")]
+    pub liquid_glass_compat_capture: bool,
     #[serde(default = "default_glass_blur")]
     pub glass_blur: f32,
     #[serde(default = "default_lyrics_transition_animation")]
@@ -276,6 +279,10 @@ fn default_liquid_glass_tint() -> f32 {
 }
 
 fn default_liquid_glass_siri() -> bool {
+    false
+}
+
+fn default_liquid_glass_compat_capture() -> bool {
     false
 }
 
@@ -454,6 +461,7 @@ impl Default for AppConfig {
             liquid_glass_dispersion: 40.0,
             liquid_glass_tint: 100.0,
             liquid_glass_siri: false,
+            liquid_glass_compat_capture: false,
             glass_blur: 0.0,
             lyrics_transition_animation: "blur".to_string(),
             show_lyrics: true,

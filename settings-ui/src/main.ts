@@ -410,7 +410,7 @@ function liquidGlassRows() {
   ) {
     return [];
   }
-  return [
+  const rows = [
     numberRow(tr("liquid_glass_blur"), "liquid_glass_blur"),
     numberRow(tr("liquid_glass_refraction"), "liquid_glass_refraction"),
     numberRow(tr("liquid_glass_dispersion"), "liquid_glass_dispersion"),
@@ -418,6 +418,19 @@ function liquidGlassRows() {
     switchRow(tr("liquid_glass_siri"), "liquid_glass_siri"),
     infoRow(tr("liquid_glass_siri_note")),
   ];
+  if (config.island_style === "liquid_glass_wgc") {
+    rows.push(
+      switchRow(tr("liquid_glass_compat_capture"), "liquid_glass_compat_capture"),
+      infoRow(
+        tr(
+          config.liquid_glass_compat_capture
+            ? "liquid_glass_compat_capture_note"
+            : "style_liquid_note",
+        ),
+      ),
+    );
+  }
+  return rows;
 }
 
 function glassRows() {
