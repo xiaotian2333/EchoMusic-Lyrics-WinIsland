@@ -168,6 +168,10 @@ nav {
   min-width: 0;
   height: 100%;
   overflow-y: auto;
+  /* 滚动容器自身裁剪绘制与布局溢出：否则其内容溢出会泄漏进根滚动器的
+     scrollHeight，render() 全量重建 DOM 时浏览器的滚动锚定会把文档滚偏，
+     表现为整页布局上移错乱（overflow:hidden 无法阻止程序化滚动） */
+  contain: paint;
   padding: 22px 26px 28px;
 }
 

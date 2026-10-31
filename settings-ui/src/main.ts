@@ -682,6 +682,9 @@ function render() {
     if (el) {
       el.scrollTop = scrollPos;
     }
+    // DOM 重建可能触发浏览器滚动锚定偏移根滚动器；复位兜底，避免整页上移错乱
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
     // 滚动位置恢复之后再定位，顺序不能颠倒
     repositionColorPicker();
   });
