@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::time::Duration;
 
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
@@ -179,6 +180,8 @@ pub struct StyleParams<'a> {
     pub host_backdrop: bool,
     /// 迷你歌词切换动画：blur / slide / fade（WinIsland 原版三选一）
     pub lyrics_transition_animation: &'a str,
+    /// dynamic 样式切歌间隙沿用旧封面背景的宽限时长
+    pub dynamic_cover_grace: Duration,
 }
 
 /// 计算岛屿在窗口内的左上角偏移；`layout.hide_progress` 会把岛屿推出屏幕。
@@ -516,6 +519,7 @@ pub fn draw_island_canvas(
         liquid_glass_siri,
         host_backdrop,
         lyrics_transition_animation,
+        dynamic_cover_grace,
     } = style;
     canvas.clear(Color::TRANSPARENT);
 
@@ -698,7 +702,7 @@ pub fn draw_island_canvas(
     } else if island_style == "dynamic" {
         canvas.save();
         canvas.clip_rrect(rrect, ClipOp::Intersect, true);
-        if let Some(blurred_cover) = get_blurred_cover_background(media) {
+        if let Some(blurred_cover) = get_blurred_cover_background(media, dynamic_cover_grace) {
             // 防露底：铺一层深灰底，避免模糊图外缘透明带露出默认黑
             let mut base_paint = Paint::default();
             base_paint.set_color(Color::from_rgb(32, 32, 36));

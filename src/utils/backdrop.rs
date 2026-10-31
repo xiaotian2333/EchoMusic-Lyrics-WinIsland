@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{
@@ -25,6 +25,8 @@ thread_local! {
     static MICA_CACHE: RefCell<Option<MicaCache>> = const { RefCell::new(None) };
     // dynamic 样式的预模糊封面，单槽缓存，key 为媒体缓存 key（切歌自动失效）
     static BLURRED_COVER_CACHE: RefCell<Option<(String, Image)>> = const { RefCell::new(None) };
+    // 切歌间隙封面数据缺失的宽限起点；None 表示当前 key 有效或不在缺失状态
+    static BLURRED_COVER_STALE_SINCE: RefCell<Option<Instant>> = const { RefCell::new(None) };
     // Smooth colour transition state for dynamic background (Apple HIG ~400ms).
     static BG_TRANSITION: RefCell<BgTransition> = const {
         RefCell::new(BgTransition {
@@ -164,11 +166,18 @@ pub fn clear_mica_cache() {
 
 /// 返回预模糊的 64×64 封面图，供 dynamic 样式放大绘制旋转漂移背景。
 /// key 命中直接克隆返回，未命中重新生成；无封面时返回 None 走纯色回退。
-pub fn get_blurred_cover_background(media: &MediaInfo) -> Option<Image> {
+/// 切歌间隙新封面数据尚未到达时，在 grace 时间内沿用旧封面避免闪黑，超时才回退。
+pub fn get_blurred_cover_background(media: &MediaInfo, grace: Duration) -> Option<Image> {
     if media.title.is_empty() {
+        BLURRED_COVER_STALE_SINCE.with(|cell| *cell.borrow_mut() = None);
         return None;
     }
-    let (image, cache_key) = get_cached_media_image_with_key(media)?;
+    let (image, cache_key) = match get_cached_media_image_with_key(media) {
+        Some(v) => v,
+        None => return stale_cover_within_grace(grace),
+    };
+
+    BLURRED_COVER_STALE_SINCE.with(|cell| *cell.borrow_mut() = None);
 
     let cached = BLURRED_COVER_CACHE.with(|cell| {
         let cache = cell.borrow();
@@ -181,11 +190,26 @@ pub fn get_blurred_cover_background(media: &MediaInfo) -> Option<Image> {
         return cached;
     }
 
-    let blurred = blur_cover(&image)?;
+    let blurred = match blur_cover(&image) {
+        Some(b) => b,
+        None => return stale_cover_within_grace(grace),
+    };
     BLURRED_COVER_CACHE.with(|cell| {
         *cell.borrow_mut() = Some((cache_key, blurred.clone()));
     });
     Some(blurred)
+}
+
+/// 宽限期内返回旧模糊封面（首次封面缺失时刻起计时），超时返回 None 回退纯色。
+fn stale_cover_within_grace(grace: Duration) -> Option<Image> {
+    let stale = BLURRED_COVER_STALE_SINCE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        *cell.get_or_insert_with(Instant::now)
+    });
+    if stale.elapsed() >= grace {
+        return None;
+    }
+    BLURRED_COVER_CACHE.with(|cell| cell.borrow().as_ref().map(|(_, img)| img.clone()))
 }
 
 /// 生成 64×64 预模糊封面。skia image_filters::blur 不支持 Clamp tile 模式，
@@ -363,9 +387,8 @@ pub fn clear_dynamic_bg_cache() {
             start: None,
         };
     });
-    BLURRED_COVER_CACHE.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
+    // BLURRED_COVER_CACHE 故意不清：切歌间隙要靠旧封面撑过宽限期，
+    // key 校验会在新封面到达后自动覆盖它
 }
 
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {

@@ -1848,6 +1848,9 @@ impl ApplicationHandler for App {
                                 lyrics_transition_animation: &self
                                     .config
                                     .lyrics_transition_animation,
+                                dynamic_cover_grace: Duration::from_secs_f32(
+                                    self.config.auto_hide_delay,
+                                ),
                             },
                         };
                         let mut gpu_error: Option<String> = None;
