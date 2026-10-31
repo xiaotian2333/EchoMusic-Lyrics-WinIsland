@@ -11,12 +11,20 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
 
+use crate::core::media_info::MediaInfo;
+use crate::ui::expanded::music_view::get_cached_media_image_with_key;
 use crate::utils::gdi_capture::{ScreenCaptureRequest, capture_screen_bgra};
+
+/// 歌曲封面背景的预模糊尺寸与模糊半径（与上游 WinIsland 一致）
+const BLURRED_COVER_SIZE: i32 = 64;
+const BLURRED_COVER_SIGMA: f32 = 8.0;
 
 thread_local! {
     static DYNAMIC_BG_CACHE: RefCell<Option<(String, Color)>> = const { RefCell::new(None) };
     static LAST_VALID_COLOR: RefCell<Option<Color>> = const { RefCell::new(None) };
     static MICA_CACHE: RefCell<Option<MicaCache>> = const { RefCell::new(None) };
+    // dynamic 样式的预模糊封面，单槽缓存，key 为媒体缓存 key（切歌自动失效）
+    static BLURRED_COVER_CACHE: RefCell<Option<(String, Image)>> = const { RefCell::new(None) };
     // Smooth colour transition state for dynamic background (Apple HIG ~400ms).
     static BG_TRANSITION: RefCell<BgTransition> = const {
         RefCell::new(BgTransition {
@@ -154,6 +162,87 @@ pub fn clear_mica_cache() {
     });
 }
 
+/// 返回预模糊的 64×64 封面图，供 dynamic 样式放大绘制旋转漂移背景。
+/// key 命中直接克隆返回，未命中重新生成；无封面时返回 None 走纯色回退。
+pub fn get_blurred_cover_background(media: &MediaInfo) -> Option<Image> {
+    if media.title.is_empty() {
+        return None;
+    }
+    let (image, cache_key) = get_cached_media_image_with_key(media)?;
+
+    let cached = BLURRED_COVER_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        cache
+            .as_ref()
+            .filter(|(key, _)| *key == cache_key)
+            .map(|(_, img)| img.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+
+    let blurred = blur_cover(&image)?;
+    BLURRED_COVER_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((cache_key, blurred.clone()));
+    });
+    Some(blurred)
+}
+
+/// 生成 64×64 预模糊封面。skia image_filters::blur 不支持 Clamp tile 模式，
+/// 先无模糊 cover-fit 垫底画满，再叠一层模糊图，消除放大后外缘的透明边；
+/// 透明边缘只可能出现在绘制正方形外缘，被圆角矩形裁剪遮蔽。
+fn blur_cover(image: &Image) -> Option<Image> {
+    let size_f = BLURRED_COVER_SIZE as f32;
+    let mut surface =
+        surfaces::raster_n32_premul(ISize::new(BLURRED_COVER_SIZE, BLURRED_COVER_SIZE))?;
+    let canvas = surface.canvas();
+    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+
+    let img_w = image.width() as f32;
+    let img_h = image.height() as f32;
+    let src_rect = if img_w > 0.0 && img_h > 0.0 {
+        let aspect = img_w / img_h;
+        if aspect > 1.0 {
+            let crop_w = img_h;
+            let sx = (img_w - crop_w) / 2.0;
+            Some(Rect::from_xywh(sx, 0.0, crop_w, img_h))
+        } else {
+            let crop_h = img_w;
+            let sy = (img_h - crop_h) / 2.0;
+            Some(Rect::from_xywh(0.0, sy, img_w, crop_h))
+        }
+    } else {
+        None
+    };
+    let src_draw = src_rect.as_ref().map(|r| (r, SrcRectConstraint::Fast));
+
+    let mut base_paint = Paint::default();
+    base_paint.set_anti_alias(true);
+    canvas.draw_image_rect_with_sampling_options(
+        image,
+        src_draw,
+        Rect::from_xywh(0.0, 0.0, size_f, size_f),
+        sampling,
+        &base_paint,
+    );
+
+    let mut blur_paint = Paint::default();
+    if let Some(filter) =
+        image_filters::blur((BLURRED_COVER_SIGMA, BLURRED_COVER_SIGMA), None, None, None)
+    {
+        blur_paint.set_image_filter(filter);
+    }
+    canvas.draw_image_rect_with_sampling_options(
+        image,
+        None,
+        Rect::from_xywh(0.0, 0.0, size_f, size_f),
+        sampling,
+        &blur_paint,
+    );
+
+    Some(surface.image_snapshot())
+}
+
 fn capture_and_blur_mica(
     monitor_x: i32,
     monitor_y: i32,
@@ -273,6 +362,9 @@ pub fn clear_dynamic_bg_cache() {
             display: None,
             start: None,
         };
+    });
+    BLURRED_COVER_CACHE.with(|cell| {
+        *cell.borrow_mut() = None;
     });
 }
 

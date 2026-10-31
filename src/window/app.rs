@@ -110,6 +110,7 @@ pub struct App {
     manually_hidden: bool,
     drag_has_moved: bool,
     last_frame_time: Instant,
+    dynamic_heartbeat_at: Instant,
     last_mon_size: (u32, u32),
     last_mon_pos: (i32, i32),
     lyric_scroll_active: bool,
@@ -183,6 +184,7 @@ impl Default for App {
             manually_hidden: false,
             drag_has_moved: false,
             last_frame_time: Instant::now(),
+            dynamic_heartbeat_at: Instant::now(),
             last_mon_size: (0, 0),
             last_mon_pos: (0, 0),
             lyric_scroll_active: false,
@@ -2284,6 +2286,19 @@ impl ApplicationHandler for App {
             || self.spring_r.velocity.abs() > 0.001
             || self.spring_view.velocity.abs() > 0.001
         {
+            window.request_redraw();
+        }
+
+        // dynamic 样式的封面背景动画（旋转/漂移）基于绝对时间推进，暂停收起时
+        // 其余重绘源全部停止，画面会冻结；靠 1Hz 心跳维持动画可见地游移
+        if self.config.island_style == "dynamic"
+            && music_active
+            && !media.title.is_empty()
+            && !self.auto_hidden
+            && !self.manually_hidden
+            && self.dynamic_heartbeat_at.elapsed() >= Duration::from_secs(1)
+        {
+            self.dynamic_heartbeat_at = Instant::now();
             window.request_redraw();
         }
         let elapsed = frame_start.elapsed();

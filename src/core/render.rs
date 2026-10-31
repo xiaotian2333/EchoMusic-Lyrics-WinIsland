@@ -24,7 +24,9 @@ use crate::ui::expanded::spectrum::{
     DrawVisualizerParams, default_spectrum_fill, draw_visualizer, get_media_spectrum_fill,
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
-use crate::utils::backdrop::{get_dynamic_bg_color, get_last_valid_color, get_mica_background};
+use crate::utils::backdrop::{
+    get_blurred_cover_background, get_dynamic_bg_color, get_last_valid_color, get_mica_background,
+};
 use crate::utils::color::{
     PLAYED_FALLBACK_COLOR, color_with_alpha, liquid_unplayed_color, lyric_boundary_gradient_shader,
     pick_played_color,
@@ -696,15 +698,65 @@ pub fn draw_island_canvas(
     } else if island_style == "dynamic" {
         canvas.save();
         canvas.clip_rrect(rrect, ClipOp::Intersect, true);
-        if let Some((img, cache_key)) = get_cached_media_image_with_key(media) {
-            bg_color = get_dynamic_bg_color(&img, &cache_key);
-        } else if let Some(last_color) = get_last_valid_color() {
-            bg_color = last_color;
+        if let Some(blurred_cover) = get_blurred_cover_background(media) {
+            // 防露底：铺一层深灰底，避免模糊图外缘透明带露出默认黑
+            let mut base_paint = Paint::default();
+            base_paint.set_color(Color::from_rgb(32, 32, 36));
+            base_paint.set_anti_alias(true);
+            canvas.draw_rect(rect, &base_paint);
+
+            // 动画相位取绝对时间，与启动时刻无关，展开/收起不会产生跳变；
+            // 旋转 0.03 rad/s、漂移幅值 20/15（与上游 WinIsland 一致）
+            const ROTATE_SPEED: f64 = 0.03;
+            const DRIFT_SPEED_X: f64 = 0.15;
+            const DRIFT_SPEED_Y: f64 = 0.12;
+            const DRIFT_AMP_X: f64 = 20.0;
+            const DRIFT_AMP_Y: f64 = 15.0;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let angle_rad = (now * ROTATE_SPEED) % (2.0 * std::f64::consts::PI);
+            let dx = (now * DRIFT_SPEED_X).sin() * DRIFT_AMP_X;
+            let dy = (now * DRIFT_SPEED_Y).cos() * DRIFT_AMP_Y;
+
+            let cx = offset_x + current_w / 2.0;
+            let cy = offset_y + current_h / 2.0;
+            // 2.6 倍对角线：旋转任意角度时圆角矩形仍被放大封面完全覆盖
+            let side_len = 2.6 * (current_w / 2.0).hypot(current_h / 2.0);
+
+            canvas.save();
+            canvas.translate(((cx + dx as f32), (cy + dy as f32)));
+            canvas.rotate(angle_rad.to_degrees() as f32, None);
+            let mut cover_paint = Paint::default();
+            cover_paint.set_anti_alias(true);
+            let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+            canvas.draw_image_rect_with_sampling_options(
+                &blurred_cover,
+                None,
+                Rect::from_xywh(-side_len / 2.0, -side_len / 2.0, side_len, side_len),
+                sampling,
+                &cover_paint,
+            );
+            canvas.restore();
+
+            // 暗罩：保证前景文字可读
+            let mut overlay_paint = Paint::default();
+            overlay_paint.set_color(Color::from_argb(120, 20, 20, 24));
+            overlay_paint.set_anti_alias(true);
+            canvas.draw_rect(rect, &overlay_paint);
+        } else {
+            // 无封面回退链：封面主色（平滑过渡）→ 上次有效主色 → 黑
+            if let Some((img, cache_key)) = get_cached_media_image_with_key(media) {
+                bg_color = get_dynamic_bg_color(&img, &cache_key);
+            } else if let Some(last_color) = get_last_valid_color() {
+                bg_color = last_color;
+            }
+            let mut bg_paint = Paint::default();
+            bg_paint.set_color(bg_color);
+            bg_paint.set_anti_alias(true);
+            canvas.draw_rrect(rrect, &bg_paint);
         }
-        let mut bg_paint = Paint::default();
-        bg_paint.set_color(bg_color);
-        bg_paint.set_anti_alias(true);
-        canvas.draw_rrect(rrect, &bg_paint);
     } else {
         canvas.save();
         canvas.clip_rrect(rrect, ClipOp::Intersect, true);
