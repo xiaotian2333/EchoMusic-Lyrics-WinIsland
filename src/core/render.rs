@@ -14,9 +14,11 @@ use crate::core::config::{
     DockPosition, ISLAND_STYLE_LIQUID_GLASS_WGC, LyricsFilterScope, PADDING, TOP_OFFSET,
     is_liquid_glass_style,
 };
+use crate::core::i18n::tr;
 use crate::core::lyrics::LyricCharacter;
 use crate::core::media_info::MediaInfo;
 use crate::icons::controls::draw_play_button;
+use crate::icons::volume::draw_volume_icon;
 use crate::ui::expanded::music_view::{
     DrawMusicPageParams, draw_music_page, draw_text_cached, get_cached_media_image,
     get_cached_media_image_with_key, get_media_palette, get_visualizer_hit_rect,
@@ -104,6 +106,110 @@ fn lyric_transition_blur_filter(sigma: f32) -> Option<skia_safe::ImageFilter> {
     )
 }
 
+pub struct DrawVolumeHintParams<'a> {
+    pub canvas: &'a Canvas,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub scale: f32,
+    /// 提示整体透明度（显示期 1.0，淡出期递减）
+    pub alpha: f32,
+    /// 当前音量值 0-100
+    pub volume: f32,
+    pub color: Color,
+}
+
+/// 非展开态滚轮调音量时的音量提示：图标 + 标签 + 胶囊音量条，
+/// 几何与上游 WinIsland 一致；显示期间替代 mini 原内容。
+pub fn draw_volume_hint(params: DrawVolumeHintParams<'_>) {
+    let DrawVolumeHintParams {
+        canvas,
+        offset_x,
+        offset_y,
+        w,
+        h,
+        scale,
+        alpha,
+        volume,
+        color,
+    } = params;
+    let alpha_u8 = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+    if alpha_u8 == 0 {
+        return;
+    }
+    let center_y = offset_y + h / 2.0;
+
+    draw_volume_icon(
+        canvas,
+        offset_x + 21.0 * scale,
+        center_y,
+        alpha_u8,
+        20.0 * scale,
+        volume / 100.0,
+        color,
+    );
+
+    let label = tr("volume");
+    let label_size = 12.0 * scale;
+    let label_x = offset_x + 37.0 * scale;
+    let label_w = FontManager::global().measure_text_cached(
+        &label,
+        label_size,
+        skia_safe::FontStyle::normal(),
+    );
+    let mut label_paint = Paint::default();
+    label_paint.set_anti_alias(true);
+    label_paint.set_color(Color::from_argb(alpha_u8, color.r(), color.g(), color.b()));
+    draw_text_cached(DrawTextCachedParams {
+        canvas,
+        text: &label,
+        x: label_x,
+        y: center_y + 4.0 * scale,
+        size: label_size,
+        bold: false,
+        paint: &label_paint,
+    });
+
+    let track_left = label_x + 11.0 * scale + label_w;
+    let track_right = offset_x + w - 14.0 * scale;
+    let track_w = (track_right - track_left).max(1.0);
+    let track_h = 4.0 * scale;
+    let track_y = center_y - track_h / 2.0;
+
+    let mut track_paint = Paint::default();
+    track_paint.set_anti_alias(true);
+    track_paint.set_color(Color::from_argb(
+        (alpha_u8 as f32 * 0.28) as u8,
+        color.r(),
+        color.g(),
+        color.b(),
+    ));
+    canvas.draw_rrect(
+        RRect::new_rect_xy(
+            Rect::from_xywh(track_left, track_y, track_w, track_h),
+            track_h / 2.0,
+            track_h / 2.0,
+        ),
+        &track_paint,
+    );
+
+    if volume > 0.0 {
+        let fill_w = (track_w * (volume / 100.0)).max(track_h);
+        let mut fill_paint = Paint::default();
+        fill_paint.set_anti_alias(true);
+        fill_paint.set_color(Color::from_argb(alpha_u8, color.r(), color.g(), color.b()));
+        canvas.draw_rrect(
+            RRect::new_rect_xy(
+                Rect::from_xywh(track_left, track_y, fill_w, track_h),
+                track_h / 2.0,
+                track_h / 2.0,
+            ),
+            &fill_paint,
+        );
+    }
+}
+
 pub struct LayoutParams {
     pub current_w: f32,
     pub current_h: f32,
@@ -182,6 +288,9 @@ pub struct StyleParams<'a> {
     pub lyrics_transition_animation: &'a str,
     /// dynamic 样式切歌间隙沿用旧封面背景的宽限时长
     pub dynamic_cover_grace: Duration,
+    /// 非展开态滚轮音量提示：alpha（0 为隐藏）与当前音量值 0-100
+    pub volume_hint_alpha: f32,
+    pub volume_hint_value: f32,
 }
 
 /// 计算岛屿在窗口内的左上角偏移；`layout.hide_progress` 会把岛屿推出屏幕。
@@ -520,6 +629,8 @@ pub fn draw_island_canvas(
         host_backdrop,
         lyrics_transition_animation,
         dynamic_cover_grace,
+        volume_hint_alpha,
+        volume_hint_value,
     } = style;
     canvas.clear(Color::TRANSPARENT);
 
@@ -891,7 +1002,19 @@ pub fn draw_island_canvas(
         }
         canvas.restore();
     }
-    if mini_alpha_f > 0.01 && current_w > 45.0 * non_expanded_scale && music_active {
+    if volume_hint_alpha > 0.01 {
+        draw_volume_hint(DrawVolumeHintParams {
+            canvas,
+            offset_x,
+            offset_y,
+            w: current_w,
+            h: current_h,
+            scale: non_expanded_scale,
+            alpha: volume_hint_alpha,
+            volume: volume_hint_value,
+            color: text_color,
+        });
+    } else if mini_alpha_f > 0.01 && current_w > 45.0 * non_expanded_scale && music_active {
         let alpha = (mini_alpha_f * 255.0) as u8;
         if let Some(image) = get_cached_media_image(media) {
             let base_size = 18.0 * non_expanded_scale;

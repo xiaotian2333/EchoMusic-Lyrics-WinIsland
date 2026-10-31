@@ -98,6 +98,8 @@ const TRANSLATION_KEYS: &[&str] = &[
     "hover_to_hide_delay",
     "spectrum_wheel_volume",
     "non_expanded_wheel_volume",
+    "volume_wheel_hint",
+    "volume",
     "reset_defaults",
     "visit_homepage",
     "created_by",

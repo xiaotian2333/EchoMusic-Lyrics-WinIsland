@@ -459,6 +459,7 @@ function generalEffects() {
       switchRow(tr("motion_blur"), "motion_blur"),
       switchRow(tr("cover_rotate"), "cover_rotate"),
       switchRow(tr("audio_gate"), "audio_gate"),
+      switchRow(tr("volume_wheel_hint"), "volume_wheel_hint"),
     ]),
     section(tr("section_experimental"), [
       switchRow(tr("mini_controls"), "mini_controls"),

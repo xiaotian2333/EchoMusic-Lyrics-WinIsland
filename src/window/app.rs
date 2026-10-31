@@ -63,6 +63,9 @@ const VOLUME_WHEEL_SLOW_STEP: f32 = 2.0;
 const VOLUME_WHEEL_MEDIUM_STEP: f32 = 4.0;
 const VOLUME_WHEEL_FAST_STEP: f32 = 8.0;
 const VOLUME_WHEEL_MAX_UNITS: f32 = 1.0;
+/// 音量提示显示时长与淡出时长（与上游 WinIsland 一致）
+const VOLUME_HINT_DISPLAY: Duration = Duration::from_millis(1600);
+const VOLUME_HINT_FADE: Duration = Duration::from_millis(240);
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -130,6 +133,7 @@ pub struct App {
     hover_to_hide_enter_at: Option<Instant>,
     last_volume_wheel_at: Option<Instant>,
     pending_volume: Option<f32>,
+    volume_hint_until: Option<Instant>,
     gpu_island: Option<crate::gpu::GpuIsland>,
     gpu_retry_at: Option<Instant>,
     backdrop_window: Option<Arc<Window>>,
@@ -204,6 +208,7 @@ impl Default for App {
             hover_to_hide_enter_at: None,
             last_volume_wheel_at: None,
             pending_volume: None,
+            volume_hint_until: None,
             gpu_island: None,
             gpu_retry_at: None,
             backdrop_window: None,
@@ -625,6 +630,10 @@ impl App {
         self.pending_volume = Some(next_volume);
         self.media.request_set_volume(next_volume);
         self.idle_timer = now;
+        // 仅非展开态滚轮调音量时提示；展开态与外部音量变化一律不提示
+        if !self.expanded && self.config.volume_wheel_hint {
+            self.volume_hint_until = Some(now + VOLUME_HINT_DISPLAY);
+        }
         true
     }
 
@@ -1682,6 +1691,28 @@ impl ApplicationHandler for App {
                             media_info.position_ms = self.seeking_preview_ms;
                             media_info.last_update = Instant::now();
                         }
+                        // 音量提示 alpha：展开立即丢弃（与上游 Discard 一致），过期清理，
+                        // 末段 240ms 线性淡出
+                        let volume_hint_alpha = match self.volume_hint_until {
+                            Some(_) if self.expanded => {
+                                self.volume_hint_until = None;
+                                0.0
+                            }
+                            Some(until) => {
+                                let remain = until.saturating_duration_since(Instant::now());
+                                if remain.is_zero() {
+                                    self.volume_hint_until = None;
+                                    0.0
+                                } else if remain <= VOLUME_HINT_FADE {
+                                    remain.as_secs_f32() / VOLUME_HINT_FADE.as_secs_f32()
+                                } else {
+                                    1.0
+                                }
+                            }
+                            None => 0.0,
+                        };
+                        let volume_hint_value =
+                            self.pending_volume.or(media_info.volume).unwrap_or(50.0);
                         if !self.config.audio_gate {
                             self.audio.set_gate_override(false);
                         } else {
@@ -1851,6 +1882,8 @@ impl ApplicationHandler for App {
                                 dynamic_cover_grace: Duration::from_secs_f32(
                                     self.config.auto_hide_delay,
                                 ),
+                                volume_hint_alpha,
+                                volume_hint_value,
                             },
                         };
                         let mut gpu_error: Option<String> = None;
@@ -2302,6 +2335,11 @@ impl ApplicationHandler for App {
             && self.dynamic_heartbeat_at.elapsed() >= Duration::from_secs(1)
         {
             self.dynamic_heartbeat_at = Instant::now();
+            window.request_redraw();
+        }
+        // 音量提示显示/淡出期间持续重绘，暂停或无音乐时帧循环停止，
+        // 不加重绘源提示会冻结在半透明
+        if self.volume_hint_until.is_some() {
             window.request_redraw();
         }
         let elapsed = frame_start.elapsed();

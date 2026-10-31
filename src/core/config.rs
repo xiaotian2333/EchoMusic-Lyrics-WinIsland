@@ -206,6 +206,8 @@ pub struct AppConfig {
     pub spectrum_wheel_volume: bool,
     #[serde(default = "default_non_expanded_wheel_volume")]
     pub non_expanded_wheel_volume: bool,
+    #[serde(default = "default_volume_wheel_hint")]
+    pub volume_wheel_hint: bool,
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
     #[serde(default = "default_update_check_interval")]
@@ -334,6 +336,10 @@ fn default_spectrum_wheel_volume() -> bool {
 
 fn default_non_expanded_wheel_volume() -> bool {
     false
+}
+
+fn default_volume_wheel_hint() -> bool {
+    true
 }
 
 fn default_check_for_updates() -> bool {
@@ -474,6 +480,7 @@ impl Default for AppConfig {
             hover_to_hide_delay: 0.5,
             spectrum_wheel_volume: true,
             non_expanded_wheel_volume: false,
+            volume_wheel_hint: true,
             check_for_updates: true,
             update_check_interval: 4.0,
             language: "auto".to_string(),
