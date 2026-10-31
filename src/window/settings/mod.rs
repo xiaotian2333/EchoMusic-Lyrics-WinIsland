@@ -8,7 +8,10 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
 use windows::core::w;
 
-use crate::core::config::{APP_AUTHOR, APP_HOMEPAGE, APP_VERSION, AppConfig, is_valid_color};
+use crate::core::config::{
+    APP_AUTHOR, APP_HOMEPAGE, APP_VERSION, AppConfig, ISLAND_STYLE_LIQUID_GLASS_DXGI,
+    ISLAND_STYLE_LIQUID_GLASS_WGC, is_valid_color, normalize_island_style,
+};
 use crate::core::i18n::{current_lang, init_i18n, tr};
 use crate::core::persistence::{load_config, save_config};
 use crate::utils::autostart::set_autostart;
@@ -64,6 +67,7 @@ const TRANSLATION_KEYS: &[&str] = &[
     "style_mica",
     "style_dynamic",
     "style_liquid_glass",
+    "style_liquid_glass_dxgi",
     "liquid_glass_blur",
     "liquid_glass_refraction",
     "liquid_glass_dispersion",
@@ -283,6 +287,7 @@ fn translation_map() -> HashMap<String, String> {
 }
 
 fn normalize_config(config: &mut AppConfig) {
+    normalize_island_style(&mut config.island_style);
     config.non_expanded_scale = round_to(config.non_expanded_scale, 0.01).clamp(0.5, 5.0);
     config.expanded_scale = round_to(config.expanded_scale, 0.01).clamp(0.5, 5.0);
     config.base_width = config.base_width.max(40.0);
@@ -323,7 +328,12 @@ fn normalize_config(config: &mut AppConfig) {
     }
     if !matches!(
         config.island_style.as_str(),
-        "default" | "glass" | "mica" | "dynamic" | "liquid_glass"
+        "default"
+            | "glass"
+            | "mica"
+            | "dynamic"
+            | ISLAND_STYLE_LIQUID_GLASS_WGC
+            | ISLAND_STYLE_LIQUID_GLASS_DXGI
     ) {
         config.island_style = AppConfig::default().island_style;
     }

@@ -1,9 +1,10 @@
 //! WinIsland 原版 GPU 渲染管线（移植自 WinIsland 的 winisland-render 与
 //! winisland-platform-windows）。
 //!
-//! 当岛样式为 liquid_glass 时启用：D3D12 设备 + Skia Ganesh D3D12 后端 +
-//! DirectComposition 合成交换链负责整帧渲染；Windows.Graphics.Capture 捕获窗口下方
-//! 屏幕内容，经共享纹理与围栏同步后在 GPU 上完成 frost 模糊与液态玻璃折射。
+//! 当岛样式为液态玻璃（liquid_glass_wgc / liquid_glass_dxgi）时启用：
+//! D3D12 设备 + Skia Ganesh D3D12 后端 + DirectComposition 合成交换链负责整帧渲染；
+//! 按样式变体选择 WGC 或 DXGI Desktop Duplication 捕获窗口下方屏幕内容，
+//! 经共享纹理与围栏同步后在 GPU 上完成 frost 模糊与液态玻璃折射。
 //!
 //! 当岛样式为 glass（毛玻璃）时启用 `host_backdrop`：伴随窗口开启 DWM 宿主背板后，
 //! 由 Windows.UI.Composition 的宿主背板画笔在窗口下方合成真实桌面内容并裁剪到岛屿
@@ -15,6 +16,7 @@
 
 mod backdrop;
 mod capture;
+mod capture_dda;
 mod device;
 mod target;
 
@@ -32,7 +34,7 @@ pub(crate) use capture::BackdropCapture;
 pub(crate) use device::D3DDevice;
 // 毛玻璃宿主背板由独立 crate 提供：其 #[implement] 需要 windows-core 0.62，
 // 而本 crate 的音频设备通知仍需 windows-core 0.58，两者无法在同一 crate 内共存
-pub(crate) use host_backdrop::{HostBackdrop, HostBackdropShape};
+pub(crate) use host_backdrop::{HostBackdrop, HostBackdropShape, set_excluded_from_dda};
 pub(crate) use target::RenderTarget;
 
 /// 背板捕获创建失败后的重试间隔。
@@ -40,6 +42,15 @@ const CAPTURE_RETRY: Duration = Duration::from_secs(10);
 
 /// 背板共享纹理的代次计数，每次重建递增，供捕获端识别失效句柄。
 static BACKDROP_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// 背板捕获后端；按液态玻璃样式变体选择。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureBackend {
+    /// Windows.Graphics.Capture（液态玻璃-WGC，原实现）。
+    Wgc,
+    /// DXGI Desktop Duplication（液态玻璃-DXGI）。
+    Dda,
+}
 
 static WAKE_PROXY: OnceLock<EventLoopProxy<()>> = OnceLock::new();
 static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -111,6 +122,7 @@ pub(crate) struct BackdropCaptureFrame {
 /// GPU 岛渲染器：整合 D3D12 设备、合成交换链与背板捕获。
 pub(crate) struct GpuIsland {
     hwnd_raw: isize,
+    backend: CaptureBackend,
     device: D3DDevice,
     target: RenderTarget,
     backdrop: Option<SharedBackdrop>,
@@ -120,12 +132,20 @@ pub(crate) struct GpuIsland {
 
 impl GpuIsland {
     /// 创建 GPU 渲染器；失败时调用方应回退到 CPU 路径并稍后重试。
-    pub(crate) fn new(hwnd_raw: isize, width: u32, height: u32) -> Result<Self, String> {
+    pub(crate) fn new(
+        hwnd_raw: isize,
+        width: u32,
+        height: u32,
+        backend: CaptureBackend,
+    ) -> Result<Self, String> {
         let mut device = D3DDevice::new()?;
         let target = device.create_target(hwnd_raw, width.max(1), height.max(1))?;
-        log::info!("GPU 渲染管线已启用（D3D12 + DirectComposition 合成交换链）");
+        log::info!(
+            "GPU 渲染管线已启用（D3D12 + DirectComposition 合成交换链，背板后端 {backend:?}）"
+        );
         Ok(Self {
             hwnd_raw,
+            backend,
             device,
             target,
             backdrop: None,
@@ -197,7 +217,7 @@ impl GpuIsland {
             if !ready {
                 return None;
             }
-            match BackdropCapture::new(self.hwnd_raw, self.device.adapter_luid()) {
+            match BackdropCapture::new(self.hwnd_raw, self.device.adapter_luid(), self.backend) {
                 Ok(capture) => {
                     self.capture = Some(capture);
                     self.capture_retry_at = None;

@@ -119,7 +119,7 @@ fn dominant_color_from_bgra(pixels: &[u8]) -> Option<Color> {
     let mut buckets = [(0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32); COVER_HUE_BUCKETS];
     let mut sampled = 0_u32;
     let mut saturation_sum = 0.0_f32;
-    for pixel in pixels.chunks_exact(4) {
+    for pixel in pixels.as_chunks::<4>().0 {
         if pixel[3] < 200 {
             continue;
         }

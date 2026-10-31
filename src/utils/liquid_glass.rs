@@ -54,10 +54,14 @@ const LUMINANCE_TTL_MS: u128 = 500;
 const LUMINANCE_DOWNSCALE: i32 = 4;
 /// 采样区域短边小于该值时不采信（岛屿几乎完全离屏）。
 const LUMINANCE_MIN_SIDE: i32 = 4;
+/// GPU 背板亮度采样面的边长；小面足够反映均值。
+const GPU_LUMINANCE_SAMPLE: i32 = 24;
 
 thread_local! {
     /// 最近一次采样到的岛屿下方内容亮度（None 表示这次采样失败）与时间戳。
     static LUMINANCE_CACHE: RefCell<Option<(Option<f32>, Instant)>> = const { RefCell::new(None) };
+    /// GPU 背板亮度缓存（液态玻璃-DXGI 使用），口径与 LUMINANCE_CACHE 相同。
+    static GPU_LUMINANCE_CACHE: RefCell<Option<(Option<f32>, Instant)>> = const { RefCell::new(None) };
 }
 
 /// 将岛屿窗口从 GDI 屏幕截图中排除（或恢复）。
@@ -103,6 +107,58 @@ pub fn backdrop_luminance(
     value
 }
 
+/// 从 GPU frost 背板图像估算岛屿下方内容的平均亮度（0.0~1.0）；采样失败返回 None。
+///
+/// 液态玻璃-DXGI 的 GPU 背板来自 DXGI Desktop Duplication，且窗口已通过
+/// WCA_EXCLUDED_FROM_DDA 排除在捕获之外，图像不含岛屿自身渲染内容；模糊
+/// 近似保持均值，与 [`display_luminance`] 的着色器口径一致。按 TTL 缓存，
+/// 采样失败沿用上一次的有效值。
+pub(crate) fn backdrop_image_luminance(backdrop: &Backdrop) -> Option<f32> {
+    let cached = GPU_LUMINANCE_CACHE.with(|cell| *cell.borrow());
+    if let Some((value, at)) = cached
+        && at.elapsed().as_millis() < LUMINANCE_TTL_MS
+    {
+        return value;
+    }
+    let value = sample_backdrop_image_luminance(backdrop).or(cached.and_then(|(value, _)| value));
+    GPU_LUMINANCE_CACHE.with(|cell| *cell.borrow_mut() = Some((value, Instant::now())));
+    value
+}
+
+/// 把背板图像拉伸绘入小采样面后求平均亮度；失败时返回 None。
+fn sample_backdrop_image_luminance(backdrop: &Backdrop) -> Option<f32> {
+    let size = ISize::new(GPU_LUMINANCE_SAMPLE, GPU_LUMINANCE_SAMPLE);
+    let mut surface = surfaces::raster_n32_premul(size)?;
+    let info = ImageInfo::new(size, ColorType::BGRA8888, AlphaType::Opaque, None);
+    {
+        let canvas = surface.canvas();
+        canvas.clear(Color::TRANSPARENT);
+        let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+        canvas.draw_image_rect_with_sampling_options(
+            &backdrop.image,
+            None,
+            Rect::from_xywh(
+                0.0,
+                0.0,
+                GPU_LUMINANCE_SAMPLE as f32,
+                GPU_LUMINANCE_SAMPLE as f32,
+            ),
+            sampling,
+            &Paint::default(),
+        );
+    }
+    let mut pixels = vec![0_u8; (GPU_LUMINANCE_SAMPLE * GPU_LUMINANCE_SAMPLE * 4) as usize];
+    if !surface.read_pixels(
+        &info,
+        pixels.as_mut_slice(),
+        (GPU_LUMINANCE_SAMPLE * 4) as usize,
+        (0, 0),
+    ) {
+        return None;
+    }
+    Some(average_luminance_bgra(&pixels))
+}
+
 /// 截取岛屿矩形下方的屏幕内容并求平均亮度；区域离屏或截屏失败时返回 None。
 fn sample_content_luminance(
     island: (i32, i32, i32, i32),
@@ -137,7 +193,7 @@ fn sample_content_luminance(
 fn average_luminance_bgra(pixels: &[u8]) -> f32 {
     let mut sum = 0.0_f32;
     let mut count = 0_u32;
-    for pixel in pixels.chunks_exact(4) {
+    for pixel in pixels.as_chunks::<4>().0 {
         sum +=
             0.299 * f32::from(pixel[2]) + 0.587 * f32::from(pixel[1]) + 0.114 * f32::from(pixel[0]);
         count += 1;

@@ -14,6 +14,8 @@
 mod blur;
 mod styles;
 
+pub use styles::set_excluded_from_dda;
+
 use std::cell::{Cell, OnceCell, RefCell};
 
 use windows::System::DispatcherQueueController;

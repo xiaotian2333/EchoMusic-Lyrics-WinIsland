@@ -404,7 +404,10 @@ function generalAppearance() {
 }
 
 function liquidGlassRows() {
-  if (config.island_style !== "liquid_glass") {
+  if (
+    config.island_style !== "liquid_glass_wgc" &&
+    config.island_style !== "liquid_glass_dxgi"
+  ) {
     return [];
   }
   return [
@@ -451,7 +454,8 @@ function generalEffects() {
         { value: "glass", label: tr("style_glass") },
         { value: "mica", label: tr("style_mica") },
         { value: "dynamic", label: tr("style_dynamic") },
-        { value: "liquid_glass", label: tr("style_liquid_glass") },
+        { value: "liquid_glass_wgc", label: tr("style_liquid_glass") },
+        { value: "liquid_glass_dxgi", label: tr("style_liquid_glass_dxgi") },
       ]),
       ...glassRows(),
       ...liquidGlassRows(),

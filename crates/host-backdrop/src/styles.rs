@@ -11,6 +11,10 @@ use windows::core::{BOOL, s, w};
 type SetWindowCompositionAttribute =
     unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> BOOL;
 
+/// `WCA_EXCLUDED_FROM_DDA`：仅阻止 DXGI Desktop Duplication 捕获该窗口，
+/// Windows Graphics Capture 与 GDI 截屏不受影响（Win10 1709+，微软已文档化）。
+const WCA_EXCLUDED_FROM_DDA: u32 = 24;
+
 #[repr(C)]
 struct AccentPolicy {
     state: u32,
@@ -48,6 +52,26 @@ pub(super) fn enable_host_backdrop(hwnd: HWND) -> bool {
     };
     // SAFETY: 动态解析出的函数使用上面校验过的原生 ABI；hwnd 存活，
     // data 指向本次调用期间有效的 accent policy。
+    unsafe { set_attribute(hwnd, &mut data).as_bool() }
+}
+
+/// 将窗口从 DXGI Desktop Duplication 屏幕捕获中排除（或恢复）。
+///
+/// `hwnd_raw` 为窗口句柄的裸值（与 [`crate::HostBackdrop::new`] 的约定一致）；
+/// 属性由窗口所属进程设置，返回是否成功（旧系统不支持时为 false）。
+pub fn set_excluded_from_dda(hwnd_raw: isize, excluded: bool) -> bool {
+    let Some(set_attribute) = set_window_composition_attribute() else {
+        return false;
+    };
+    let mut value: i32 = i32::from(excluded);
+    let mut data = WindowCompositionAttributeData {
+        attribute: WCA_EXCLUDED_FROM_DDA,
+        data: (&mut value as *mut i32).cast(),
+        size: size_of::<i32>(),
+    };
+    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    // SAFETY: 动态解析出的函数使用上面校验过的原生 ABI；hwnd 存活，
+    // data 指向本次调用期间有效的 BOOL 负载。
     unsafe { set_attribute(hwnd, &mut data).as_bool() }
 }
 

@@ -104,7 +104,7 @@ pub fn capture_screen_bgra(request: ScreenCaptureRequest) -> Option<ScreenCaptur
         let _ = ReleaseDC(HWND::default(), hdc_screen);
 
         if request.force_opaque_alpha {
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }

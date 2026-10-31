@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::core::config::{AppConfig, is_valid_color};
+use crate::core::config::{AppConfig, is_valid_color, normalize_island_style};
 
 pub fn get_config_path() -> PathBuf {
     let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -41,6 +41,7 @@ pub fn load_config() -> AppConfig {
         config.lyrics_transition_animation = AppConfig::default().lyrics_transition_animation;
     }
     config.lyrics_scroll_max_width = config.lyrics_scroll_max_width.max(config.base_width + 35.0);
+    normalize_island_style(&mut config.island_style);
     if !config.spectrum_wheel_volume {
         config.non_expanded_wheel_volume = false;
     }

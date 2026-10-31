@@ -19,7 +19,8 @@ use winit::window::{Window, WindowButtons, WindowId, WindowLevel};
 
 use crate::core::audio::AudioProcessor;
 use crate::core::config::{
-    AppConfig, DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE,
+    AppConfig, DockPosition, ISLAND_STYLE_LIQUID_GLASS_DXGI, ISLAND_STYLE_LIQUID_GLASS_WGC,
+    LyricsFilterScope, PADDING, TOP_OFFSET, WINDOW_TITLE, is_liquid_glass_style,
 };
 use crate::core::lyrics::{
     LyricCharacter, LyricLine, current_character_index, current_lyric_index, filtered_lyric_text,
@@ -1078,9 +1079,9 @@ impl App {
         }
     }
 
-    /// 按当前样式维护 GPU 渲染管线：liquid_glass 时惰性创建，其他样式释放。
+    /// 按当前样式维护 GPU 渲染管线：液态玻璃时惰性创建，其他样式释放。
     fn ensure_gpu_island(&mut self) {
-        if self.config.island_style != "liquid_glass" {
+        if !is_liquid_glass_style(&self.config.island_style) {
             if self.gpu_island.is_some() {
                 // Drop 会分离 DirectComposition 视觉树并关闭捕获会话
                 self.gpu_island = None;
@@ -1101,7 +1102,12 @@ impl App {
         if self.os_w == 0 || self.os_h == 0 {
             return;
         }
-        match crate::gpu::GpuIsland::new(hwnd_raw, self.os_w, self.os_h) {
+        let backend = if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
+            crate::gpu::CaptureBackend::Dda
+        } else {
+            crate::gpu::CaptureBackend::Wgc
+        };
+        match crate::gpu::GpuIsland::new(hwnd_raw, self.os_w, self.os_h, backend) {
             Ok(gpu) => {
                 self.gpu_island = Some(gpu);
                 self.gpu_retry_at = None;
@@ -1242,11 +1248,24 @@ impl App {
                         if old_style == "mica" {
                             disable_mica(hwnd);
                         }
-                        if old_style == "liquid_glass" {
+                        // 离开/进入液态玻璃时按变体切换对应的捕获排除标志：
+                        // WGC 变体用 WDA（对全部捕获隐身），DXGI 变体用
+                        // WCA_EXCLUDED_FROM_DDA（仅 DXGI 捕获隐身，录屏软件仍可见）
+                        if old_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
                             set_exclude_from_capture(hwnd, false);
                         }
-                        if self.config.island_style == "liquid_glass" {
+                        if old_style == ISLAND_STYLE_LIQUID_GLASS_DXGI
+                            && let Some(hwnd_raw) = self.hwnd_raw
+                        {
+                            crate::gpu::set_excluded_from_dda(hwnd_raw, false);
+                        }
+                        if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
                             set_exclude_from_capture(hwnd, true);
+                        }
+                        if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI
+                            && let Some(hwnd_raw) = self.hwnd_raw
+                        {
+                            crate::gpu::set_excluded_from_dda(hwnd_raw, true);
                         }
                     }
                 }
@@ -1486,8 +1505,11 @@ impl ApplicationHandler for App {
                     0,
                     WS_MAXIMIZEBOX.0 as isize | WS_THICKFRAME.0 as isize,
                 );
-                if self.config.island_style == "liquid_glass" {
+                if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
                     set_exclude_from_capture(hwnd, true);
+                }
+                if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
+                    crate::gpu::set_excluded_from_dda(win32_handle.hwnd.get(), true);
                 }
             }
 

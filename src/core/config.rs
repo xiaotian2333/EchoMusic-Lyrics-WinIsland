@@ -135,6 +135,23 @@ impl From<LyricsFilterScope> for String {
 
 pub const DEFAULT_LYRICS_FILTER_REGEX: &str = r"^([^：]*)：.*$|^([^:]*):.*$|^([^翻唱]*)翻唱.*$|^([^许可]*)许可.*$|^([^音乐人]*)音乐人.*$|^([^国风]*)国风.*$|^([^纯音乐]*)纯音乐.*$|^([^星曜计划]*)星曜计划.*$";
 
+/// 液态玻璃-WGC 样式值：Windows.Graphics.Capture 捕捉 + WDA 排除（原 `liquid_glass`，行为不变）。
+pub const ISLAND_STYLE_LIQUID_GLASS_WGC: &str = "liquid_glass_wgc";
+/// 液态玻璃-DXGI 样式值：DXGI Desktop Duplication 捕捉 + WCA_EXCLUDED_FROM_DDA 排除。
+pub const ISLAND_STYLE_LIQUID_GLASS_DXGI: &str = "liquid_glass_dxgi";
+
+/// 是否为液态玻璃样式（WGC 或 DXGI 变体）。
+pub fn is_liquid_glass_style(style: &str) -> bool {
+    style == ISLAND_STYLE_LIQUID_GLASS_WGC || style == ISLAND_STYLE_LIQUID_GLASS_DXGI
+}
+
+/// 旧版样式值迁移：原 `liquid_glass` 更名为 `liquid_glass_wgc`，其余原样。
+pub fn normalize_island_style(style: &mut String) {
+    if style == "liquid_glass" {
+        *style = ISLAND_STYLE_LIQUID_GLASS_WGC.to_string();
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ProcessDockRule {
     pub process_name: String,

@@ -1,8 +1,11 @@
-//! Windows.Graphics.Capture 屏幕捕获（移植自 WinIsland 的 platform-windows/capture.rs）。
+//! 背板屏幕捕获（液态玻璃 GPU 渲染管线），两种后端共用共享纹理与围栏握手：
 //!
-//! 在渲染适配器上创建 D3D11 设备，以自由线程帧池捕获窗口所在显示器；
-//! 变化探针与脏区域用于节流，仅当窗口下方内容变化时才唤醒渲染线程。
-//! 捕获端不管理窗口的 WDA 排除标志（由应用层统一设置）。
+//! - WGC（液态玻璃-WGC）：Windows.Graphics.Capture 自由线程帧池捕获窗口所在显示器；
+//! - DDA（液态玻璃-DXGI）：DXGI Desktop Duplication 轮询捕获，见 capture_dda.rs。
+//!
+//! 在渲染适配器上创建 D3D11 设备；变化探针与脏区域用于节流，仅当窗口下方
+//! 内容变化时才唤醒渲染线程。捕获端不管理窗口的捕获排除标志
+//! （WDA / WCA_EXCLUDED_FROM_DDA 由应用层按样式统一设置）。
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -47,6 +50,8 @@ use windows62::{
     core::{HSTRING, Interface},
 };
 
+use super::CaptureBackend;
+use super::capture_dda::DdaSession;
 use super::{BackdropCaptureFrame, BackdropCaptureRequest, BackdropShare, Rect};
 
 const FRAME_BUFFERS: i32 = 2;
@@ -60,24 +65,57 @@ const BORDER_REQUIRED: u8 = 3;
 static BORDER_ACCESS: AtomicU8 = AtomicU8::new(BORDER_UNKNOWN);
 
 /// 锁定互斥量；锁中毒时仍继续使用内部数据（捕获线程崩溃不应拖垮渲染线程）。
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Default)]
-struct Latest {
-    frame: Option<Direct3D11CaptureFrame>,
-    sequence: u64,
+pub(super) struct Latest {
+    pub(super) source: Option<FrameSource>,
+    pub(super) sequence: u64,
 }
 
-struct Shared {
-    latest: Mutex<Latest>,
-    interest: Mutex<Rect>,
-    pending: AtomicBool,
-    content: Mutex<SizeInt32>,
+pub(super) struct Shared {
+    pub(super) latest: Mutex<Latest>,
+    pub(super) interest: Mutex<Rect>,
+    pub(super) pending: AtomicBool,
+    pub(super) content: Mutex<SizeInt32>,
+    /// WGC 帧池专用的 WinRT Direct3D 设备；DDA 后端不使用。
     device: AgileDevice,
+    /// WGC 变化探针专用的设备与上下文包装；DDA 后端不使用。
     d3d: AgileContext,
     probe: Mutex<Probe>,
+}
+
+/// 最新背板帧的来源：WGC 帧池帧或 DDA 内部纹理拷贝。
+#[derive(Clone)]
+pub(super) enum FrameSource {
+    Wgc(Direct3D11CaptureFrame),
+    Dda {
+        texture: ID3D11Texture2D,
+        size: (u32, u32),
+    },
+}
+
+impl FrameSource {
+    /// 帧纹理；WGC 帧每次重新提取表面，DDA 克隆内部纹理引用。
+    pub(super) fn texture(&self) -> windows62::core::Result<ID3D11Texture2D> {
+        match self {
+            Self::Wgc(frame) => frame_texture(frame),
+            Self::Dda { texture, .. } => Ok(texture.clone()),
+        }
+    }
+
+    /// 帧内容尺寸（桌面像素）。
+    pub(super) fn content_size(&self) -> windows62::core::Result<SizeInt32> {
+        match self {
+            Self::Wgc(frame) => frame.ContentSize(),
+            Self::Dda { size, .. } => Ok(SizeInt32 {
+                Width: size.0 as i32,
+                Height: size.1 as i32,
+            }),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -88,7 +126,74 @@ struct Probe {
     scratch: Vec<u32>,
 }
 
-struct Session {
+/// 捕获会话后端；对上提供 monitor/origin/sync_rate/refresh 的统一视图。
+enum Session {
+    Wgc(WgcSession),
+    Dda(DdaSession),
+}
+
+impl Session {
+    fn monitor(&self) -> HMONITOR {
+        match self {
+            Self::Wgc(session) => session.monitor,
+            Self::Dda(session) => session.monitor(),
+        }
+    }
+
+    fn origin(&self) -> (i32, i32) {
+        match self {
+            Self::Wgc(session) => session.origin,
+            Self::Dda(session) => session.origin(),
+        }
+    }
+
+    fn sync_rate(&self, rate_hz: u32) {
+        match self {
+            Self::Wgc(session) => {
+                if session.rate_hz.get() != rate_hz {
+                    session.rate_hz.set(rate_hz);
+                    set_rate(&session.session, rate_hz);
+                }
+            }
+            Self::Dda(session) => session.sync_rate(rate_hz),
+        }
+    }
+
+    /// 周期性状态复查；WGC 复查无边框捕获授权，DDA 由轮询线程自行恢复。
+    fn refresh(&self) -> Result<(), String> {
+        match self {
+            Self::Wgc(session) => {
+                if !session.borderless.get() && borderless_allowed() {
+                    session.borderless.set(true);
+                    hide_border(&session.session);
+                }
+                if border_access_required() {
+                    return Err("无边框屏幕捕获权限不可用".to_string());
+                }
+                Ok(())
+            }
+            Self::Dda(_) => Ok(()),
+        }
+    }
+
+    fn start(
+        backend: CaptureBackend,
+        monitor: HMONITOR,
+        shared: &Arc<Shared>,
+        rate_hz: u32,
+        device: &ID3D11Device5,
+        context: &ID3D11DeviceContext4,
+    ) -> Result<Self, String> {
+        match backend {
+            CaptureBackend::Wgc => Ok(Self::Wgc(WgcSession::start(monitor, shared, rate_hz)?)),
+            CaptureBackend::Dda => Ok(Self::Dda(DdaSession::start(
+                monitor, shared, rate_hz, device, context,
+            )?)),
+        }
+    }
+}
+
+struct WgcSession {
     monitor: HMONITOR,
     origin: (i32, i32),
     pool: Direct3D11CaptureFramePool,
@@ -108,6 +213,7 @@ struct Import {
 
 pub(crate) struct BackdropCapture {
     hwnd: HWND,
+    backend: CaptureBackend,
     device: ID3D11Device5,
     context: ID3D11DeviceContext4,
     shared: Arc<Shared>,
@@ -120,9 +226,14 @@ pub(crate) struct BackdropCapture {
 }
 
 impl BackdropCapture {
-    /// 创建捕获端并启动显示器捕获会话。
-    pub(crate) fn new(hwnd_raw: isize, adapter_luid: u64) -> Result<Self, String> {
-        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+    /// 创建捕获端并按后端启动显示器捕获会话。
+    pub(crate) fn new(
+        hwnd_raw: isize,
+        adapter_luid: u64,
+        backend: CaptureBackend,
+    ) -> Result<Self, String> {
+        if backend == CaptureBackend::Wgc && !GraphicsCaptureSession::IsSupported().unwrap_or(false)
+        {
             return Err("Windows.Graphics.Capture 不受支持".to_string());
         }
         let hwnd = HWND(hwnd_raw as *mut _);
@@ -131,12 +242,14 @@ impl BackdropCapture {
             .cast()
             .map_err(|error| format!("IDXGIDevice 不可用: {error}"))?;
         // SAFETY: DXGI 设备存活；WinRT 返回拥有的可检查对象包装。
+        // （WGC 帧池专用，DDA 后端不使用，创建成本可忽略。）
         let winrt_device: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
             .and_then(|device| device.cast())
             .map_err(|error| format!("WinRT Direct3D 设备创建失败: {error}"))?;
         let d3d = AgileContext(device.clone().into(), context.clone().into());
         let capture = Self {
             hwnd,
+            backend,
             device,
             context,
             shared: Arc::new(Shared {
@@ -165,7 +278,7 @@ impl BackdropCapture {
             log::warn!("背板捕获会话重启失败: {error}");
             return None;
         }
-        let origin = self.session.borrow().as_ref()?.origin;
+        let origin = self.session.borrow().as_ref()?.origin();
         let interest = Rect {
             left: request.interest.left - origin.0,
             top: request.interest.top - origin.1,
@@ -175,9 +288,9 @@ impl BackdropCapture {
         *lock(&self.shared.interest) = interest;
         self.shared.pending.store(false, Ordering::Release);
         self.ensure_import(request.share)?;
-        let (frame, sequence) = {
+        let (source, sequence) = {
             let latest = lock(&self.shared.latest);
-            (latest.frame.clone()?, latest.sequence)
+            (latest.source.clone()?, latest.sequence)
         };
         let key = (
             request.share.generation,
@@ -187,7 +300,7 @@ impl BackdropCapture {
         );
         let verified = intersection(self.verified.get(), interest);
         if self.copied.get() != Some(key) || verified != interest {
-            self.copy(&frame, request, key)?;
+            self.copy(&source, request, key)?;
             self.verified.set(interest);
         } else {
             self.verified.set(verified);
@@ -200,14 +313,14 @@ impl BackdropCapture {
 
     fn copy(
         &self,
-        frame: &Direct3D11CaptureFrame,
+        frame_source: &FrameSource,
         request: BackdropCaptureRequest,
         key: (u64, u64, i32, i32),
     ) -> Option<()> {
         let import = self.import.borrow();
         let import = import.as_ref()?;
-        let source = frame_texture(frame).ok()?;
-        let content = frame.ContentSize().ok()?;
+        let source = frame_source.texture().ok()?;
+        let content = frame_source.content_size().ok()?;
         let (local_x, local_y) = (key.2, key.3);
         let left = local_x.max(0);
         let top = local_y.max(0);
@@ -307,32 +420,32 @@ impl BackdropCapture {
         // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
         let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
         if let Some(session) = self.session.borrow().as_ref()
-            && session.monitor == monitor
+            && session.monitor() == monitor
         {
-            if session.rate_hz.get() != rate_hz {
-                session.rate_hz.set(rate_hz);
-                set_rate(&session.session, rate_hz);
-            }
-            if !session.borderless.get() && borderless_allowed() {
-                session.borderless.set(true);
-                hide_border(&session.session);
-            }
-            if border_access_required() {
+            session.sync_rate(rate_hz);
+            if let Err(error) = session.refresh() {
                 self.session.borrow_mut().take();
-                return Err("无边框屏幕捕获权限不可用".to_string());
+                return Err(error);
             }
             return Ok(());
         }
         self.session.borrow_mut().take();
         *lock(&self.shared.latest) = Latest::default();
         self.copied.set(None);
-        let session = Session::start(monitor, &self.shared, rate_hz)?;
+        let session = Session::start(
+            self.backend,
+            monitor,
+            &self.shared,
+            rate_hz,
+            &self.device,
+            &self.context,
+        )?;
         *self.session.borrow_mut() = Some(session);
         Ok(())
     }
 }
 
-impl Session {
+impl WgcSession {
     fn start(monitor: HMONITOR, shared: &Arc<Shared>, rate_hz: u32) -> Result<Self, String> {
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -398,7 +511,7 @@ impl Session {
     }
 }
 
-impl Drop for Session {
+impl Drop for WgcSession {
     fn drop(&mut self) {
         let _ = self.pool.RemoveFrameArrived(self.token);
         let _ = self.session.Close();
@@ -568,7 +681,7 @@ impl Shared {
             || (unknown && self.probe_changed(&frame, interest));
         {
             let mut latest = lock(&self.latest);
-            latest.frame = Some(frame);
+            latest.source = Some(FrameSource::Wgc(frame));
             if relevant {
                 latest.sequence += 1;
             }
@@ -660,7 +773,7 @@ fn intersection(a: Rect, b: Rect) -> Rect {
     }
 }
 
-fn intersects(a: Rect, b: Rect) -> bool {
+pub(super) fn intersects(a: Rect, b: Rect) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 

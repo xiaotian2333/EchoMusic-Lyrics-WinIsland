@@ -9,7 +9,10 @@ use skia_safe::{
 use softbuffer::Surface;
 use winit::window::Window;
 
-use crate::core::config::{DockPosition, LyricsFilterScope, PADDING, TOP_OFFSET};
+use crate::core::config::{
+    DockPosition, ISLAND_STYLE_LIQUID_GLASS_WGC, LyricsFilterScope, PADDING, TOP_OFFSET,
+    is_liquid_glass_style,
+};
 use crate::core::lyrics::LyricCharacter;
 use crate::core::media_info::MediaInfo;
 use crate::icons::controls::draw_play_button;
@@ -29,8 +32,9 @@ use crate::utils::color::{
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
 use crate::utils::liquid_glass::{
-    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams, backdrop_luminance,
-    display_luminance, draw_liquid_glass_with_backdrop, get_liquid_glass_background,
+    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams, backdrop_image_luminance,
+    backdrop_luminance, display_luminance, draw_liquid_glass_with_backdrop,
+    get_liquid_glass_background,
 };
 
 thread_local! {
@@ -526,7 +530,7 @@ pub fn draw_island_canvas(
 
     // Liquid glass text uses a tint derived from the music palette — keeps it
     // readable on the dark refractive background while feeling cohesive.
-    let liquid_palette = if island_style == "liquid_glass" {
+    let liquid_palette = if is_liquid_glass_style(island_style) {
         let p = get_media_palette(media);
         if p.is_empty() || (p[0].r() >= 250 && p[0].g() >= 250 && p[0].b() >= 250) {
             vec![Color::from_rgb(200, 200, 200)]
@@ -537,7 +541,7 @@ pub fn draw_island_canvas(
         vec![Color::from_rgb(200, 200, 200)]
     };
 
-    let text_color = if island_style == "liquid_glass" {
+    let text_color = if is_liquid_glass_style(island_style) {
         let c = &liquid_palette[0];
         Color::from_rgb(
             (c.r() as f32 * 0.25 + 255.0 * 0.75) as u8,
@@ -547,7 +551,7 @@ pub fn draw_island_canvas(
     } else {
         Color::WHITE
     };
-    let text_color_sec = if island_style == "liquid_glass" {
+    let text_color_sec = if is_liquid_glass_style(island_style) {
         let c = &liquid_palette[0];
         Color::from_rgb(
             (c.r() as f32 * 0.15 + 255.0 * 0.85) as u8,
@@ -558,7 +562,7 @@ pub fn draw_island_canvas(
         Color::WHITE
     };
 
-    if island_style == "liquid_glass" {
+    if is_liquid_glass_style(island_style) {
         let liquid_scale =
             non_expanded_scale + (expanded_scale - non_expanded_scale) * expansion_progress;
         let draw_params = LiquidGlassDrawParams {
@@ -715,7 +719,11 @@ pub fn draw_island_canvas(
 
     // 液态玻璃未播放色的自动取值：按玻璃着色后的背景亮度在黑白两档间切换。
     // 背景是实时折射的桌面内容，固定的浅色在亮背景上会糊；采样不可用时回退到默认文字色。
-    let liquid_unplayed = if island_style == "liquid_glass" && char_color_unplayed.is_none() {
+    // WGC 变体沿用 GDI 采样（窗口由 WDA 排除，采到的是岛屿下方内容）；DXGI 变体
+    // 改从 GPU 背板图像采样（背板来自 Desktop Duplication 且已排除自身）；
+    // GPU 背板未就绪时（CPU 兜底/捕获重试）GDI 采样会把岛上歌词算进来形成
+    // 自反馈抖动，直接停用自动取色回退默认文字色。
+    let liquid_unplayed = if is_liquid_glass_style(island_style) && char_color_unplayed.is_none() {
         let island_rect = (
             win_x + offset_x.round() as i32,
             win_y + offset_y.round() as i32,
@@ -723,7 +731,14 @@ pub fn draw_island_canvas(
             current_h.round() as i32,
         );
         let monitor_rect = (monitor_x, monitor_y, monitor_w as i32, monitor_h as i32);
-        backdrop_luminance(island_rect, monitor_rect).map(|content| {
+        let content = if island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
+            backdrop_luminance(island_rect, monitor_rect)
+        } else if let Some(backdrop) = gpu_backdrop {
+            backdrop_image_luminance(backdrop)
+        } else {
+            None
+        };
+        content.map(|content| {
             liquid_unplayed_color(
                 display_luminance(content, liquid_glass_tint / 100.0, liquid_glass_siri),
                 dt,
@@ -1112,7 +1127,7 @@ pub fn draw_island_canvas(
     }
     canvas.restore();
 
-    if island_style != "liquid_glass" {
+    if !is_liquid_glass_style(island_style) {
         let mut border_paint = Paint::default();
         border_paint.set_anti_alias(true);
         border_paint.set_style(skia_safe::PaintStyle::Stroke);
