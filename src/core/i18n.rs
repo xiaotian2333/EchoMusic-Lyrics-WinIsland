@@ -76,6 +76,11 @@ pub fn tr(key: &str) -> String {
     I18N.read().unwrap().get(key)
 }
 
+/// 返回当前语言的全部翻译（设置页全量下发）
+pub fn all_translations() -> HashMap<String, String> {
+    I18N.read().unwrap().translations.clone()
+}
+
 fn get_system_lang() -> String {
     let mut buffer = [0u16; 128];
     // SAFETY: GetUserDefaultLocaleName reads the system locale into the provided
