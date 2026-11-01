@@ -2292,13 +2292,19 @@ impl ApplicationHandler for App {
         }
 
         let lyric_character_data = self.current_desktop_character_data(&media);
-        let target_w = self.compute_lyric_target_width(
-            &window,
-            music_active,
-            is_paused,
-            lyric_character_data.as_ref(),
-            dt,
-        );
+        // 音量提示显示期间冻结岛宽：以弹簧当前值作为目标，velocity 自然衰减归零，
+        // 提示结束（volume_hint_until 清空）后目标恢复歌词驱动，弹簧弹回
+        let target_w = if !self.expanded && self.volume_hint_until.is_some() {
+            self.spring_w.value
+        } else {
+            self.compute_lyric_target_width(
+                &window,
+                music_active,
+                is_paused,
+                lyric_character_data.as_ref(),
+                dt,
+            )
+        };
         let target_h = if self.expanded {
             self.config.expanded_height * self.config.expanded_scale
         } else {
