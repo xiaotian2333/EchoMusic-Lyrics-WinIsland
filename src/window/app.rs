@@ -2323,12 +2323,13 @@ impl ApplicationHandler for App {
         self.spring_r.update_dt(target_r, 0.10, 0.68, dt);
         self.spring_view.update_dt(target_view, 0.12, 0.68, dt);
 
-        // 隐藏态（自动/悬停/手动收起）保持连续重绘：此时其余重绘源全部停止，
-        // 背板更新只能依赖捕获唤醒驱动的零星重绘，把手玻璃会停留在收起前的
-        // 旧帧；连续重绘让 update() 按帧序号逐帧跟进捕获，实时折射不节流
+        // 液态玻璃-DXGI 隐藏态（自动/悬停/手动收起）保持连续重绘：此时其余重绘源
+        // 全部停止，背板更新只能依赖捕获唤醒驱动的零星重绘，把手玻璃会停留在收起
+        // 前的旧帧；连续重绘让 update() 按帧序号逐帧跟进捕获，实时折射不节流。
+        // WGC 变体维持原行为，隐藏态不做连续重绘
         if self.expanded
             || (music_active && media.is_playing)
-            || self.is_hidden()
+            || (self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI && self.is_hidden())
             || self.spring_w.velocity.abs() > 0.001
             || self.spring_h.velocity.abs() > 0.001
             || self.spring_r.velocity.abs() > 0.001

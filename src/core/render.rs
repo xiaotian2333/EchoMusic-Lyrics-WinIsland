@@ -566,16 +566,6 @@ pub fn draw_island_canvas(
     } = params;
 
     let (offset_x, offset_y) = island_offset(&layout);
-    // 隐藏位移量：把手玻璃的背板采样须保持岛原位（见下方液态玻璃分支）
-    let hidden_sample_shift = if layout.hide_progress > 0.0 {
-        island_offset(&LayoutParams {
-            hide_progress: 0.0,
-            ..layout
-        })
-        .1 - offset_y
-    } else {
-        0.0
-    };
     let LayoutParams {
         current_w,
         current_h,
@@ -708,16 +698,29 @@ pub fn draw_island_canvas(
         // DXGI 变体不设 WDA，GDI 兜底截屏会把岛屿自身上一帧的玻璃画面截进背景，
         // 再叠一层 frost 模糊形成「玻璃与自身叠加」，因此直接落到下方暗色底兜底。
         let drawn = if let Some(backdrop) = gpu_backdrop {
-            // 隐藏位移期间保持岛原位采样：把手只露出玻璃的边缘条，按绘制位置
-            // 采样会折射屏幕边缘的静态内容，看起来背景被固定；反向偏移 origin
-            // 让这块玻璃始终折射展开位置下的桌面内容
-            let backdrop = LiquidBackdrop {
-                image: backdrop.image.clone(),
-                blur_scale: backdrop.blur_scale,
-                origin: (0.0, -hidden_sample_shift),
-                luminance: backdrop.luminance,
-            };
-            draw_liquid_glass_with_backdrop(canvas, &backdrop, &draw_params)
+            if island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
+                // 隐藏位移期间保持岛原位采样：把手只露出玻璃的边缘条，按绘制位置
+                // 采样会折射屏幕边缘的静态内容，看起来背景被固定；反向偏移 origin
+                // 让这块玻璃始终折射展开位置下的桌面内容
+                let sample_shift = if hide_progress > 0.0 {
+                    island_offset(&LayoutParams {
+                        hide_progress: 0.0,
+                        ..layout
+                    })
+                    .1 - offset_y
+                } else {
+                    0.0
+                };
+                let backdrop = LiquidBackdrop {
+                    image: backdrop.image.clone(),
+                    blur_scale: backdrop.blur_scale,
+                    origin: (0.0, -sample_shift),
+                    luminance: backdrop.luminance,
+                };
+                draw_liquid_glass_with_backdrop(canvas, &backdrop, &draw_params)
+            } else {
+                draw_liquid_glass_with_backdrop(canvas, backdrop, &draw_params)
+            }
         } else if island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
             false
         } else {

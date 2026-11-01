@@ -211,7 +211,9 @@ impl GpuIsland {
             self.backdrop = None;
         }
         let generation = BACKDROP_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let backdrop = self.device.create_backdrop(size.0, size.1, generation)?;
+        let backdrop = self
+            .device
+            .create_backdrop(size.0, size.1, generation, self.backend)?;
         let share = backdrop.share();
         self.backdrop = Some(backdrop);
         Ok(share)
@@ -320,7 +322,7 @@ impl GpuIsland {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackdropCaptureFrame, D3DDevice};
+    use super::{BackdropCaptureFrame, CaptureBackend, D3DDevice};
 
     /// 冒烟测试：D3D12 设备、Skia D3D12 上下文、共享背板与 GPU frost 管线。
     /// 无 GPU 环境自动跳过；手动运行：cargo test gpu_device_smoke -- --ignored --nocapture
@@ -333,7 +335,7 @@ mod tests {
         };
         assert!(device.check_health().is_ok(), "设备健康检查失败");
         let mut backdrop = device
-            .create_backdrop(256, 256, 1)
+            .create_backdrop(256, 256, 1, CaptureBackend::Dda)
             .expect("共享背板创建失败");
         let share = backdrop.share();
         assert_ne!(share.texture, 0, "共享纹理句柄为空");

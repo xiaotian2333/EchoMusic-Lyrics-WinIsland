@@ -34,7 +34,7 @@ use windows62::Win32::{
     },
 };
 
-use super::{BackdropCaptureFrame, BackdropShare};
+use super::{BackdropCaptureFrame, BackdropShare, CaptureBackend};
 use crate::utils::liquid_glass::average_luminance_bgra;
 use windows62::core::Interface;
 
@@ -111,6 +111,7 @@ impl SharedBackdrop {
         width: u32,
         height: u32,
         generation: u64,
+        capture_backend: CaptureBackend,
     ) -> Result<Self, String> {
         let width = width.max(1).div_ceil(SIZE_STEP) * SIZE_STEP;
         let height = height.max(1).div_ceil(SIZE_STEP) * SIZE_STEP;
@@ -155,12 +156,17 @@ impl SharedBackdrop {
         );
         let write = Fence::new(device)?;
         let read = Fence::new(device)?;
-        let luminance = match LuminanceSampler::new(device, &resource, &desc, width, height) {
-            Ok(sampler) => Some(sampler),
-            Err(error) => {
-                log::warn!("背板亮度采样器创建失败，自动取色将停用: {error}");
-                None
+        // 亮度采样仅服务液态玻璃-DXGI 的自动取色；WGC 变体沿用 GDI 屏幕采样，不做 GPU 回读
+        let luminance = if capture_backend == CaptureBackend::Dda {
+            match LuminanceSampler::new(device, &resource, &desc, width, height) {
+                Ok(sampler) => Some(sampler),
+                Err(error) => {
+                    log::warn!("背板亮度采样器创建失败，自动取色将停用: {error}");
+                    None
+                }
             }
+        } else {
+            None
         };
         Ok(Self {
             resource,

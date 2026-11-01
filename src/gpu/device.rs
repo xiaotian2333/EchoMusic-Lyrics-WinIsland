@@ -17,8 +17,8 @@ use windows62::Win32::Graphics::{
     },
 };
 
-use super::RenderTarget;
 use super::backdrop::SharedBackdrop;
+use super::{CaptureBackend, RenderTarget};
 
 const GPU_RESOURCE_CACHE_LIMIT: usize = 12 * 1024 * 1024;
 const GPU_GLYPH_CACHE_LIMIT: usize = 2 * 1024 * 1024;
@@ -118,8 +118,15 @@ impl D3DDevice {
         width: u32,
         height: u32,
         generation: u64,
+        capture_backend: CaptureBackend,
     ) -> Result<SharedBackdrop, String> {
-        SharedBackdrop::new(&self.backend.device, width, height, generation)
+        SharedBackdrop::new(
+            &self.backend.device,
+            width,
+            height,
+            generation,
+            capture_backend,
+        )
     }
 
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
