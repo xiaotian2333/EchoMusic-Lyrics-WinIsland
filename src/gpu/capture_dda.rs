@@ -100,6 +100,7 @@ impl DdaSession {
             stop: Arc::clone(&stop),
             backoff: REBUILD_BACKOFF_MIN,
             last_wake: Instant::now(),
+            deferred_wake: None,
             format_warned: false,
         };
         let handle = std::thread::Builder::new()
@@ -153,6 +154,8 @@ struct Worker {
     stop: Arc<AtomicBool>,
     backoff: Duration,
     last_wake: Instant,
+    /// 节流窗内攒下的补发唤醒时刻；窗口结束时补发一次，突发末帧不被吞。
+    deferred_wake: Option<Instant>,
     /// 帧格式告警是否已输出（只告警一次，避免每帧刷屏）。
     format_warned: bool,
 }
@@ -163,6 +166,7 @@ impl Worker {
             if self.stop.load(Ordering::Acquire) {
                 return;
             }
+            self.fire_deferred_wake();
             let Some(duplication) = self.duplication.clone() else {
                 self.rebuild();
                 continue;
@@ -170,8 +174,9 @@ impl Worker {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             // SAFETY: 复制会话存活；输出 Option 由本次调用初始化并拥有。
+            // 有补发唤醒待触发时把超时截止到补发时刻，保证空闲时准时醒来补发。
             match unsafe {
-                duplication.AcquireNextFrame(POLL_TIMEOUT_MS, &mut frame_info, &mut resource)
+                duplication.AcquireNextFrame(self.wake_wait_ms(), &mut frame_info, &mut resource)
             } {
                 // 桌面无更新，继续等待
                 Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
@@ -357,20 +362,53 @@ impl Worker {
 
     /// 递增共享帧序号并按速率节流唤醒渲染线程。
     ///
-    /// 被节流的帧不再丢弃序号：数据已经拷进内部纹理，这里只合并唤醒机会，
-    /// 下一次渲染自然会取到最新内容，动画收尾不再有最长一个节流周期的尾巴延迟。
+    /// 数据无条件拷进内部纹理并递增序号，被节流的只有唤醒：窗内的唤醒推迟到
+    /// 窗口结束补发而不是丢弃，突发末帧不再滞留在内部纹理里——空闲态下最后一
+    /// 次内容变化也能到达渲染端。补发只影响唤醒时机，后续帧的拷贝与发布不受影响，
+    /// 唤醒节奏仍收敛在速率上限。
     fn publish_frame(&mut self) {
         lock(&self.shared.latest).sequence += 1;
         let rate_hz = self.rate_hz.load(Ordering::Acquire).max(1);
         let min_interval = Duration::from_millis(1000 / u64::from(rate_hz));
         let now = Instant::now();
-        if now.duration_since(self.last_wake) < min_interval {
+        let elapsed = now.duration_since(self.last_wake);
+        if elapsed < min_interval {
+            // 只保留最早的补发时刻；窗口结束前统一醒来发一次
+            if self.deferred_wake.is_none() {
+                self.deferred_wake = Some(now + (min_interval - elapsed));
+            }
             return;
         }
-        self.last_wake = now;
+        self.fire_wake();
+    }
+
+    /// 唤醒渲染线程并记录唤醒时刻（节流窗口基准），常规路径与补发路径共用。
+    fn fire_wake(&mut self) {
+        self.last_wake = Instant::now();
         if !self.shared.pending.swap(true, Ordering::AcqRel) {
             crate::gpu::wake();
         }
+    }
+
+    /// 补发节流窗内攒下的唤醒；突发末帧的唤醒不再被节流丢弃。
+    fn fire_deferred_wake(&mut self) {
+        let Some(deadline) = self.deferred_wake else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.deferred_wake = None;
+        self.fire_wake();
+    }
+
+    /// AcquireNextFrame 的等待时长：无补发时用常规轮询间隔；有补发时截止到
+    /// 补发时刻（至少 1ms），空闲桌面下也能准时醒来补发。
+    fn wake_wait_ms(&self) -> u32 {
+        self.deferred_wake.map_or(POLL_TIMEOUT_MS, |deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            (remaining.as_millis() as u32 + 1).min(POLL_TIMEOUT_MS)
+        })
     }
 }
 
