@@ -415,6 +415,11 @@ where
                     Some("open_homepage") => {
                         let _ = open::that(APP_HOMEPAGE);
                     }
+                    Some("open_settings") => {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                        }
+                    }
                     Some("disabled") => {
                         let _ = event_tx.send(LyricsWsEvent::PluginDisabled);
                     }
