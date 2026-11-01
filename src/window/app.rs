@@ -1299,7 +1299,7 @@ impl App {
                         if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI
                             && let Some(hwnd_raw) = self.hwnd_raw
                         {
-                            crate::gpu::set_excluded_from_dda(hwnd_raw, true);
+                            crate::gpu::apply_liquid_glass_dxgi_exclusion(hwnd_raw);
                         }
                     }
                 }
@@ -1537,7 +1537,7 @@ impl ApplicationHandler for App {
                     set_exclude_from_capture(hwnd, !self.config.liquid_glass_compat_capture);
                 }
                 if self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
-                    crate::gpu::set_excluded_from_dda(win32_handle.hwnd.get(), true);
+                    crate::gpu::apply_liquid_glass_dxgi_exclusion(win32_handle.hwnd.get());
                 }
             }
 
@@ -1726,6 +1726,10 @@ impl ApplicationHandler for App {
                         if !media_info.title.is_empty() {
                             music_active = true;
                         }
+                        // 捕获/取色的高频期标记：音乐活跃或运动模糊速度未归零。
+                        // 高频重绘期间帧渲染不应被 GPU 回读打断（液态玻璃-DXGI 亮度采样）
+                        let animating =
+                            music_active || sigmas.0.abs() > 0.01 || sigmas.1.abs() > 0.01;
 
                         let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
                         let lyric_current_pos = media_info.effective_position_ms(delay_ms);
@@ -1876,6 +1880,7 @@ impl ApplicationHandler for App {
                                 liquid_glass_tint: self.config.liquid_glass_tint,
                                 liquid_glass_siri: self.config.liquid_glass_siri,
                                 host_backdrop: self.host_backdrop.is_some(),
+                                animating,
                                 lyrics_transition_animation: &self
                                     .config
                                     .lyrics_transition_animation,
@@ -1892,8 +1897,6 @@ impl ApplicationHandler for App {
                                 + (self.config.expanded_scale - self.config.non_expanded_scale)
                                     * progress;
                             let frost_sigma = self.config.liquid_glass_blur * liquid_scale;
-                            let animating =
-                                music_active || sigmas.0.abs() > 0.01 || sigmas.1.abs() > 0.01;
                             let render_result = gpu.render(
                                 (self.win_x, self.win_y),
                                 (self.os_w, self.os_h),

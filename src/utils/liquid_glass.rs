@@ -113,8 +113,15 @@ pub fn backdrop_luminance(
 /// WCA_EXCLUDED_FROM_DDA 排除在捕获之外，图像不含岛屿自身渲染内容；模糊
 /// 近似保持均值，与 [`display_luminance`] 的着色器口径一致。按 TTL 缓存，
 /// 采样失败沿用上一次的有效值。
-pub(crate) fn backdrop_image_luminance(backdrop: &Backdrop) -> Option<f32> {
+///
+/// `animating` 为高频重绘期标记：采样会把 GPU 图像隐式回读到 CPU，强制整条
+/// 命令队列 flush 同步，在动画中途表现为周期性掉帧，因此高频期只沿用缓存值
+/// （不限 TTL），回到空闲帧再真正刷新。
+pub(crate) fn backdrop_image_luminance(backdrop: &Backdrop, animating: bool) -> Option<f32> {
     let cached = GPU_LUMINANCE_CACHE.with(|cell| *cell.borrow());
+    if animating {
+        return cached.and_then(|(value, _)| value);
+    }
     if let Some((value, at)) = cached
         && at.elapsed().as_millis() < LUMINANCE_TTL_MS
     {

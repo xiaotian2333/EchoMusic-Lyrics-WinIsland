@@ -93,13 +93,15 @@ pub(super) struct Shared {
     probe: Mutex<Probe>,
 }
 
-/// 最新背板帧的来源：WGC 帧池帧、DDA 内部纹理拷贝或放大镜像素回调帧。
+/// 最新背板帧的来源：WGC 帧池帧、DDA interest 裁剪纹理或放大镜像素回调帧。
 #[derive(Clone)]
 pub(super) enum FrameSource {
     Wgc(Direct3D11CaptureFrame),
     Dda {
         texture: ID3D11Texture2D,
         size: (u32, u32),
+        /// 纹理左上角的桌面坐标：启动期全帧兜底时为输出原点，裁剪期为其 interest 盒原点
+        origin: (i32, i32),
     },
     Magnifier(Arc<PixelFrame>),
 }
@@ -225,6 +227,7 @@ impl Session {
 
     fn start(
         backend: CaptureBackend,
+        hwnd_raw: isize,
         monitor: HMONITOR,
         shared: &Arc<Shared>,
         rate_hz: u32,
@@ -234,7 +237,7 @@ impl Session {
         match backend {
             CaptureBackend::Wgc => Ok(Self::Wgc(WgcSession::start(monitor, shared, rate_hz)?)),
             CaptureBackend::Dda => Ok(Self::Dda(DdaSession::start(
-                monitor, shared, rate_hz, device, context,
+                hwnd_raw, monitor, shared, rate_hz, device, context,
             )?)),
         }
     }
@@ -363,11 +366,17 @@ impl BackdropCapture {
         *lock(&self.shared.interest) = interest;
         self.shared.pending.store(false, Ordering::Release);
         self.ensure_import(request.share)?;
+        // DDA 内部纹理的坐标基准随帧携带（启动期全帧兜底为输出原点，裁剪期为其
+        // interest 盒原点）；其余来源的源纹理从会话原点（输出左上角）起算
+        let (base_x, base_y) = match &source {
+            FrameSource::Dda { origin, .. } => *origin,
+            _ => (origin.0, origin.1),
+        };
         let key = (
             request.share.generation,
             sequence,
-            request.origin.x - origin.0,
-            request.origin.y - origin.1,
+            request.origin.x - base_x,
+            request.origin.y - base_y,
         );
         let verified = intersection(self.verified.get(), interest);
         if self.copied.get() != Some(key) || verified != interest {
@@ -438,7 +447,24 @@ impl BackdropCapture {
                 .map(|()| self.context.Flush())
         };
         if let Err(error) = result {
-            log::warn!("背板捕获拷贝失败: {error}");
+            let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: desc 为输出结构，由本次调用初始化。
+            unsafe { source.GetDesc(&mut source_desc) };
+            log::warn!(
+                "背板捕获拷贝失败: {error}（local=({local_x},{local_y}) src_box=({},{},{},{}) content={}x{} 源纹理={}x{} 格式{:?} import={}x{} read_value={}）",
+                source_box.left,
+                source_box.top,
+                source_box.right,
+                source_box.bottom,
+                content.Width,
+                content.Height,
+                source_desc.Width,
+                source_desc.Height,
+                source_desc.Format,
+                import.size.0,
+                import.size.1,
+                request.read_value
+            );
             return None;
         }
         // SAFETY: 仅查询保留设备的移除状态。
@@ -538,6 +564,15 @@ impl BackdropCapture {
         })();
         match import {
             Ok(import) => {
+                // 共享写围栏的值由底层内核对象持有，跨捕获端实例单调递增；新建的
+                // 捕获端必须从围栏当前值继续 Signal，从 0 重来会因值回退被拒
+                // （E_INVALIDARG）——中途回退后端或重建捕获时必然触发
+                // SAFETY: 围栏接口存活，仅读取其当前完成值。
+                let fence_value = unsafe { import.write_fence.GetCompletedValue() };
+                self.write_value.store(
+                    fence_value.max(self.write_value.load(Ordering::Acquire)),
+                    Ordering::Release,
+                );
                 *self.import.borrow_mut() = Some(import);
                 self.copied.set(None);
                 Some(())
@@ -580,9 +615,13 @@ impl BackdropCapture {
         }
         self.session.borrow_mut().take();
         *lock(&self.shared.latest) = Latest::default();
+        // 一并清空 interest：DDA 轮询线程以「interest 为空」识别渲染端尚未确认
+        // 新会话，从而走全帧兜底，避免陷入等 interest 才产 source 的死锁
+        *lock(&self.shared.interest) = Rect::default();
         self.copied.set(None);
         let session = Session::start(
             self.backend,
+            self.hwnd.0 as isize,
             monitor,
             &self.shared,
             rate_hz,

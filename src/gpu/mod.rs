@@ -44,6 +44,16 @@ const CAPTURE_RETRY: Duration = Duration::from_secs(10);
 /// 背板共享纹理的代次计数，每次重建递增，供捕获端识别失效句柄。
 static BACKDROP_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// 为液态玻璃-DXGI 应用 DDA 排除标志（尽力而为，不做任何后端替换）。
+///
+/// 部分系统会接受调用但不执行排除，此时 DDA 捕获会包含岛屿自身渲染内容，
+/// 由液态玻璃的重度模糊掩盖，不因此切换捕获后端。
+pub fn apply_liquid_glass_dxgi_exclusion(hwnd_raw: isize) {
+    if !set_excluded_from_dda(hwnd_raw, true) {
+        log::warn!("WCA_EXCLUDED_FROM_DDA 设置失败，DDA 捕获将包含岛屿自身");
+    }
+}
+
 /// 背板捕获后端；按液态玻璃样式变体选择。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureBackend {

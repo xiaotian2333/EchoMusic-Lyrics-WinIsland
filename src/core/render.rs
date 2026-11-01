@@ -11,8 +11,8 @@ use softbuffer::Surface;
 use winit::window::Window;
 
 use crate::core::config::{
-    DockPosition, ISLAND_STYLE_LIQUID_GLASS_WGC, LyricsFilterScope, PADDING, TOP_OFFSET,
-    is_liquid_glass_style,
+    DockPosition, ISLAND_STYLE_LIQUID_GLASS_DXGI, ISLAND_STYLE_LIQUID_GLASS_WGC, LyricsFilterScope,
+    PADDING, TOP_OFFSET, is_liquid_glass_style,
 };
 use crate::core::i18n::tr;
 use crate::core::lyrics::LyricCharacter;
@@ -284,6 +284,9 @@ pub struct StyleParams<'a> {
     pub liquid_glass_siri: bool,
     /// 毛玻璃宿主背板是否已就绪；就绪时背景由合成视觉提供，这里只画暗色覆盖层
     pub host_backdrop: bool,
+    /// 是否处于高频重绘期（音乐活跃或运动模糊速度未归零）；液态玻璃-DXGI 的
+    /// 亮度采样在高频期只沿用缓存，避免帧渲染中途的 GPU 回读同步造成周期性卡顿
+    pub animating: bool,
     /// 迷你歌词切换动画：blur / slide / fade（WinIsland 原版三选一）
     pub lyrics_transition_animation: &'a str,
     /// dynamic 样式切歌间隙沿用旧封面背景的宽限时长
@@ -627,6 +630,7 @@ pub fn draw_island_canvas(
         liquid_glass_tint,
         liquid_glass_siri,
         host_backdrop,
+        animating,
         lyrics_transition_animation,
         dynamic_cover_grace,
         volume_hint_alpha,
@@ -694,9 +698,13 @@ pub fn draw_island_canvas(
             tint: liquid_glass_tint / 100.0,
             siri: liquid_glass_siri,
         };
-        // GPU 路径使用 WinIsland 原版渲染管线提供的背板；否则回退到 CPU 截屏实现
+        // GPU 路径使用 WinIsland 原版渲染管线提供的背板；否则回退到 CPU 截屏实现。
+        // DXGI 变体不设 WDA，GDI 兜底截屏会把岛屿自身上一帧的玻璃画面截进背景，
+        // 再叠一层 frost 模糊形成「玻璃与自身叠加」，因此直接落到下方暗色底兜底。
         let drawn = if let Some(backdrop) = gpu_backdrop {
             draw_liquid_glass_with_backdrop(canvas, backdrop, &draw_params)
+        } else if island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
+            false
         } else {
             match get_liquid_glass_background(&LiquidGlassParams {
                 win_x,
@@ -901,7 +909,7 @@ pub fn draw_island_canvas(
         let content = if island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
             backdrop_luminance(island_rect, monitor_rect)
         } else if let Some(backdrop) = gpu_backdrop {
-            backdrop_image_luminance(backdrop)
+            backdrop_image_luminance(backdrop, animating)
         } else {
             None
         };
