@@ -54,14 +54,10 @@ const LUMINANCE_TTL_MS: u128 = 500;
 const LUMINANCE_DOWNSCALE: i32 = 4;
 /// 采样区域短边小于该值时不采信（岛屿几乎完全离屏）。
 const LUMINANCE_MIN_SIDE: i32 = 4;
-/// GPU 背板亮度采样面的边长；小面足够反映均值。
-const GPU_LUMINANCE_SAMPLE: i32 = 24;
 
 thread_local! {
     /// 最近一次采样到的岛屿下方内容亮度（None 表示这次采样失败）与时间戳。
     static LUMINANCE_CACHE: RefCell<Option<(Option<f32>, Instant)>> = const { RefCell::new(None) };
-    /// GPU 背板亮度缓存（液态玻璃-DXGI 使用），口径与 LUMINANCE_CACHE 相同。
-    static GPU_LUMINANCE_CACHE: RefCell<Option<(Option<f32>, Instant)>> = const { RefCell::new(None) };
 }
 
 /// 将岛屿窗口从 GDI 屏幕截图中排除（或恢复）。
@@ -107,65 +103,6 @@ pub fn backdrop_luminance(
     value
 }
 
-/// 从 GPU frost 背板图像估算岛屿下方内容的平均亮度（0.0~1.0）；采样失败返回 None。
-///
-/// 液态玻璃-DXGI 的 GPU 背板来自 DXGI Desktop Duplication，且窗口已通过
-/// WCA_EXCLUDED_FROM_DDA 排除在捕获之外，图像不含岛屿自身渲染内容；模糊
-/// 近似保持均值，与 [`display_luminance`] 的着色器口径一致。按 TTL 缓存，
-/// 采样失败沿用上一次的有效值。
-///
-/// `animating` 为高频重绘期标记：采样会把 GPU 图像隐式回读到 CPU，强制整条
-/// 命令队列 flush 同步，在动画中途表现为周期性掉帧，因此高频期只沿用缓存值
-/// （不限 TTL），回到空闲帧再真正刷新。
-pub(crate) fn backdrop_image_luminance(backdrop: &Backdrop, animating: bool) -> Option<f32> {
-    let cached = GPU_LUMINANCE_CACHE.with(|cell| *cell.borrow());
-    if animating {
-        return cached.and_then(|(value, _)| value);
-    }
-    if let Some((value, at)) = cached
-        && at.elapsed().as_millis() < LUMINANCE_TTL_MS
-    {
-        return value;
-    }
-    let value = sample_backdrop_image_luminance(backdrop).or(cached.and_then(|(value, _)| value));
-    GPU_LUMINANCE_CACHE.with(|cell| *cell.borrow_mut() = Some((value, Instant::now())));
-    value
-}
-
-/// 把背板图像拉伸绘入小采样面后求平均亮度；失败时返回 None。
-fn sample_backdrop_image_luminance(backdrop: &Backdrop) -> Option<f32> {
-    let size = ISize::new(GPU_LUMINANCE_SAMPLE, GPU_LUMINANCE_SAMPLE);
-    let mut surface = surfaces::raster_n32_premul(size)?;
-    let info = ImageInfo::new(size, ColorType::BGRA8888, AlphaType::Opaque, None);
-    {
-        let canvas = surface.canvas();
-        canvas.clear(Color::TRANSPARENT);
-        let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-        canvas.draw_image_rect_with_sampling_options(
-            &backdrop.image,
-            None,
-            Rect::from_xywh(
-                0.0,
-                0.0,
-                GPU_LUMINANCE_SAMPLE as f32,
-                GPU_LUMINANCE_SAMPLE as f32,
-            ),
-            sampling,
-            &Paint::default(),
-        );
-    }
-    let mut pixels = vec![0_u8; (GPU_LUMINANCE_SAMPLE * GPU_LUMINANCE_SAMPLE * 4) as usize];
-    if !surface.read_pixels(
-        &info,
-        pixels.as_mut_slice(),
-        (GPU_LUMINANCE_SAMPLE * 4) as usize,
-        (0, 0),
-    ) {
-        return None;
-    }
-    Some(average_luminance_bgra(&pixels))
-}
-
 /// 截取岛屿矩形下方的屏幕内容并求平均亮度；区域离屏或截屏失败时返回 None。
 fn sample_content_luminance(
     island: (i32, i32, i32, i32),
@@ -197,7 +134,7 @@ fn sample_content_luminance(
 }
 
 /// BGRA 像素缓冲的平均亮度（0.0~1.0）；权重取 BT.601，与封面取色口径一致。
-fn average_luminance_bgra(pixels: &[u8]) -> f32 {
+pub(crate) fn average_luminance_bgra(pixels: &[u8]) -> f32 {
     let mut sum = 0.0_f32;
     let mut count = 0_u32;
     for pixel in pixels.as_chunks::<4>().0 {
@@ -348,6 +285,8 @@ pub(crate) struct Backdrop {
     pub(crate) blur_scale: f32,
     /// 背板左上角在画布坐标中的位置（窗口部分离屏时非零）。
     pub(crate) origin: (f32, f32),
+    /// 岛屿下方内容的平均亮度；GPU 背板由异步采样器跨帧产出，CPU 兜底路径无此值。
+    pub(crate) luminance: Option<f32>,
 }
 
 /// 背板截图缓存键：窗口与显示器矩形。
@@ -935,6 +874,7 @@ pub fn get_liquid_glass_background(params: &LiquidGlassParams) -> Option<LiquidG
         image: backdrop_image,
         blur_scale,
         origin,
+        luminance: None,
     };
 
     let margin = material.margin().ceil();
@@ -1022,6 +962,7 @@ mod tests {
             image: backdrop_surface.image_snapshot(),
             blur_scale: 1.0,
             origin: (0.0, 0.0),
+            luminance: None,
         };
         let mut surface = surfaces::raster_n32_premul(ISize::new(64, 64)).unwrap();
         let shape = LiquidShape {

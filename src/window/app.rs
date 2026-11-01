@@ -1726,8 +1726,8 @@ impl ApplicationHandler for App {
                         if !media_info.title.is_empty() {
                             music_active = true;
                         }
-                        // 捕获/取色的高频期标记：音乐活跃或运动模糊速度未归零。
-                        // 高频重绘期间帧渲染不应被 GPU 回读打断（液态玻璃-DXGI 亮度采样）
+                        // 捕获高频期标记：音乐活跃或运动模糊速度未归零，期间背板
+                        // 以 60Hz 更新（空闲 30Hz）
                         let animating =
                             music_active || sigmas.0.abs() > 0.01 || sigmas.1.abs() > 0.01;
 
@@ -1880,7 +1880,6 @@ impl ApplicationHandler for App {
                                 liquid_glass_tint: self.config.liquid_glass_tint,
                                 liquid_glass_siri: self.config.liquid_glass_siri,
                                 host_backdrop: self.host_backdrop.is_some(),
-                                animating,
                                 lyrics_transition_animation: &self
                                     .config
                                     .lyrics_transition_animation,

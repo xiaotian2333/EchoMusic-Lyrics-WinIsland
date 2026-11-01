@@ -37,9 +37,8 @@ use crate::utils::color::{
 use crate::utils::font::{DrawTextCachedParams, FontManager};
 use crate::utils::glass::get_glass_background;
 use crate::utils::liquid_glass::{
-    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams, backdrop_image_luminance,
-    backdrop_luminance, display_luminance, draw_liquid_glass_with_backdrop,
-    get_liquid_glass_background,
+    Backdrop as LiquidBackdrop, LiquidGlassDrawParams, LiquidGlassParams, backdrop_luminance,
+    display_luminance, draw_liquid_glass_with_backdrop, get_liquid_glass_background,
 };
 
 thread_local! {
@@ -284,9 +283,6 @@ pub struct StyleParams<'a> {
     pub liquid_glass_siri: bool,
     /// 毛玻璃宿主背板是否已就绪；就绪时背景由合成视觉提供，这里只画暗色覆盖层
     pub host_backdrop: bool,
-    /// 是否处于高频重绘期（音乐活跃或运动模糊速度未归零）；液态玻璃-DXGI 的
-    /// 亮度采样在高频期只沿用缓存，避免帧渲染中途的 GPU 回读同步造成周期性卡顿
-    pub animating: bool,
     /// 迷你歌词切换动画：blur / slide / fade（WinIsland 原版三选一）
     pub lyrics_transition_animation: &'a str,
     /// dynamic 样式切歌间隙沿用旧封面背景的宽限时长
@@ -630,7 +626,6 @@ pub fn draw_island_canvas(
         liquid_glass_tint,
         liquid_glass_siri,
         host_backdrop,
-        animating,
         lyrics_transition_animation,
         dynamic_cover_grace,
         volume_hint_alpha,
@@ -895,9 +890,9 @@ pub fn draw_island_canvas(
     // 液态玻璃未播放色的自动取值：按玻璃着色后的背景亮度在黑白两档间切换。
     // 背景是实时折射的桌面内容，固定的浅色在亮背景上会糊；采样不可用时回退到默认文字色。
     // WGC 变体沿用 GDI 采样（窗口由 WDA 排除，采到的是岛屿下方内容）；DXGI 变体
-    // 改从 GPU 背板图像采样（背板来自 Desktop Duplication 且已排除自身）；
-    // GPU 背板未就绪时（CPU 兜底/捕获重试）GDI 采样会把岛上歌词算进来形成
-    // 自反馈抖动，直接停用自动取色回退默认文字色。
+    // 改用 GPU 背板亮度采样器（渲染帧尾异步拷贝、跨帧收割，亮度随背板就绪传入，
+    // 详见 gpu::backdrop::LuminanceSampler）；GPU 背板未就绪时（CPU 兜底/捕获重试）
+    // GDI 采样会把岛上歌词算进来形成自反馈抖动，直接停用自动取色回退默认文字色。
     let liquid_unplayed = if is_liquid_glass_style(island_style) && char_color_unplayed.is_none() {
         let island_rect = (
             win_x + offset_x.round() as i32,
@@ -909,7 +904,7 @@ pub fn draw_island_canvas(
         let content = if island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
             backdrop_luminance(island_rect, monitor_rect)
         } else if let Some(backdrop) = gpu_backdrop {
-            backdrop_image_luminance(backdrop, animating)
+            backdrop.luminance
         } else {
             None
         };

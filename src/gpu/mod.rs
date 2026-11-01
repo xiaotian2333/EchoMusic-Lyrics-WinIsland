@@ -282,13 +282,17 @@ impl GpuIsland {
         canvas.reset_matrix();
         canvas.save();
         let gpu_backdrop = match self.backdrop.as_mut() {
-            Some(backdrop) => backdrop
-                .images(&mut self.device.context)
-                .map(|(_, blurred)| LiquidBackdrop {
-                    image: blurred,
-                    blur_scale: backdrop.frost_scale(),
-                    origin: (0.0, 0.0),
-                }),
+            Some(backdrop) => {
+                let luminance = backdrop.luminance();
+                backdrop
+                    .images(&mut self.device.context)
+                    .map(|(_, blurred)| LiquidBackdrop {
+                        image: blurred,
+                        blur_scale: backdrop.frost_scale(),
+                        origin: (0.0, 0.0),
+                        luminance,
+                    })
+            }
             None => None,
         };
         let output = draw(canvas, gpu_backdrop.as_ref());
@@ -299,6 +303,11 @@ impl GpuIsland {
             &skia_safe::gpu::FlushInfo::default(),
         );
         self.device.submit(skia_safe::gpu::SyncCpu::No)?;
+        if let Some(backdrop) = self.backdrop.as_mut() {
+            // 亮度采样拷贝排在读围栏信号之前：捕获端覆写共享纹理的围栏等待
+            // 因此覆盖本读取，且全程无 CPU 等待，不阻塞下一帧
+            backdrop.queue_luminance_sample(self.device.queue());
+        }
         if let Some(backdrop) = self.backdrop.as_mut() {
             backdrop.finish_frame(self.device.queue())?;
         }
@@ -343,6 +352,11 @@ mod tests {
         let images = backdrop.images(&mut device.context);
         assert!(images.is_some(), "GPU frost 管线未产出图像");
         drop(images);
+        // 亮度采样：提交拷贝并同步 GPU，再收割一次应产出有效均值
+        backdrop.queue_luminance_sample(&queue);
+        device.synchronize().expect("GPU 同步失败");
+        backdrop.queue_luminance_sample(&queue);
+        assert!(backdrop.luminance().is_some(), "背板亮度采样未产出结果");
         drop(backdrop);
         assert!(device.synchronize().is_ok(), "GPU 同步失败");
         eprintln!("GPU 冒烟测试通过：D3D12 设备、Skia 上下文与 frost 管线可用");
