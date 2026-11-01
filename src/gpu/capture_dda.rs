@@ -2,10 +2,10 @@
 //!
 //! 复制会话仅声明 B8G8R8A8_UNORM：SDR 桌面按原格式输出，HDR 桌面（FP16 scRGB）
 //! 由 DXGI 在系统端转换为 BGRA8，下游共享纹理管线无需感知格式差异。
-//! 轮询线程按脏区相关性过滤后，只把 interest 交叠盒（窗口所在区域）拷入内部
-//! 纹理；主线程 update() 沿用与 WGC 后端相同的共享纹理握手把该区域拷进 D3D12
-//! 背板。interest 之外的桌面更新不产生拷贝与唤醒，避免全桌面大拷贝在桌面刷新
-//! 率下与主线程渲染争抢 GPU。
+//! 轮询线程按脏区/移动区相关性过滤后，只把 interest 交叠盒（窗口所在区域）拷入
+//! 内部纹理；纯指针更新（无像素变化）不产生拷贝与唤醒。主线程 update() 沿用与
+//! WGC 后端相同的共享纹理握手把该区域拷进 D3D12 背板。interest 之外的桌面更新
+//! 不产生拷贝与唤醒，避免全桌面大拷贝在桌面刷新率下与主线程渲染争抢 GPU。
 //! 会话（重）启动时尽力重新应用 WCA_EXCLUDED_FROM_DDA；部分系统会静默忽略
 //! 该标志，此时捕获包含岛屿自身渲染内容，由液态玻璃的重度模糊掩盖，
 //! 不做任何后端替换。
@@ -22,8 +22,8 @@ use windows62::Win32::Graphics::Direct3D11::{
 };
 use windows62::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows62::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIDevice, IDXGIOutput,
-    IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter,
+    IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows62::Win32::Graphics::Gdi::HMONITOR;
 use windows62::core::Interface;
@@ -31,8 +31,9 @@ use windows62::core::Interface;
 use super::Rect;
 use super::capture::{FrameSource, Shared, intersects, lock};
 
-/// AcquireNextFrame 的阻塞超时：桌面无更新时的轮询间隔，也决定停止响应粒度。
-const POLL_TIMEOUT_MS: u32 = 100;
+/// AcquireNextFrame 的阻塞超时：桌面无更新时的轮询间隔，也决定停止响应粒度
+/// （会话停机 join 最多阻塞调用方一个超时周期）。
+const POLL_TIMEOUT_MS: u32 = 30;
 /// 退避睡眠的分片粒度。
 const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 /// 复制会话重建退避的起始与上限。
@@ -101,6 +102,9 @@ impl DdaSession {
             backoff: REBUILD_BACKOFF_MIN,
             last_wake: Instant::now(),
             deferred_wake: None,
+            dirty_buf: Vec::new(),
+            move_buf: Vec::new(),
+            fresh_session: true,
             format_warned: false,
         };
         let handle = std::thread::Builder::new()
@@ -156,6 +160,12 @@ struct Worker {
     last_wake: Instant,
     /// 节流窗内攒下的补发唤醒时刻；窗口结束时补发一次，突发末帧不被吞。
     deferred_wake: Option<Instant>,
+    /// 帧脏区元数据缓冲，跨帧复用避免高频分配。
+    dirty_buf: Vec<RECT>,
+    /// 帧移动区元数据缓冲，跨帧复用避免高频分配。
+    move_buf: Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    /// 复制会话（重）建后是否尚未处理过任何帧；首帧整幅放行。
+    fresh_session: bool,
     /// 帧格式告警是否已输出（只告警一次，避免每帧刷屏）。
     format_warned: bool,
 }
@@ -188,26 +198,44 @@ impl Worker {
                 }
                 Ok(()) => {}
             }
-            // 脏区必须在 ReleaseFrame 之前读取；相关性在拷贝之前判断，
-            // 不相关的桌面更新不再产生全帧拷贝。interest 为空表示渲染端尚未
+            // 脏区与移动区必须在 ReleaseFrame 之前读取；相关性在拷贝之前判断，
+            // 不相关的桌面更新不再产生拷贝与唤醒。interest 为空表示渲染端尚未
             // 确认本会话（其写入依赖先看到帧源），此时必须放行走全帧兜底，
             // 否则「等 interest 才产 source、等 source 才写 interest」互相死锁
-            let dirty_rects = read_dirty_rects(&duplication, &frame_info);
+            let dirty_rects = read_frame_rects(
+                frame_info.TotalMetadataBufferSize,
+                &mut self.dirty_buf,
+                |size, pointer, required| unsafe {
+                    duplication.GetFrameDirtyRects(size, pointer, required)
+                },
+            );
+            let move_rects = read_frame_rects(
+                frame_info.TotalMetadataBufferSize,
+                &mut self.move_buf,
+                |size, pointer, required| unsafe {
+                    duplication.GetFrameMoveRects(size, pointer, required)
+                },
+            );
+            // 会话（重）建后的首帧整幅放行：重建后内容口径（分辨率/内容尺寸）立即恢复
+            let fresh_session = self.fresh_session;
+            self.fresh_session = false;
+            // 空元数据且无呈现的帧是纯指针更新（形状变化不产生像素，位置变化不经
+            // 桌面图像），跳过拷贝与唤醒；其余空元数据帧按整幅更新放行
+            let pointer_only = !fresh_session
+                && frame_info.LastPresentTime == 0
+                && dirty_rects.is_empty()
+                && move_rects.is_empty();
             let interest = *lock(&self.shared.interest);
             let interest_ready = interest.right > interest.left && interest.bottom > interest.top;
             let relevant = !interest_ready
-                || dirty_rects.is_empty()
-                || dirty_rects.iter().any(|rect| {
-                    intersects(
-                        Rect {
-                            left: rect.left,
-                            top: rect.top,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                        interest,
-                    )
-                });
+                || (!pointer_only
+                    && (dirty_rects.is_empty() && move_rects.is_empty()
+                        || dirty_rects
+                            .iter()
+                            .any(|rect| intersects(rect_bounds(rect), interest))
+                        || move_rects.iter().any(|move_rect| {
+                            intersects(rect_bounds(&move_rect.DestinationRect), interest)
+                        })));
             let copied = relevant
                 && resource
                     .and_then(|resource| resource.cast::<ID3D11Texture2D>().ok())
@@ -232,6 +260,7 @@ impl Worker {
             Ok(duplication) => {
                 self.duplication = Some(duplication);
                 self.backoff = REBUILD_BACKOFF_MIN;
+                self.fresh_session = true;
             }
             Err(error) => {
                 log::info!("DXGI 背板复制会话重建失败: {error}");
@@ -412,33 +441,48 @@ impl Worker {
     }
 }
 
-/// 读取帧脏区；必须在 ReleaseFrame 之前调用，失败或无脏区时返回空。
-fn read_dirty_rects(
-    duplication: &IDXGIOutputDuplication,
-    frame_info: &DXGI_OUTDUPL_FRAME_INFO,
-) -> Vec<RECT> {
-    if frame_info.TotalMetadataBufferSize == 0 {
-        return Vec::new();
+/// 读取帧元数据矩形（脏区或移动区）；必须在 ReleaseFrame 之前调用，复用调用方
+/// 缓冲避免高频分配，失败或无数据时清空后返回空切片。
+///
+/// TotalMetadataBufferSize 是移动区与脏区元数据的总上限，按元素大小换算的
+/// 容量对任意一次调用都必然足够。
+fn read_frame_rects<T: Default + Clone>(
+    total_metadata: u32,
+    buffer: &mut Vec<T>,
+    fill: impl FnOnce(u32, *mut T, &mut u32) -> windows62::core::Result<()>,
+) -> &[T] {
+    if total_metadata == 0 {
+        buffer.clear();
+        return &[];
     }
-    // TotalMetadataBufferSize 是移动区与脏区元数据的总上限，按 RECT 大小换算
-    // 的容量必然足够
-    let capacity = frame_info.TotalMetadataBufferSize as usize / std::mem::size_of::<RECT>() + 1;
-    let mut rects = vec![RECT::default(); capacity];
+    let element_size = std::mem::size_of::<T>();
+    let capacity = total_metadata as usize / element_size + 1;
+    buffer.clear();
+    buffer.resize(capacity, T::default());
     let mut required: u32 = 0;
     // SAFETY: 缓冲区不小于元数据总上限；所需字节数写入 required。
-    if let Err(error) = unsafe {
-        duplication.GetFrameDirtyRects(
-            (rects.len() * std::mem::size_of::<RECT>()) as u32,
-            rects.as_mut_ptr(),
-            &mut required,
-        )
-    } {
-        log::debug!("读取帧脏区失败: {error}");
-        return Vec::new();
+    if let Err(error) = fill(
+        (buffer.len() * element_size) as u32,
+        buffer.as_mut_ptr(),
+        &mut required,
+    ) {
+        log::debug!("读取帧元数据失败: {error}");
+        buffer.clear();
+        return &[];
     }
-    let count = (required as usize / std::mem::size_of::<RECT>()).min(rects.len());
-    rects.truncate(count);
-    rects
+    let count = (required as usize / element_size).min(buffer.len());
+    buffer.truncate(count);
+    buffer
+}
+
+/// RECT → 输出坐标系下的屏幕像素矩形。
+fn rect_bounds(rect: &RECT) -> Rect {
+    Rect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
 }
 
 /// 在适配器上查找包含指定显示器的输出。
