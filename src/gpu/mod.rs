@@ -174,6 +174,11 @@ impl GpuIsland {
         })
     }
 
+    /// 周期性复查捕获会话（隐藏态不渲染时也需要驱动边框隐藏重发）。
+    pub(crate) fn refresh_capture(&self) -> Option<String> {
+        self.capture.as_ref().and_then(|capture| capture.refresh())
+    }
+
     /// 窗口尺寸变化时重建交换链缓冲。
     pub(crate) fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         self.device.resize_target(&mut self.target, width, height)

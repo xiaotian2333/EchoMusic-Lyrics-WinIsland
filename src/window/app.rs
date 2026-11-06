@@ -140,6 +140,7 @@ pub struct App {
     backdrop_hwnd_raw: Option<isize>,
     host_backdrop: Option<crate::gpu::HostBackdrop>,
     host_backdrop_retry_at: Option<Instant>,
+    border_refresh_at: Option<Instant>,
     hwnd_raw: Option<isize>,
 }
 
@@ -215,6 +216,7 @@ impl Default for App {
             backdrop_hwnd_raw: None,
             host_backdrop: None,
             host_backdrop_retry_at: None,
+            border_refresh_at: None,
             hwnd_raw: None,
         }
     }
@@ -1145,6 +1147,23 @@ impl App {
         }
     }
 
+    /// 隐藏态不渲染，但睡眠唤醒后系统可能重新绘制捕获边框，需要周期驱动
+    /// 捕获端复查（无边框授权与边框隐藏重发）。
+    fn refresh_capture_border(&mut self) {
+        if self
+            .border_refresh_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.border_refresh_at = Some(Instant::now());
+        if let Some(gpu) = self.gpu_island.as_ref()
+            && let Some(error) = gpu.refresh_capture()
+        {
+            self.fail_gpu_island(&error);
+        }
+    }
+
     /// GPU 渲染失败时释放管线并进入冷却，下一帧回退到 CPU 路径。
     fn fail_gpu_island(&mut self, error: &str) {
         log::warn!("GPU 渲染失败，回退到 CPU 液态玻璃路径: {error}");
@@ -1956,6 +1975,7 @@ impl ApplicationHandler for App {
         self.last_frame_time = Instant::now();
 
         if !self.visible {
+            self.refresh_capture_border();
             std::thread::sleep(Duration::from_millis(16));
             return;
         }

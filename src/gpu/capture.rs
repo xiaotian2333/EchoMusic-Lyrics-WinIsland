@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use windows62::{
     Foundation::Metadata::ApiInformation,
@@ -63,6 +64,11 @@ const PROBE_STEP: usize = 2;
 const PROBE_ALIGN: u32 = 64;
 /// 像素回调子模式的帧率上限（CPU 读回成本高）。
 const PIXEL_RATE_LIMIT: u32 = 60;
+/// 捕获会话创建/复查失败后的重试间隔，避免未授权时每帧重建会话。
+const SESSION_RETRY: Duration = Duration::from_secs(5);
+/// 无边框捕获授权的重发间隔：睡眠唤醒或显示器重连后系统会重新绘制
+/// 捕获边框，需要周期性重发隐藏请求。
+const BORDER_REFRESH: Duration = Duration::from_secs(1);
 const BORDER_UNKNOWN: u8 = 0;
 const BORDER_PENDING: u8 = 1;
 const BORDER_OPTIONAL: u8 = 2;
@@ -192,12 +198,13 @@ impl Session {
     fn refresh(&self) -> Result<(), String> {
         match self {
             Self::Wgc(session) => {
-                if !session.borderless.get() && borderless_allowed() {
-                    session.borderless.set(true);
-                    hide_border(&session.session);
-                }
-                if border_access_required() {
-                    return Err("无边框屏幕捕获权限不可用".to_string());
+                if session.border_at.get().elapsed() >= BORDER_REFRESH {
+                    session.border_at.set(Instant::now());
+                    if borderless_allowed() && !hide_border(&session.session) {
+                        session.borderless.set(false);
+                        // 睡眠唤醒后授权可能失效，重置状态以重新发起授权请求
+                        BORDER_ACCESS.store(BORDER_UNKNOWN, Ordering::Release);
+                    }
                 }
                 Ok(())
             }
@@ -232,6 +239,7 @@ struct WgcSession {
     token: i64,
     rate_hz: Cell<u32>,
     borderless: Cell<bool>,
+    border_at: Cell<Instant>,
 }
 
 struct Import {
@@ -260,6 +268,8 @@ pub(crate) struct BackdropCapture {
     upload: RefCell<Option<(ID3D11Texture2D, u32, u32)>>,
     /// 捕获端在放大镜链路全部失效回退整屏时自设的 WDA 标记；Drop 时据此清除。
     self_excluded: Cell<bool>,
+    /// 会话创建或复查失败后的冷却起点，避免持续重试。
+    session_retry_at: Cell<Option<Instant>>,
 }
 
 impl BackdropCapture {
@@ -308,9 +318,18 @@ impl BackdropCapture {
             magnifier_mode: Cell::new(backend == CaptureBackend::Wgc && wgc_compat),
             upload: RefCell::new(None),
             self_excluded: Cell::new(false),
+            session_retry_at: Cell::new(None),
         };
-        capture.ensure_session(60)?;
+        // 首次会话可能因等待无边框授权而失败，不能让渲染端整体不可用；
+        // update 会按重试间隔继续建立会话。
+        let _ = capture.ensure_session(60);
         Ok(capture)
+    }
+
+    /// 周期性复查捕获会话（无边框授权与边框重发）；返回需要重建的错误。
+    pub(crate) fn refresh(&self) -> Option<String> {
+        let session = self.session.borrow();
+        session.as_ref().and_then(|session| session.refresh().err())
     }
 
     /// 处理一次背板更新请求：必要时重启会话，把最新帧拷贝进共享纹理。
@@ -562,9 +581,17 @@ impl BackdropCapture {
     }
 
     fn ensure_session(&self, rate_hz: u32) -> Result<(), String> {
+        if let Some(at) = self.session_retry_at.get()
+            && at.elapsed() < SESSION_RETRY
+        {
+            return Ok(());
+        }
         if self.magnifier_mode.get() {
             match self.ensure_pixel_session(rate_hz) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.session_retry_at.set(None);
+                    return Ok(());
+                }
                 Err(error) => {
                     log::warn!("放大镜背景不可用，回退整屏捕获: {error}");
                     self.magnifier_mode.set(false);
@@ -583,8 +610,10 @@ impl BackdropCapture {
             session.sync_rate(rate_hz);
             if let Err(error) = session.refresh() {
                 self.session.borrow_mut().take();
+                self.session_retry_at.set(Some(Instant::now()));
                 return Err(error);
             }
+            self.session_retry_at.set(None);
             return Ok(());
         }
         self.session.borrow_mut().take();
@@ -593,7 +622,7 @@ impl BackdropCapture {
         // 新会话，从而走全帧兜底，避免陷入等 interest 才产 source 的死锁
         *lock(&self.shared.interest) = Rect::default();
         self.copied.set(None);
-        let session = Session::start(
+        let session = match Session::start(
             self.backend,
             self.hwnd.0 as isize,
             monitor,
@@ -601,7 +630,14 @@ impl BackdropCapture {
             rate_hz,
             &self.device,
             &self.context,
-        )?;
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.session_retry_at.set(Some(Instant::now()));
+                return Err(error);
+            }
+        };
+        self.session_retry_at.set(None);
         *self.session.borrow_mut() = Some(session);
         Ok(())
     }
@@ -675,6 +711,7 @@ impl WgcSession {
             token,
             rate_hz: Cell::new(rate_hz),
             borderless: Cell::new(borderless),
+            border_at: Cell::new(Instant::now()),
         })
     }
 
@@ -692,6 +729,7 @@ impl WgcSession {
         ),
         String,
     > {
+        let mut borderless = borderless_allowed();
         let size = item
             .Size()
             .map_err(|error| format!("捕获尺寸不可用: {error}"))?;
@@ -718,12 +756,8 @@ impl WgcSession {
             .CreateCaptureSession(item)
             .map_err(|error| format!("捕获会话创建失败: {error}"))?;
         let _ = session.SetIsCursorCaptureEnabled(false);
-        let borderless = borderless_allowed();
-        if border_access_required() {
-            return Err("无边框屏幕捕获权限不可用".to_string());
-        }
-        if borderless {
-            hide_border(&session);
+        if borderless && !hide_border(&session) {
+            borderless = false;
         }
         let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
         set_rate(&session, rate_hz);
@@ -1117,10 +1151,6 @@ fn borderless_allowed() -> bool {
     BORDER_ACCESS.load(Ordering::Acquire) == BORDER_OPTIONAL
 }
 
-fn border_access_required() -> bool {
-    BORDER_ACCESS.load(Ordering::Acquire) == BORDER_REQUIRED
-}
-
 fn borderless_api_supported() -> bool {
     ApiInformation::IsPropertyPresent(
         &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
@@ -1129,8 +1159,13 @@ fn borderless_api_supported() -> bool {
     .unwrap_or(false)
 }
 
-fn hide_border(session: &GraphicsCaptureSession) {
-    if let Err(error) = session.SetIsBorderRequired(false) {
-        log::warn!("屏幕捕获边框无法隐藏: {error}");
+/// 隐藏捕获边框；失败时返回 false，由调用方保留重试机会。
+fn hide_border(session: &GraphicsCaptureSession) -> bool {
+    match session.SetIsBorderRequired(false) {
+        Ok(()) => true,
+        Err(error) => {
+            log::warn!("屏幕捕获边框无法隐藏: {error}");
+            false
+        }
     }
 }
