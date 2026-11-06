@@ -20,6 +20,7 @@ use crate::window::app::App;
 
 fn main() {
     let _ = env_logger::try_init();
+    utils::crash::install();
     let config = core::persistence::load_config();
     init_i18n(&config.language);
 

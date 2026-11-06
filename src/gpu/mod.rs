@@ -71,6 +71,11 @@ pub fn set_wake_proxy(proxy: EventLoopProxy<()>) {
     let _ = WAKE_PROXY.set(proxy);
 }
 
+/// 放大镜最近一次源矩形与控件尺寸（左、上、右、下、宽、高），供崩溃日志记录。
+pub(crate) fn magnifier_debug_state() -> [i32; 6] {
+    capture_magnifier::debug_state()
+}
+
 /// 从任意线程唤醒主事件循环（捕获回调使用）；重复调用合并为一次事件。
 pub(crate) fn wake() {
     if WAKE_PENDING.swap(true, Ordering::AcqRel) {

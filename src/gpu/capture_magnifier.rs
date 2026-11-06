@@ -11,13 +11,15 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows62::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows62::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
-use windows62::Win32::Graphics::Gdi::{HRGN, InvalidateRect};
+use windows62::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, HRGN, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+};
 use windows62::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows62::Win32::System::Threading::GetCurrentProcessId;
 use windows62::Win32::UI::HiDpi::{
@@ -31,15 +33,32 @@ use windows62::Win32::UI::Magnification::{
 use windows62::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
     GetWindowThreadProcessId, IsWindowVisible, LWA_ALPHA, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SWP_NOACTIVATE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowPos,
-    TranslateMessage, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    RegisterClassW, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOZORDER, SetLayeredWindowAttributes,
+    SetWindowPos, TranslateMessage, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows62::core::{BOOL, PCWSTR, w};
 
 use super::capture::lock;
 
 const FILTER_REFRESH: Duration = Duration::from_millis(500);
+
+/// 最近一次提交给放大镜的源矩形与控件尺寸（左、上、右、下、宽、高），
+/// 供崩溃日志判断 magnification.dll 是否在越界源上崩溃。
+static DEBUG_STATE: [AtomicI32; 6] = [
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+];
+
+pub(super) fn debug_state() -> [i32; 6] {
+    DEBUG_STATE
+        .each_ref()
+        .map(|value| value.load(Ordering::Relaxed))
+}
 
 /// 放大镜图像回调产出的一帧：紧凑排列的 BGRA 行（头部声明 RGBA，但字节实为 BGRA）。
 #[derive(PartialEq)]
@@ -88,7 +107,7 @@ impl Magnifier {
             .name("liquid-magnifier".into())
             .spawn(move || run(thread_state, sender, sink))
             .map_err(|error| format!("放大镜线程启动失败: {error}"))?;
-        match receiver.recv() {
+        match receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(host)) => Ok(Self {
                 state,
                 host: HWND(host as *mut _),
@@ -98,7 +117,12 @@ impl Magnifier {
                 let _ = thread.join();
                 Err(error)
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // 初始化卡住时放弃等待并让线程自行退出，避免渲染线程被永久阻塞
+                state.stop.store(true, Ordering::Release);
+                Err("放大镜线程初始化超时".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = thread.join();
                 Err("放大镜线程在初始化期间退出".to_string())
             }
@@ -268,7 +292,9 @@ fn run(
         if let Some(sink) = sink {
             let source = lock(&state.source);
             SINK.with(|slot| *slot.borrow_mut() = Some((sink, (source.left, source.top))));
-            let _ = MagSetImageScalingCallback(magnifier, Some(on_frame));
+            if !MagSetImageScalingCallback(magnifier, Some(on_frame)).as_bool() {
+                log::warn!("放大镜图像回调注册失败，像素帧将不可用");
+            }
         }
         let mut excluded = own_windows();
         let mut filter_ok = apply_filter(magnifier, &excluded, true);
@@ -281,28 +307,51 @@ fn run(
         let mut message = MSG::default();
         while !state.stop.load(Ordering::Acquire) {
             let source = lock(&state.source);
-            let current = (source.right - source.left, source.bottom - source.top);
-            if current != size && current.0 > 0 && current.1 > 0 {
-                size = current;
-                let _ = SetWindowPos(
-                    host,
-                    None,
-                    source.left,
-                    source.top,
-                    size.0,
-                    size.1,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                let _ = SetWindowPos(
-                    magnifier,
-                    None,
-                    0,
-                    0,
-                    size.0,
-                    size.1,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                refilter = true;
+            // 源矩形必须落在显示器内：部分系统版本会在 magnification.dll 内部
+            // 拷贝屏幕外像素时越界崩溃。完全离屏时保持上一帧，不读取源。
+            if let Some(source) = clamped_source(*source) {
+                let current = (source.right - source.left, source.bottom - source.top);
+                // 尺寸变化的这一帧只重排窗口，下一帧再设置源：部分系统版本
+                // （如 Windows 11 23H2）在 SetWindowPos 后立即设置源时会在
+                // magnification.dll 内部越界拷贝并崩溃。
+                let resized = current != size;
+                if resized {
+                    size = current;
+                    let _ = SetWindowPos(
+                        host,
+                        None,
+                        source.left,
+                        source.top,
+                        size.0,
+                        size.1,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                    );
+                    let _ = SetWindowPos(
+                        magnifier,
+                        None,
+                        0,
+                        0,
+                        size.0,
+                        size.1,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                    );
+                    refilter = true;
+                }
+                SINK.with(|slot| {
+                    if let Some((_, origin)) = slot.borrow_mut().as_mut() {
+                        *origin = (source.left, source.top);
+                    }
+                });
+                DEBUG_STATE[0].store(source.left, Ordering::Relaxed);
+                DEBUG_STATE[1].store(source.top, Ordering::Relaxed);
+                DEBUG_STATE[2].store(source.right, Ordering::Relaxed);
+                DEBUG_STATE[3].store(source.bottom, Ordering::Relaxed);
+                DEBUG_STATE[4].store(size.0, Ordering::Relaxed);
+                DEBUG_STATE[5].store(size.1, Ordering::Relaxed);
+                if !resized {
+                    let _ = MagSetWindowSource(magnifier, source);
+                    let _ = InvalidateRect(Some(magnifier), None, false);
+                }
             }
             let windows = own_windows();
             if refilter || windows != excluded || filter_at.elapsed() >= FILTER_REFRESH {
@@ -311,13 +360,6 @@ fn run(
                 excluded = windows;
                 filter_ok = apply_filter(magnifier, &excluded, filter_ok);
             }
-            SINK.with(|slot| {
-                if let Some((_, origin)) = slot.borrow_mut().as_mut() {
-                    *origin = (source.left, source.top);
-                }
-            });
-            let _ = MagSetWindowSource(magnifier, *source);
-            let _ = InvalidateRect(Some(magnifier), None, false);
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -335,6 +377,30 @@ fn run(
         let _ = MagUninitialize();
         SINK.with(|slot| slot.borrow_mut().take());
     }
+}
+
+/// 把源矩形裁剪到其所在显示器。放大镜源越出屏幕时会读取屏外像素，部分系统
+/// 版本（如 Windows 11 23H2）在 magnification.dll 内部越界拷贝并崩溃；完全
+/// 离屏时返回 None，调用方保持上一帧。
+fn clamped_source(source: RECT) -> Option<RECT> {
+    // SAFETY: 仅按矩形查询所在显示器并读取其边界。
+    let monitor = unsafe { MonitorFromRect(&source, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: monitor 来自系统调用，info 是尺寸正确的输出结构。
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Some(source);
+    }
+    let bounds = info.rcMonitor;
+    let clamped = RECT {
+        left: source.left.max(bounds.left),
+        top: source.top.max(bounds.top),
+        right: source.right.min(bounds.right),
+        bottom: source.bottom.min(bounds.bottom),
+    };
+    (clamped.right > clamped.left && clamped.bottom > clamped.top).then_some(clamped)
 }
 
 /// 重新发送排除列表。窗口隐藏后再次显示或放大镜尺寸变化时 DWM 可能丢弃某窗口

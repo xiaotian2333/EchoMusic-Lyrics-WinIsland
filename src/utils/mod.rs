@@ -2,6 +2,7 @@ pub mod autostart;
 pub mod backdrop;
 pub mod blur;
 pub mod color;
+pub mod crash;
 pub mod font;
 pub mod gdi_capture;
 pub mod glass;
