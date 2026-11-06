@@ -145,15 +145,11 @@ enum Session {
     Magnifier(MagnifierSession),
 }
 
-/// 放大镜捕获会话：`capture` 为 Some 时宿主窗口由 WGC 捕捉，None 时帧经
-/// 放大镜像素回调直接送达（无 WGC 会话）。`magnifier` 声明在 `capture` 之后，
-/// Drop 时先关闭 WGC 会话再销毁放大镜宿主窗口。
+/// 放大镜捕获会话：帧经放大镜像素回调直接送达（无 WGC 会话）。
 struct MagnifierSession {
     monitor: HMONITOR,
     origin: Cell<(i32, i32)>,
-    source: Cell<(i32, i32, i32, i32)>,
     rate_hz: Cell<u32>,
-    capture: Option<WgcSession>,
     magnifier: Magnifier,
 }
 
@@ -186,9 +182,6 @@ impl Session {
             Self::Magnifier(session) => {
                 if session.rate_hz.get() != rate_hz {
                     session.rate_hz.set(rate_hz);
-                    if let Some(capture) = &session.capture {
-                        set_rate(&capture.session, rate_hz);
-                    }
                     session.magnifier.set_rate(rate_hz);
                 }
             }
@@ -209,19 +202,7 @@ impl Session {
                 Ok(())
             }
             Self::Dda(_) => Ok(()),
-            Self::Magnifier(session) => match &session.capture {
-                Some(capture) => {
-                    if !capture.borderless.get() && borderless_allowed() {
-                        capture.borderless.set(true);
-                        hide_border(&capture.session);
-                    }
-                    if border_access_required() {
-                        return Err("无边框屏幕捕获权限不可用".to_string());
-                    }
-                    Ok(())
-                }
-                None => Ok(()),
-            },
+            Self::Magnifier(_) => Ok(()),
         }
     }
 
@@ -275,8 +256,6 @@ pub(crate) struct BackdropCapture {
     serial: Cell<u64>,
     /// 兼容模式：优先经放大镜采集背景，岛窗口对捕获可见。
     magnifier_mode: Cell<bool>,
-    /// 放大镜窗口捕捉不可用（如 Windows 10）时的像素回调子模式。
-    pixel_mode: Cell<bool>,
     /// 放大镜像素帧的暂存上传纹理。
     upload: RefCell<Option<(ID3D11Texture2D, u32, u32)>>,
     /// 捕获端在放大镜链路全部失效回退整屏时自设的 WDA 标记；Drop 时据此清除。
@@ -327,7 +306,6 @@ impl BackdropCapture {
             write_value: AtomicU64::new(0),
             serial: Cell::new(0),
             magnifier_mode: Cell::new(backend == CaptureBackend::Wgc && wgc_compat),
-            pixel_mode: Cell::new(false),
             upload: RefCell::new(None),
             self_excluded: Cell::new(false),
         };
@@ -343,7 +321,6 @@ impl BackdropCapture {
         }
         // 像素回调子模式：放大镜源取 interest 与所在显示器的交集（屏幕外无内容）
         if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref()
-            && session.capture.is_none()
             && let Some(source) = monitor_clamped(self.hwnd, request.interest)
         {
             session.magnifier.set_source(source);
@@ -585,11 +562,8 @@ impl BackdropCapture {
     }
 
     fn ensure_session(&self, rate_hz: u32) -> Result<(), String> {
-        if self.pixel_mode.get() {
-            return self.ensure_pixel_session(rate_hz);
-        }
         if self.magnifier_mode.get() {
-            match self.ensure_magnifier_session(rate_hz) {
+            match self.ensure_pixel_session(rate_hz) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     log::warn!("放大镜背景不可用，回退整屏捕获: {error}");
@@ -632,81 +606,11 @@ impl BackdropCapture {
         Ok(())
     }
 
-    /// 兼容模式主路径：放大镜宿主窗口渲染背景，再由 WGC 捕捉该宿主窗口。
-    fn ensure_magnifier_session(&self, rate_hz: u32) -> Result<(), String> {
-        let rect = window_rect(self.hwnd)?;
-        let source = (rect.left, rect.top, rect.right, rect.bottom);
-        if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref() {
-            if session.rate_hz.get() != rate_hz {
-                session.rate_hz.set(rate_hz);
-                if let Some(capture) = &session.capture {
-                    set_rate(&capture.session, rate_hz);
-                }
-                session.magnifier.set_rate(rate_hz);
-            }
-            if session.source.get() != source {
-                session.source.set(source);
-                session.origin.set((rect.left, rect.top));
-                session.magnifier.set_source(rect);
-            }
-            if let Some(capture) = &session.capture {
-                if !capture.borderless.get() && borderless_allowed() {
-                    capture.borderless.set(true);
-                    hide_border(&capture.session);
-                }
-                if border_access_required() {
-                    return Err("无边框屏幕捕获权限不可用".to_string());
-                }
-            }
-            return Ok(());
-        }
-        self.session.borrow_mut().take();
-        *lock(&self.shared.latest) = Latest::default();
-        self.copied.set(None);
-        let magnifier = Magnifier::start(rect, rate_hz, None)?;
-        let interop =
-            windows62::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-                .map_err(|error| format!("捕获互操作接口不可用: {error}"))?;
-        // SAFETY: 放大镜宿主是本进程拥有的存活窗口；WinRT 返回拥有的捕获项。
-        let item: GraphicsCaptureItem = match unsafe { interop.CreateForWindow(magnifier.host()) } {
-            Ok(item) => item,
-            Err(error) => {
-                log::info!("放大镜窗口捕捉不可用（{error}），改用像素回调直接读取放大镜帧");
-                drop(magnifier);
-                self.pixel_mode.set(true);
-                return self.ensure_pixel_session(rate_hz);
-            }
-        };
-        // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
-        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
-        let (pool, capture_session, token, borderless) =
-            WgcSession::open(&item, &self.shared, rate_hz)?;
-        let origin = (rect.left, rect.top);
-        *self.session.borrow_mut() = Some(Session::Magnifier(MagnifierSession {
-            monitor,
-            origin: Cell::new(origin),
-            source: Cell::new(source),
-            rate_hz: Cell::new(rate_hz),
-            magnifier,
-            capture: Some(WgcSession {
-                monitor,
-                origin,
-                pool,
-                session: capture_session,
-                token,
-                rate_hz: Cell::new(rate_hz),
-                borderless: Cell::new(borderless),
-            }),
-        }));
-        Ok(())
-    }
-
-    /// 像素回调子模式：隐藏宿主经图像回调直接产出 BGRA 帧（无 WGC 会话）。
+    /// 兼容模式主路径：隐藏宿主经放大镜图像回调直接产出 BGRA 帧，不经过
+    /// WGC 窗口捕获（避免系统捕获边框与宿主尺寸变化时重建帧池的卡顿）。
     fn ensure_pixel_session(&self, rate_hz: u32) -> Result<(), String> {
         let rate_hz = rate_hz.min(PIXEL_RATE_LIMIT);
-        if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref()
-            && session.capture.is_none()
-        {
+        if let Some(Session::Magnifier(session)) = self.session.borrow().as_ref() {
             if session.rate_hz.get() != rate_hz {
                 session.rate_hz.set(rate_hz);
                 session.magnifier.set_rate(rate_hz);
@@ -730,10 +634,8 @@ impl BackdropCapture {
         *self.session.borrow_mut() = Some(Session::Magnifier(MagnifierSession {
             monitor,
             origin: Cell::new(origin),
-            source: Cell::new((rect.left, rect.top, rect.right, rect.bottom)),
             rate_hz: Cell::new(rate_hz),
             magnifier,
-            capture: None,
         }));
         Ok(())
     }

@@ -1,9 +1,8 @@
-//! Windows 放大镜（Magnification API）背景采集，液态玻璃-WGC 兼容模式的后备来源。
+//! Windows 放大镜（Magnification API）背景采集，液态玻璃-WGC 兼容模式的来源。
 //!
 //! 放大镜宿主窗口渲染 `source` 区域下方的桌面内容，并通过窗口过滤列表排除
-//! 本进程的所有窗口。携带像素回调（sink）时，帧经隐藏宿主的图像回调送达，
-//! 适用于 Windows.Graphics.Capture 无法读取 cloaked 窗口的场景（Windows 10）；
-//! 不带回调时宿主被 cloak，作为普通窗口交给 WGC 捕捉。
+//! 本进程的所有窗口。帧经隐藏宿主的图像回调（sink）直接送达；兼容模式不再
+//! 由 WGC 捕获宿主窗口，避免系统捕获边框与宿主尺寸变化时重建帧池的卡顿。
 //!
 //! 移植自上游 WinIsland 的 capture/magnifier.rs。
 
@@ -81,12 +80,11 @@ struct State {
     stop: AtomicBool,
 }
 
-/// 渲染 `source` 下方桌面内容（不含本进程窗口）的放大镜。携带 sink 时帧经
-/// 隐藏宿主的图像回调送达，适用于 Windows.Graphics.Capture 无法读取 cloaked
-/// 窗口的场景（Windows 10）；否则宿主被 cloak 并作为普通窗口被捕捉。
+/// 渲染 `source` 下方桌面内容（不含本进程窗口）的放大镜，帧经隐藏宿主的
+/// 图像回调送达。不带 sink 时宿主被 cloak 并可作为普通窗口被 WGC 捕捉，
+/// 该路径当前不用于兼容模式。
 pub(super) struct Magnifier {
     state: Arc<State>,
-    host: HWND,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -108,9 +106,8 @@ impl Magnifier {
             .spawn(move || run(thread_state, sender, sink))
             .map_err(|error| format!("放大镜线程启动失败: {error}"))?;
         match receiver.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(host)) => Ok(Self {
+            Ok(Ok(_)) => Ok(Self {
                 state,
-                host: HWND(host as *mut _),
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -127,10 +124,6 @@ impl Magnifier {
                 Err("放大镜线程在初始化期间退出".to_string())
             }
         }
-    }
-
-    pub(super) fn host(&self) -> HWND {
-        self.host
     }
 
     pub(super) fn set_source(&self, source: RECT) {
@@ -301,22 +294,26 @@ fn run(
         let _ = ready.send(Ok(host.0 as isize));
 
         let mut size = (0, 0);
+        let mut last_current = (0, 0);
+        let mut initialized = false;
         let mut next = Instant::now();
         let mut filter_at = Instant::now();
         let mut refilter = false;
         let mut message = MSG::default();
         while !state.stop.load(Ordering::Acquire) {
-            let source = lock(&state.source);
+            // 立即复制并释放锁：消息泵、放大镜渲染与帧间休眠期间不能持有
+            // 源矩形锁，否则渲染线程的 set_source 会被阻塞到本帧结束。
+            let source = *lock(&state.source);
             // 源矩形必须落在显示器内：部分系统版本会在 magnification.dll 内部
             // 拷贝屏幕外像素时越界崩溃。完全离屏时保持上一帧，不读取源。
-            if let Some(source) = clamped_source(*source) {
+            if let Some(source) = clamped_source(source) {
                 let current = (source.right - source.left, source.bottom - source.top);
-                // 尺寸变化的这一帧只重排窗口，下一帧再设置源：部分系统版本
-                // （如 Windows 11 23H2）在 SetWindowPos 后立即设置源时会在
-                // magnification.dll 内部越界拷贝并崩溃。
-                let resized = current != size;
-                if resized {
+                if !initialized {
+                    // 首帧只建立控件尺寸：放大镜控件完成消息初始化前读取源会在
+                    // magnification.dll 内部越界拷贝并崩溃。
+                    initialized = true;
                     size = current;
+                    last_current = current;
                     let _ = SetWindowPos(
                         host,
                         None,
@@ -336,19 +333,47 @@ fn run(
                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
                     );
                     refilter = true;
-                }
-                SINK.with(|slot| {
-                    if let Some((_, origin)) = slot.borrow_mut().as_mut() {
-                        *origin = (source.left, source.top);
+                } else {
+                    // 尺寸变化期间先用旧控件尺寸继续渲染，保持图像回调帧流；
+                    // 帧流中断会让渲染端回退到 CPU 截屏，而兼容模式下岛对捕获
+                    // 可见，截屏会把岛自身计入背景（玻璃自叠加）并拖慢主线程。
+                    // 尺寸稳定后再重排控件，此时源与控件尺寸一致，避免在
+                    // Windows 11 23H2 的 magnification.dll 内部越界崩溃。
+                    if current != last_current {
+                        last_current = current;
+                    } else if current != size {
+                        size = current;
+                        let _ = SetWindowPos(
+                            host,
+                            None,
+                            source.left,
+                            source.top,
+                            size.0,
+                            size.1,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                        );
+                        let _ = SetWindowPos(
+                            magnifier,
+                            None,
+                            0,
+                            0,
+                            size.0,
+                            size.1,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                        );
+                        refilter = true;
                     }
-                });
-                DEBUG_STATE[0].store(source.left, Ordering::Relaxed);
-                DEBUG_STATE[1].store(source.top, Ordering::Relaxed);
-                DEBUG_STATE[2].store(source.right, Ordering::Relaxed);
-                DEBUG_STATE[3].store(source.bottom, Ordering::Relaxed);
-                DEBUG_STATE[4].store(size.0, Ordering::Relaxed);
-                DEBUG_STATE[5].store(size.1, Ordering::Relaxed);
-                if !resized {
+                    SINK.with(|slot| {
+                        if let Some((_, origin)) = slot.borrow_mut().as_mut() {
+                            *origin = (source.left, source.top);
+                        }
+                    });
+                    DEBUG_STATE[0].store(source.left, Ordering::Relaxed);
+                    DEBUG_STATE[1].store(source.top, Ordering::Relaxed);
+                    DEBUG_STATE[2].store(source.right, Ordering::Relaxed);
+                    DEBUG_STATE[3].store(source.bottom, Ordering::Relaxed);
+                    DEBUG_STATE[4].store(size.0, Ordering::Relaxed);
+                    DEBUG_STATE[5].store(size.1, Ordering::Relaxed);
                     let _ = MagSetWindowSource(magnifier, source);
                     let _ = InvalidateRect(Some(magnifier), None, false);
                 }
