@@ -1,4 +1,4 @@
-use skia_safe::{Canvas, Color, Paint, Path};
+use skia_safe::{Canvas, Color, Paint};
 
 // Tabler Icons — stroke-based SVG paths (viewport 24×24)
 const REPEAT_OFF_PATH: &str = "M4 12V9a3 3 0 0 1 2.08-2.856M10 6h10m-3-3l3 3l-3 3m3 3v3a3 3 0 0 1-.133.886m-1.99 1.984A3 3 0 0 1 17 18H4m3 3l-3-3l3-3M3 3l18 18";
@@ -25,7 +25,7 @@ pub fn draw_play_mode_icon(
         _ => return,
     };
 
-    let Some(path) = Path::from_svg(path_data) else {
+    let Some(path) = super::cached_svg_path(path_data) else {
         return;
     };
 

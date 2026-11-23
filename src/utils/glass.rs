@@ -6,6 +6,11 @@ use skia_safe::{
     surfaces,
 };
 
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
+
 use crate::utils::gdi_capture::{ScreenCaptureRequest, capture_screen_bgra};
 
 type GlassCacheEntry = (Image, Instant, i32, i32, u32, u32);
@@ -63,6 +68,23 @@ pub fn get_glass_background(
     result
 }
 
+/// 点所在显示器的屏幕边界（左、上、右、下）；查询失败时返回 None。
+fn monitor_bounds_at(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+    let point = POINT { x, y };
+    // SAFETY: point 是栈上有效结构；monitor 与 info 均为本地拥有。
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: monitor 来自 MonitorFromPoint，info 是尺寸正确的输出结构。
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let bounds = info.rcMonitor;
+    Some((bounds.left, bounds.top, bounds.right, bounds.bottom))
+}
+
 /// Captures the island region + margin from the desktop, heavily blurs,
 /// crops to the island area, then blends with a dark base colour to
 /// guarantee the signature dark frosted-glass look.
@@ -74,16 +96,34 @@ fn capture_and_blur(sx: i32, sy: i32, w: u32, h: u32, blur_sigma: f32) -> Option
     let margin = (w.max(h) / downscale) as i32;
     let cap_full_w = (w as i32 + 2 * margin).max(1);
     let cap_full_h = (h as i32 + 2 * margin).max(1);
-    let cap_w = (cap_full_w / downscale as i32).max(1);
-    let cap_h = (cap_full_h / downscale as i32).max(1);
+
+    // 截屏源区域必须裁到所在显示器内：越界时 BitBlt 产出全黑或无意义内容
+    let (mon_left, mon_top, mon_right, mon_bottom) = monitor_bounds_at(sx, sy)?;
+    let src_left = sx - margin;
+    let src_top = sy - margin;
+    let clamped_left = src_left.max(mon_left);
+    let clamped_top = src_top.max(mon_top);
+    let clamped_right = (src_left + cap_full_w).min(mon_right);
+    let clamped_bottom = (src_top + cap_full_h).min(mon_bottom);
+    if clamped_right <= clamped_left || clamped_bottom <= clamped_top {
+        return None;
+    }
+    // 裁剪偏移对齐到降采样倍数，保证后续按比例还原岛屿区域时无累积误差
+    let step = downscale as i32;
+    let offset_x = ((clamped_left - src_left) / step) * step;
+    let offset_y = ((clamped_top - src_top) / step) * step;
+    let src_x = src_left + offset_x;
+    let src_y = src_top + offset_y;
+    let src_w = clamped_right - src_x;
+    let src_h = clamped_bottom - src_y;
 
     let capture = capture_screen_bgra(ScreenCaptureRequest {
-        src_x: sx - margin,
-        src_y: sy - margin,
-        src_w: cap_full_w,
-        src_h: cap_full_h,
-        dst_w: cap_w,
-        dst_h: cap_h,
+        src_x,
+        src_y,
+        src_w,
+        src_h,
+        dst_w: (src_w / step).max(1),
+        dst_h: (src_h / step).max(1),
         use_halftone: true,
         force_opaque_alpha: true,
     })?;
@@ -108,8 +148,8 @@ fn capture_and_blur(sx: i32, sy: i32, w: u32, h: u32, blur_sigma: f32) -> Option
     blur_canvas.draw_image(&src_img, (0, 0), Some(&paint));
     let blurred = blur_surface.image_snapshot();
 
-    let crop_x = (margin / downscale as i32) as f32;
-    let crop_y = (margin / downscale as i32) as f32;
+    let crop_x = ((margin - offset_x) / downscale as i32).max(0) as f32;
+    let crop_y = ((margin - offset_y) / downscale as i32).max(0) as f32;
     let crop_w = (w / downscale).max(1) as i32;
     let crop_h = (h / downscale).max(1) as i32;
 

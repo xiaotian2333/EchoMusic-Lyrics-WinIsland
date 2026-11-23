@@ -18,12 +18,12 @@ EchoMusic-Lyrics-WinIsland is a Windows desktop application that creates a Dynam
 src/
 ├── core/              Core business logic
 │   ├── audio.rs       Audio loopback capture + FFT spectrum
-│   ├── config.rs      AppConfig struct and defaults
+│   ├── config.rs      AppConfig struct, defaults and the single `normalized()` implementation
 │   ├── i18n.rs        Translation system (key-value .lang files)
 │   ├── lyrics.rs      MusicData payload parser & lyric index helpers
 │   ├── lyrics_ws.rs   WebSocket server (127.0.0.1:17195) for EchoMusic plugin
 │   ├── media_info.rs  MediaInfo struct — current track, position, lyrics, cover
-│   ├── persistence.rs Config save/load (~/.echomusic-lyrics-winisland/config.toml)
+│   ├── persistence.rs Atomic config save/load + cross-process lock (~/.echomusic-lyrics-winisland/config.toml)
 │   ├── render.rs      Main draw_island() — all Skia rendering lives here
 │   └── ws_media.rs    WsMediaListener — WS event loop, state management, play control
 ├── icons/             Custom Skia path icons (arrows, controls, music, settings)
@@ -40,22 +40,27 @@ src/
 │   ├── backdrop.rs    Mica & dynamic color background effects
 │   ├── blur.rs        Motion blur sigma calculation
 │   ├── color.rs       Adaptive island border color from screen pixels
+│   ├── crash.rs       crash.log writer (panic + unhandled exception, size-capped)
 │   ├── font.rs        Font manager with caching
+│   ├── frost.sksl / liquid.sksl  Runtime shaders for the glass effects
+│   ├── gdi_capture.rs Shared GDI screen capture (BitBlt/StretchBlt + GetDIBits)
 │   ├── glass.rs       Frosted glass effect (GDI capture + blur + dark overlay)
 │   ├── icon.rs        Helper for loading/rendering icon bitmaps
 │   ├── liquid_glass.rs Refractive liquid glass (WinIsland liquid.sksl + frost blur)
 │   ├── mouse.rs       Global cursor position, hit-test, fullscreen detection
-│   ├── physics.rs     Spring physics for smooth animations
+│   ├── physics.rs     Spring physics + dt-independent smoothing helper
 │   ├── process.rs     Process discovery & external app detection
 │   ├── scroll.rs      Scroll container helpers
-│   ├── updater.rs     Nightly release check + download
+│   ├── updater.rs     Release check + download; install orchestration lives in the main process
 │   └── win32.rs       Raw Win32 API wrappers (topmost, window styles, etc.)
-├── gpu/               WinIsland-style GPU pipeline (D3D12 + DirectComposition + WGC)
-│   ├── mod.rs         GpuIsland orchestration, wake proxy, shared types
+├── gpu/               WinIsland-style GPU pipeline (D3D12 + DirectComposition + WGC/DDA)
+│   ├── mod.rs         GpuIsland orchestration, wake proxy, shared types, CaptureBackend
 │   ├── device.rs      D3D12 device + Skia Ganesh D3D12 context
 │   ├── target.rs      Composition swap chain render target
-│   ├── backdrop.rs    Shared texture + GPU frost pipeline
-│   └── capture.rs     Windows.Graphics.Capture screen capture
+│   ├── backdrop.rs    Shared texture + GPU frost pipeline + luminance sampler
+│   ├── capture.rs     Backdrop capture hub: WGC session + shared texture/fence handshake
+│   ├── capture_dda.rs DXGI Desktop Duplication backend (liquid_glass_dxgi)
+│   └── capture_magnifier.rs Magnification API capture for WGC compat mode
 ├── crates/host-backdrop/  WinIsland frosted-glass host backdrop (separate crate)
 │   ├── lib.rs         DWM host backdrop brush + DirectComposition visual tree
 │   ├── blur.rs        D2D1 GaussianBlur IGraphicsEffectD2D1Interop implementation
@@ -63,7 +68,7 @@ src/
 └── window/
     ├── app.rs         Main App struct — event loop, state, input, orchestration
     ├── tray.rs        System tray icon + context menu
-    └── settings/      Separate settings window (Tauri v2 Web)
+    └── settings/      Separate settings window (Tauri v2 Web, emits `config-changed`)
 ```
 
 ---

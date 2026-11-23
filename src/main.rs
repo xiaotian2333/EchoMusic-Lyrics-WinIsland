@@ -77,13 +77,25 @@ fn main() {
                 }
                 if !is_restart || start.elapsed() > std::time::Duration::from_secs(10) {
                     if is_restart {
+                        // 兜底只清理主实例进程：按命令行排除 --settings 进程，
+                        // 避免强制误杀独立运行的设置窗口（设置窗口监听主实例互斥体后会自行退出）
                         let own_pid = std::process::id();
+                        let exe_name = std::env::current_exe()
+                            .ok()
+                            .and_then(|path| {
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_else(|| "EchoMusic-Lyrics-WinIsland.exe".to_string());
                         if let Ok(output) = std::process::Command::new("powershell")
                             .args([
                                 "-NoProfile",
                                 "-Command",
                                 &format!(
-                                    "Get-Process EchoMusic-Lyrics-WinIsland -ErrorAction SilentlyContinue | Where-Object {{$_.Id -ne {own_pid}}} | Stop-Process -Force"
+                                    "Get-CimInstance Win32_Process -Filter \"Name='{}'\" | \
+                                     Where-Object {{$_.ProcessId -ne {own_pid} -and $_.CommandLine -notmatch '--settings'}} | \
+                                     ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+                                    exe_name.replace('\'', "''")
                                 ),
                             ])
                             .output()

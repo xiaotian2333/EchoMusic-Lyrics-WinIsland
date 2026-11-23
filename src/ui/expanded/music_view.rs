@@ -14,10 +14,12 @@ use crate::icons::controls::{
 };
 use crate::icons::play_mode::draw_play_mode_icon;
 use crate::utils::font::{DrawTextCachedParams, FontManager};
-use crate::utils::physics::Spring;
+use crate::utils::physics::{Spring, dt_smoothing_factor};
 use crate::utils::scroll::{ScrollDrawParams, ScrollText};
 
-use super::spectrum::{DrawVisualizerParams, SpectrumFill, clear_spectrum_cache, draw_visualizer};
+use super::spectrum::{
+    DrawVisualizerParams, SpectrumFill, VizSlot, clear_spectrum_cache, draw_visualizer,
+};
 
 const CONTROL_BUTTON_GAP: f32 = 75.0;
 const FAVORITE_BUTTON_SCALE: f32 = 1.12;
@@ -26,6 +28,8 @@ type PaletteCache = (HashMap<String, Vec<Color>>, VecDeque<String>);
 
 thread_local! {
     static IMG_CACHE: RefCell<Option<(String, Image)>> = const { RefCell::new(None) };
+    /// 解码失败缓存键：同一份损坏封面只解码一次，避免每帧重复全量解码与告警刷屏
+    static IMG_FAILED_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
     static COLOR_CACHE: RefCell<PaletteCache> = RefCell::new((HashMap::new(), VecDeque::new()));
     static PROGRESS_SMOOTH: RefCell<f32> = const { RefCell::new(-1.0) };
     static PAUSE_ANIM: RefCell<f32> = const { RefCell::new(0.0) };
@@ -74,6 +78,99 @@ fn ease_out_back(t: f32) -> f32 {
     let c1 = 1.70158_f32;
     let c3 = c1 + 1.0;
     1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
+}
+
+/// 切歌按钮飞出动画的进度；动画超过 0.5 秒后自动清空状态。
+fn skip_anim_progress(
+    cell: &'static std::thread::LocalKey<RefCell<Option<std::time::Instant>>>,
+) -> Option<f32> {
+    cell.with(|cell| {
+        let start = *cell.borrow();
+        match start {
+            Some(s) => {
+                let t = s.elapsed().as_secs_f32() / 0.5;
+                if t >= 1.0 {
+                    *cell.borrow_mut() = None;
+                    return None;
+                }
+                Some(t)
+            }
+            None => None,
+        }
+    })
+}
+
+/// 绘制切歌时的按钮飞出动画；`mirrored` 为上一首按钮（左侧镜像绘制）。
+struct SkipAnimParams<'a> {
+    canvas: &'a Canvas,
+    cx: f32,
+    cy: f32,
+    alpha: u8,
+    scale: f32,
+    use_blur: bool,
+    text_color: Color,
+    progress: Option<f32>,
+    mirrored: bool,
+}
+
+fn draw_skip_anim(params: SkipAnimParams<'_>) {
+    let SkipAnimParams {
+        canvas,
+        cx,
+        cy,
+        alpha,
+        scale,
+        use_blur,
+        text_color,
+        progress,
+        mirrored,
+    } = params;
+    canvas.save();
+    canvas.translate((cx, cy));
+    if mirrored {
+        canvas.scale((-1.0, 1.0));
+    }
+    if let Some(t) = progress {
+        let skip_blur = (1.0 - t / 0.3).max(0.0) * 6.0 * scale;
+        if skip_blur > 0.1 && use_blur {
+            let mut blur_paint = Paint::default();
+            blur_paint.set_image_filter(image_filters::blur(
+                (skip_blur, skip_blur * 0.3),
+                None,
+                None,
+                None,
+            ));
+            canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&blur_paint));
+        }
+
+        let shoot_t = (t / 0.25).min(1.0);
+        let shoot_x = 10.92 * scale + 22.0 * scale * shoot_t;
+        let shoot_alpha = ((alpha as f32) * (1.0 - shoot_t)) as u8;
+        if shoot_alpha > 0 {
+            draw_control_triangle(canvas, shoot_x, 0.0, shoot_alpha, 0.055, scale, text_color);
+        }
+
+        let move_t = (t / 0.55).min(1.0);
+        let mid_x = -10.92 * scale + (10.92 * 2.0) * scale * move_t;
+        let mid_s = 0.050 + (0.055 - 0.050) * move_t;
+        draw_control_triangle(canvas, mid_x, 0.0, alpha, mid_s, scale, text_color);
+
+        let fade_raw = ((t - 0.15) / 0.85).clamp(0.0, 1.0);
+        let fade_eased = ease_out_back(fade_raw);
+        let new_x = -25.0 * scale + (25.0 - 10.92) * scale * fade_eased;
+        let new_alpha = ((alpha as f32) * fade_raw) as u8;
+        if new_alpha > 0 {
+            draw_control_triangle(canvas, new_x, 0.0, new_alpha, 0.050, scale, text_color);
+        }
+
+        if skip_blur > 0.1 && use_blur {
+            canvas.restore();
+        }
+    } else {
+        draw_control_triangle(canvas, -10.92 * scale, 0.0, alpha, 0.050, scale, text_color);
+        draw_control_triangle(canvas, 10.92 * scale, 0.0, alpha, 0.055, scale, text_color);
+    }
+    canvas.restore();
 }
 
 struct CoverLayout {
@@ -250,7 +347,7 @@ fn bytes_to_skia_image(data: &[u8]) -> Option<Image> {
     if let Some(image) = Image::from_encoded(Data::new_copy(data)) {
         return Some(image);
     }
-    log::warn!(
+    log::debug!(
         "Skia 无法解码封面 ({} bytes)，尝试 image crate 后备",
         data.len()
     );
@@ -273,8 +370,8 @@ pub fn get_cached_media_image_with_key(media: &MediaInfo) -> Option<(Image, Stri
         return None;
     }
     let cache_key = format!(
-        "{}|{}|{}|{:016x}",
-        media.title, media.artist, media.album, media.thumbnail_hash
+        "{}|{}|{:016x}",
+        media.title, media.artist, media.thumbnail_hash
     );
 
     let mut result: Option<(Image, String)> = None;
@@ -286,11 +383,21 @@ pub fn get_cached_media_image_with_key(media: &MediaInfo) -> Option<(Image, Stri
             result = Some((img.clone(), key.clone()));
             return;
         }
+        // 同一份损坏封面已解码失败过，直接跳过，避免每帧重试
+        let already_failed =
+            IMG_FAILED_KEY.with(|failed| failed.borrow().as_ref() == Some(&cache_key));
+        if already_failed {
+            return;
+        }
         if let Some(ref bytes_arc) = media.thumbnail
             && let Some(image) = bytes_to_skia_image(bytes_arc)
         {
             *cache_mut = Some((cache_key.clone(), image.clone()));
             result = Some((image, cache_key));
+        } else if media.thumbnail.is_some() {
+            IMG_FAILED_KEY.with(|failed| {
+                *failed.borrow_mut() = Some(cache_key);
+            });
         }
     });
     result
@@ -309,6 +416,9 @@ pub fn get_media_palette(media: &MediaInfo) -> Vec<Color> {
 
 pub fn clear_cover_cache() {
     IMG_CACHE.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    IMG_FAILED_KEY.with(|cell| {
         *cell.borrow_mut() = None;
     });
     COVER_FLIP_OLD_IMG.with(|cell| {
@@ -442,7 +552,7 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         if pause_s < 0.15 {
             *v = target;
         } else {
-            *v += (target - *v) * 0.12;
+            *v += (target - *v) * dt_smoothing_factor(0.12, dt);
             if (*v - target).abs() < 0.005 {
                 *v = target;
             }
@@ -581,13 +691,15 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
     let title_y = img_y + 26.0 * scale;
     let mut text_paint = Paint::default();
     text_paint.set_anti_alias(true);
+    let no_music = crate::core::i18n::tr("no_music_playing");
+    let unknown_artist = crate::core::i18n::tr("unknown_artist");
     let title = if !music_active || media.title.is_empty() {
-        "No Music playing"
+        no_music.as_str()
     } else {
         &media.title
     };
     let artist = if !music_active || media.artist.is_empty() {
-        "Unknown Artist"
+        unknown_artist.as_str()
     } else {
         &media.artist
     };
@@ -658,13 +770,7 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         };
         let time_w = 36.0 * scale;
 
-        let current_pos_ms = if media.is_playing {
-            media
-                .position_ms
-                .saturating_add(media.last_update.elapsed().as_millis() as u64)
-        } else {
-            media.position_ms
-        };
+        let current_pos_ms = media.effective_position_ms(0);
         let duration_ms = media.effective_duration_ms();
         let current_pos_ms = if duration_ms > 0 {
             current_pos_ms.min(duration_ms)
@@ -687,7 +793,7 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
                 if diff > 0.3 {
                     *smooth = raw_progress;
                 } else {
-                    *smooth += (raw_progress - *smooth) * 0.15;
+                    *smooth += (raw_progress - *smooth) * dt_smoothing_factor(0.15, dt);
                 }
             }
             *smooth
@@ -712,7 +818,7 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         let hover_t = PROGRESS_HOVER.with(|cell| {
             let mut state = cell.borrow_mut();
             let target = if state.0 { 1.0_f32 } else { 0.0 };
-            state.1 += (target - state.1) * 0.18;
+            state.1 += (target - state.1) * dt_smoothing_factor(0.18, dt);
             if (state.1 - target).abs() < 0.005 {
                 state.1 = target;
             }
@@ -817,76 +923,29 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
             fav_color,
         );
 
-        let prev_t = PREV_SKIP_ANIM.with(|cell| {
-            let start = *cell.borrow();
-            match start {
-                Some(s) => {
-                    let t = s.elapsed().as_secs_f32() / 0.5;
-                    if t >= 1.0 {
-                        *cell.borrow_mut() = None;
-                        return None;
-                    }
-                    Some(t)
-                }
-                None => None,
-            }
+        let prev_t = skip_anim_progress(&PREV_SKIP_ANIM);
+        draw_skip_anim(SkipAnimParams {
+            canvas,
+            cx: btn_cx - skip_gap,
+            cy: btn_cy,
+            alpha,
+            scale,
+            use_blur,
+            text_color,
+            progress: prev_t,
+            mirrored: true,
         });
-
-        canvas.save();
-        canvas.translate((btn_cx - skip_gap, btn_cy));
-        canvas.scale((-1.0, 1.0));
-        if let Some(t) = prev_t {
-            let skip_blur = (1.0 - t / 0.3).max(0.0) * 6.0 * scale;
-            if skip_blur > 0.1 && use_blur {
-                let mut blur_paint = Paint::default();
-                blur_paint.set_image_filter(image_filters::blur(
-                    (skip_blur, skip_blur * 0.3),
-                    None,
-                    None,
-                    None,
-                ));
-                canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&blur_paint));
-            }
-
-            let shoot_t = (t / 0.25).min(1.0);
-            let shoot_x = 10.92 * scale + 22.0 * scale * shoot_t;
-            let shoot_alpha = ((alpha as f32) * (1.0 - shoot_t)) as u8;
-            if shoot_alpha > 0 {
-                draw_control_triangle(canvas, shoot_x, 0.0, shoot_alpha, 0.055, scale, text_color);
-            }
-
-            let move_t = (t / 0.55).min(1.0);
-            let mid_x = -10.92 * scale + (10.92 * 2.0) * scale * move_t;
-            let mid_s = 0.050 + (0.055 - 0.050) * move_t;
-            draw_control_triangle(canvas, mid_x, 0.0, alpha, mid_s, scale, text_color);
-
-            let fade_raw = ((t - 0.15) / 0.85).clamp(0.0, 1.0);
-            let fade_eased = ease_out_back(fade_raw);
-            let new_x = -25.0 * scale + (25.0 - 10.92) * scale * fade_eased;
-            let new_alpha = ((alpha as f32) * fade_raw) as u8;
-            if new_alpha > 0 {
-                draw_control_triangle(canvas, new_x, 0.0, new_alpha, 0.050, scale, text_color);
-            }
-
-            if skip_blur > 0.1 && use_blur {
-                canvas.restore();
-            }
-        } else {
-            draw_control_triangle(canvas, -10.92 * scale, 0.0, alpha, 0.050, scale, text_color);
-            draw_control_triangle(canvas, 10.92 * scale, 0.0, alpha, 0.055, scale, text_color);
-        }
-        canvas.restore();
 
         let (pause_s, pause_blur) = PAUSE_SPRING.with(|cell| {
             let mut s = cell.borrow_mut();
             if s.velocity < 0.0 {
-                s.value = (s.value + s.velocity).max(0.01);
-                s.velocity *= 0.8;
+                s.value = (s.value + s.velocity * dt).max(0.01);
+                s.velocity *= 0.8_f32.powf(dt);
                 if s.velocity > -0.01 || s.value <= 0.01 {
                     s.velocity = 0.0;
                 }
             } else {
-                s.velocity = (1.0 - s.value) * 0.15;
+                s.velocity = (1.0 - s.value) * 0.15 * dt;
                 s.value += s.velocity;
             }
             (s.value, (s.velocity.abs() * 40.0 * scale).clamp(0.0, 15.0))
@@ -926,64 +985,18 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         }
         canvas.restore();
 
-        let next_t = NEXT_SKIP_ANIM.with(|cell| {
-            let start = *cell.borrow();
-            match start {
-                Some(s) => {
-                    let t = s.elapsed().as_secs_f32() / 0.5;
-                    if t >= 1.0 {
-                        *cell.borrow_mut() = None;
-                        return None;
-                    }
-                    Some(t)
-                }
-                None => None,
-            }
+        let next_t = skip_anim_progress(&NEXT_SKIP_ANIM);
+        draw_skip_anim(SkipAnimParams {
+            canvas,
+            cx: btn_cx + skip_gap,
+            cy: btn_cy,
+            alpha,
+            scale,
+            use_blur,
+            text_color,
+            progress: next_t,
+            mirrored: false,
         });
-
-        canvas.save();
-        canvas.translate((btn_cx + skip_gap, btn_cy));
-        if let Some(t) = next_t {
-            let skip_blur = (1.0 - t / 0.3).max(0.0) * 6.0 * scale;
-            if skip_blur > 0.1 && use_blur {
-                let mut blur_paint = Paint::default();
-                blur_paint.set_image_filter(image_filters::blur(
-                    (skip_blur, skip_blur * 0.3),
-                    None,
-                    None,
-                    None,
-                ));
-                canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&blur_paint));
-            }
-
-            let shoot_t = (t / 0.25).min(1.0);
-            let shoot_x = 10.92 * scale + 22.0 * scale * shoot_t;
-            let shoot_alpha = ((alpha as f32) * (1.0 - shoot_t)) as u8;
-            if shoot_alpha > 0 {
-                draw_control_triangle(canvas, shoot_x, 0.0, shoot_alpha, 0.055, scale, text_color);
-            }
-
-            let move_t = (t / 0.55).min(1.0);
-            let mid_x = -10.92 * scale + (10.92 * 2.0) * scale * move_t;
-            let mid_s = 0.050 + (0.055 - 0.050) * move_t;
-            draw_control_triangle(canvas, mid_x, 0.0, alpha, mid_s, scale, text_color);
-
-            let fade_raw = ((t - 0.15) / 0.85).clamp(0.0, 1.0);
-            let fade_eased = ease_out_back(fade_raw);
-            let new_x = -25.0 * scale + (25.0 - 10.92) * scale * fade_eased;
-            let new_alpha = ((alpha as f32) * fade_raw) as u8;
-            if new_alpha > 0 {
-                draw_control_triangle(canvas, new_x, 0.0, new_alpha, 0.050, scale, text_color);
-            }
-
-            if skip_blur > 0.1 && use_blur {
-                canvas.restore();
-            }
-        } else {
-            draw_control_triangle(canvas, -10.92 * scale, 0.0, alpha, 0.050, scale, text_color);
-            draw_control_triangle(canvas, 10.92 * scale, 0.0, alpha, 0.055, scale, text_color);
-        }
-        canvas.restore();
 
         let play_mode_cx = btn_cx + skip_gap * 2.0;
         let play_mode_hit = 36.0 * scale;
@@ -1016,6 +1029,8 @@ pub fn draw_music_page(params: DrawMusicPageParams<'_>) -> bool {
         w_scale: scale,
         h_scale: viz_h_scale,
         smooth_factors: (0.6, 0.08),
+        dt,
+        slot: VizSlot::Expanded,
     });
 
     is_rotating

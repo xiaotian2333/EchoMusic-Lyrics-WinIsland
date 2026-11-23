@@ -332,27 +332,8 @@ impl AudioProcessor {
                     }
                 };
 
-                // SAFETY: COM 初始化成功时，创建的音频会话对象仅在本次采集周期内使用。
-                let _session = unsafe {
-                    if hr.is_ok() {
-                        (|| {
-                            let enumerator: IMMDeviceEnumerator =
-                                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-                            let device =
-                                enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
-                            let manager = device
-                                .Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
-                                .ok()?;
-                            manager.GetSimpleAudioVolume(None, 0).ok()
-                        })()
-                    } else {
-                        None
-                    }
-                };
-
                 if let Err(error) = stream.play() {
                     log::debug!("启动频谱采集流失败，准备重试: {error}");
-                    drop(_session);
                     drop(stream);
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
@@ -366,7 +347,6 @@ impl AudioProcessor {
                 }
 
                 drop(stream);
-                drop(_session);
                 reset_spectrum(&spectrum_arc);
                 if !cancel.is_cancelled()
                     && device_generation.load(Ordering::Relaxed) == observed_generation

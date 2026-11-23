@@ -41,6 +41,8 @@ use windows62::core::{BOOL, PCWSTR, w};
 use super::capture::lock;
 
 const FILTER_REFRESH: Duration = Duration::from_millis(500);
+/// 析构时等待放大镜线程退出的上限：magnification.dll 卡死时不能阻塞渲染线程。
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 最近一次提交给放大镜的源矩形与控件尺寸（左、上、右、下、宽、高），
 /// 供崩溃日志判断 magnification.dll 是否在越界源上崩溃。
@@ -138,9 +140,20 @@ impl Magnifier {
 impl Drop for Magnifier {
     fn drop(&mut self) {
         self.state.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // 放大镜线程卡在 magnification.dll 内部时不能无限等待：与初始化路径
+        // 同量级的有限等待，超时后放弃 join 让线程自行消亡，避免阻塞渲染线程
+        let deadline = Instant::now() + DROP_JOIN_TIMEOUT;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                log::warn!("放大镜线程未能在超时内退出，放弃等待");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        let _ = thread.join();
     }
 }
 

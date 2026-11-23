@@ -100,6 +100,9 @@ fn module_of(address: usize) -> Option<(String, usize)> {
     ))
 }
 
+/// 单个崩溃日志文件的上限（1 MiB）：一次崩溃最多写几十行，超出即轮转。
+const CRASH_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 fn log_path() -> PathBuf {
     let mut path = crate::core::persistence::get_config_path();
     path.pop();
@@ -108,13 +111,21 @@ fn log_path() -> PathBuf {
 }
 
 fn append(text: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path())
-    {
+    let path = log_path();
+    rotate_if_oversized(&path);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(text.as_bytes());
         let _ = file.write_all(b"\n");
         let _ = file.flush();
+    }
+}
+
+/// 日志超过上限时轮转为 `.log.1`：保留最近一份，避免无限增长占满用户目录。
+fn rotate_if_oversized(path: &std::path::Path) {
+    let oversized = std::fs::metadata(path)
+        .map(|meta| meta.len() > CRASH_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if oversized {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
     }
 }

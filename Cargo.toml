@@ -79,3 +79,5 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+# 保留行号级调试信息供 PDB 归档：崩溃日志只有模块+偏移，需要符号才能定位
+debug = 1

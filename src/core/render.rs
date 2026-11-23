@@ -24,7 +24,7 @@ use crate::ui::expanded::music_view::{
     get_cached_media_image_with_key, get_media_palette, get_visualizer_hit_rect,
 };
 use crate::ui::expanded::spectrum::{
-    DrawVisualizerParams, default_spectrum_fill, draw_visualizer, get_media_spectrum_fill,
+    DrawVisualizerParams, VizSlot, default_spectrum_fill, draw_visualizer, get_media_spectrum_fill,
 };
 use crate::ui::expanded::widget_view::draw_widget_page;
 use crate::utils::backdrop::{
@@ -62,6 +62,9 @@ const MIN_BLUR_SIGMA: f32 = 0.1;
 /// 三种切换动画共用同一速度：早期实现里带模糊的分支取了 0.25，比这慢 16 倍，
 /// 当前字在唱完前几乎不动，换字时直接跳到已上浮位置，看起来像瞬移。
 const CHAR_LIFT_SPEED: f32 = 4.0;
+
+/// dynamic 样式背景动画的时间基准：进程内单调时钟，NTP 校时不会引起相位跳变。
+static ANIMATION_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// 歌词切换进度缓动：WinIsland 使用 smoothstep 让进出更自然。
 fn lyric_transition_progress(progress: f32) -> f32 {
@@ -282,6 +285,8 @@ pub struct StyleParams<'a> {
     pub liquid_glass_dispersion: f32,
     pub liquid_glass_tint: f32,
     pub liquid_glass_siri: bool,
+    /// 液态玻璃兼容模式：岛对截图可见、背景由放大镜提供，GDI 取色会采到岛屿自身
+    pub liquid_glass_compat: bool,
     /// 毛玻璃宿主背板是否已就绪；就绪时背景由合成视觉提供，这里只画暗色覆盖层
     pub host_backdrop: bool,
     /// 迷你歌词切换动画：blur / slide / fade（WinIsland 原版三选一）
@@ -515,21 +520,25 @@ pub fn draw_island(
     surface: &mut Surface<Arc<Window>, Arc<Window>>,
     params: DrawIslandParams<'_>,
 ) -> bool {
-    let mut buffer = surface.buffer_mut().unwrap();
+    // 软缓冲与光栅表面都可能因 OOM/设备丢失失败，这里返回静默失败而非 panic
+    let Ok(mut buffer) = surface.buffer_mut() else {
+        return false;
+    };
     let (os_w, os_h) = (params.layout.os_w, params.layout.os_h);
-    let mut sk_surface = SK_SURFACE.with(|cell| {
+    let Some(mut sk_surface) = SK_SURFACE.with(|cell| {
         let mut opt = cell.borrow_mut();
         if let Some(ref s) = *opt
             && s.width() == os_w as i32
             && s.height() == os_h as i32
         {
-            return s.clone();
+            return Some(s.clone());
         }
-        let new_surface =
-            surfaces::raster_n32_premul(ISize::new(os_w as i32, os_h as i32)).unwrap();
+        let new_surface = surfaces::raster_n32_premul(ISize::new(os_w as i32, os_h as i32))?;
         *opt = Some(new_surface.clone());
-        new_surface
-    });
+        Some(new_surface)
+    }) else {
+        return false;
+    };
     let widget_animating = draw_island_canvas(sk_surface.canvas(), params, None);
 
     let info = skia_safe::ImageInfo::new(
@@ -626,6 +635,7 @@ pub fn draw_island_canvas(
         liquid_glass_dispersion,
         liquid_glass_tint,
         liquid_glass_siri,
+        liquid_glass_compat,
         host_backdrop,
         lyrics_transition_animation,
         dynamic_cover_grace,
@@ -721,7 +731,7 @@ pub fn draw_island_canvas(
             } else {
                 draw_liquid_glass_with_backdrop(canvas, backdrop, &draw_params)
             }
-        } else if island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI {
+        } else if island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI || liquid_glass_compat {
             false
         } else {
             match get_liquid_glass_background(&LiquidGlassParams {
@@ -853,9 +863,9 @@ pub fn draw_island_canvas(
             const DRIFT_SPEED_Y: f64 = 0.12;
             const DRIFT_AMP_X: f64 = 20.0;
             const DRIFT_AMP_Y: f64 = 15.0;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+            let now = ANIMATION_EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
                 .as_secs_f64();
             let angle_rad = (now * ROTATE_SPEED) % (2.0 * std::f64::consts::PI);
             let dx = (now * DRIFT_SPEED_X).sin() * DRIFT_AMP_X;
@@ -924,8 +934,13 @@ pub fn draw_island_canvas(
             current_h.round() as i32,
         );
         let monitor_rect = (monitor_x, monitor_y, monitor_w as i32, monitor_h as i32);
+        // 兼容模式不设 WDA，GDI 采样区域会包含岛屿自身，形成字色亮度自反馈，直接停用
         let content = if island_style == ISLAND_STYLE_LIQUID_GLASS_WGC {
-            backdrop_luminance(island_rect, monitor_rect)
+            if liquid_glass_compat {
+                None
+            } else {
+                backdrop_luminance(island_rect, monitor_rect)
+            }
         } else if let Some(backdrop) = gpu_backdrop {
             backdrop.luminance
         } else {
@@ -1142,6 +1157,8 @@ pub fn draw_island_canvas(
             w_scale: 0.55 * non_expanded_scale,
             h_scale: viz_h_scale * non_expanded_scale,
             smooth_factors: (0.6, 0.08),
+            dt: style.dt,
+            slot: VizSlot::Mini,
         });
 
         let is_paused = music_active && !media.is_playing && style.mini_controls;

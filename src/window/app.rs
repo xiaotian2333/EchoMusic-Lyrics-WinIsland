@@ -46,7 +46,7 @@ use crate::utils::icon::get_app_icon;
 use crate::utils::liquid_glass::{clear_liquid_glass_cache, set_exclude_from_capture};
 use crate::utils::mouse::{
     get_global_cursor_pos, is_cursor_hidden, is_foreground_fullscreen, is_left_button_pressed,
-    is_point_in_rect,
+    is_point_in_circle, is_point_in_rect,
 };
 use crate::utils::physics::Spring;
 use crate::utils::process::get_foreground_process_name;
@@ -66,6 +66,16 @@ const VOLUME_WHEEL_MAX_UNITS: f32 = 1.0;
 /// 音量提示显示时长与淡出时长（与上游 WinIsland 一致）
 const VOLUME_HINT_DISPLAY: Duration = Duration::from_millis(1600);
 const VOLUME_HINT_FADE: Duration = Duration::from_millis(240);
+/// 动画活跃期的帧预算（144FPS）
+const ACTIVE_FRAME_BUDGET: Duration = Duration::from_micros(6944);
+/// 静止但可见时的帧预算（30FPS）：光标悬停检测的响应延迟上限
+const IDLE_FRAME_BUDGET: Duration = Duration::from_millis(33);
+/// 托盘隐藏态的帧预算：仅维持捕获边框刷新与配置轮询
+const HIDDEN_FRAME_BUDGET: Duration = Duration::from_millis(100);
+/// 强制置顶的刷新间隔：动画期每帧执行，静止期降频
+const TOPMOST_REFRESH_IDLE: Duration = Duration::from_millis(500);
+/// 配置文件变更检查间隔
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -142,6 +152,9 @@ pub struct App {
     host_backdrop_retry_at: Option<Instant>,
     border_refresh_at: Option<Instant>,
     hwnd_raw: Option<isize>,
+    topmost_at: Option<Instant>,
+    config_poll_at: Option<Instant>,
+    config_mtime: Option<std::time::SystemTime>,
 }
 
 impl Default for App {
@@ -218,6 +231,9 @@ impl Default for App {
             host_backdrop_retry_at: None,
             border_refresh_at: None,
             hwnd_raw: None,
+            topmost_at: None,
+            config_poll_at: None,
+            config_mtime: None,
         }
     }
 }
@@ -230,6 +246,24 @@ struct IslandLayout {
     hide_distance: f64,
     hidden_handle_y: f64,
     hidden_handle_h: f64,
+}
+
+/// 一帧内的指针位置与命中判定结果，供隐藏状态机与拖拽/进度交互复用。
+#[derive(Clone, Copy)]
+struct PointerContext {
+    rel_x: i32,
+    rel_y: i32,
+    py: i32,
+    island_y: f64,
+    offset_x: f64,
+    dock_bottom: bool,
+    hide_distance: f64,
+    is_hovering_visible: bool,
+    is_on_hidden_handle: bool,
+    hover_to_hide_available: bool,
+    cursor_in_hover_inner: bool,
+    cursor_in_hover_outer: bool,
+    block_auto_reveal: bool,
 }
 
 /// 逐字渲染状态快照：歌词数据 + 行下标 + 当前字下标与字内进度。
@@ -272,6 +306,36 @@ impl App {
 
     fn is_hidden(&self) -> bool {
         self.auto_hidden || self.hover_hidden || self.manually_hidden
+    }
+
+    /// 是否存在需要逐帧推进的动画/交互：仅此类状态按 144FPS 出帧。
+    fn is_animating(&self) -> bool {
+        self.expanded
+            || self.is_dragging
+            || self.seeking_progress
+            || self.volume_hint_until.is_some()
+            || self.lyric_transition < 1.0
+            || self.lyric_scroll_active
+            || self.spring_hide.velocity.abs() > 0.001
+            || (self.spring_hide.value > 0.0 && self.spring_hide.value < 1.0)
+            || self.spring_w.velocity.abs() > 0.001
+            || self.spring_h.velocity.abs() > 0.001
+            || self.spring_r.velocity.abs() > 0.001
+            || self.spring_view.velocity.abs() > 0.001
+    }
+
+    /// 当前帧预算：隐藏态最低频，静止可见态降频，动画期按 144FPS。
+    fn frame_budget(&self) -> Duration {
+        if !self.visible {
+            HIDDEN_FRAME_BUDGET
+        } else if self.is_animating()
+            || (!self.media.get_info().title.is_empty() && self.last_media_playing)
+        {
+            // 音乐播放期间频谱与进度条持续变化，保持全速出帧
+            ACTIVE_FRAME_BUDGET
+        } else {
+            IDLE_FRAME_BUDGET
+        }
     }
 
     fn update_dock_position_from_process(&mut self, window: &Window) {
@@ -354,15 +418,7 @@ impl App {
 
     fn current_filtered_lyric(&mut self, media: &MediaInfo) -> Option<String> {
         let lyrics = media.lyrics.as_ref()?;
-        let raw_pos = if media.is_playing {
-            media
-                .position_ms
-                .saturating_add(media.last_update.elapsed().as_millis() as u64)
-        } else {
-            media.position_ms
-        };
-        let current_pos =
-            (raw_pos as i64 + (self.config.lyrics_delay * 1000.0) as i64).max(0) as u64;
+        let current_pos = media.effective_position_ms((self.config.lyrics_delay * 1000.0) as i64);
         let idx = current_lyric_index(lyrics, current_pos)?;
         self.refresh_lyrics_filter_regex();
         if let Some(regex) = &self.lyrics_filter_regex_cache {
@@ -383,28 +439,7 @@ impl App {
                 .primary_monitor()
                 .or_else(|| window.current_monitor());
         }
-        use windows::Win32::Graphics::Gdi::*;
-        let mut win32_names: Vec<String> = Vec::new();
-        // SAFETY: EnumDisplayDevicesW reads display device info. We provide a zeroed
-        // DISPLAY_DEVICEW with correct cb size. idx increments safely. No mutable global state.
-        unsafe {
-            let mut idx = 0u32;
-            loop {
-                let mut dd: DISPLAY_DEVICEW = std::mem::zeroed();
-                dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-                if EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
-                    if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0 {
-                        let name = String::from_utf16_lossy(&dd.DeviceName)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        win32_names.push(name);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
-        }
+        let win32_names = crate::utils::win32::active_display_names();
         let target_name = win32_names.get(monitor_index as usize);
         let monitors: Vec<_> = window.available_monitors().collect();
         if let Some(name) = target_name {
@@ -926,19 +961,14 @@ impl App {
             if view_val > 0.5 {
                 let gear_x = offset_x + w - 28.0 * scale + w - page_shift;
                 let gear_y = island_y + h - 28.0 * scale;
-                let dist_sq = (rel_x as f64 - gear_x).powi(2) + (rel_y as f64 - gear_y).powi(2);
-                if dist_sq <= (20.0 * scale).powi(2) {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(exe).arg("--settings").spawn();
-                    }
+                if is_point_in_circle(rel_x as f64, rel_y as f64, gear_x, gear_y, 20.0 * scale) {
+                    crate::window::settings::open_settings_window();
                     return;
                 }
 
                 let arrow_x = offset_x + 12.0 * scale + w - page_shift;
                 let arrow_y = island_y + h / 2.0;
-                let adx = rel_x as f64 - arrow_x;
-                let ady = rel_y as f64 - arrow_y;
-                if adx * adx + ady * ady <= (20.0 * scale).powi(2) {
+                if is_point_in_circle(rel_x as f64, rel_y as f64, arrow_x, arrow_y, 20.0 * scale) {
                     self.widget_view = false;
                     return;
                 }
@@ -947,9 +977,7 @@ impl App {
             if view_val < 0.5 {
                 let arrow_x = offset_x + w - 12.0 * scale;
                 let arrow_y = island_y + h / 2.0;
-                let adx = rel_x as f64 - arrow_x;
-                let ady = rel_y as f64 - arrow_y;
-                if adx * adx + ady * ady <= (20.0 * scale).powi(2) {
+                if is_point_in_circle(rel_x as f64, rel_y as f64, arrow_x, arrow_y, 20.0 * scale) {
                     self.widget_view = true;
                     return;
                 }
@@ -1057,7 +1085,7 @@ impl App {
     }
 
     fn close_settings_window() {
-        crate::utils::win32::close_window("EchoMusic-Lyrics-WinIsland Settings");
+        crate::window::settings::close_settings_window();
     }
 
     fn handle_tray_events(&mut self, window: &Window, event_loop: &ActiveEventLoop) {
@@ -1075,9 +1103,7 @@ impl App {
                     }
                 }
                 TrayAction::OpenSettings => {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(exe).arg("--settings").spawn();
-                    }
+                    crate::window::settings::open_settings_window();
                 }
                 TrayAction::Restart => {
                     Self::close_settings_window();
@@ -1253,9 +1279,21 @@ impl App {
     }
 
     fn reload_config_if_changed(&mut self, window: &Window) {
-        if !self.frame_count.is_multiple_of(30) {
+        if self
+            .config_poll_at
+            .is_some_and(|at| at.elapsed() < CONFIG_POLL_INTERVAL)
+        {
             return;
         }
+        self.config_poll_at = Some(Instant::now());
+        // 先比较文件修改时间：配置未变时避免每轮都完整读盘 + TOML 解析
+        let current_mtime = std::fs::metadata(crate::core::persistence::get_config_path())
+            .and_then(|meta| meta.modified())
+            .ok();
+        if current_mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = current_mtime;
         let current_config = load_config();
         if current_config != self.config {
             let old_non_expanded_scale = self.config.non_expanded_scale;
@@ -1270,10 +1308,26 @@ impl App {
             let old_mini_shape = self.config.mini_cover_shape.clone();
             let old_expanded_shape = self.config.expanded_cover_shape.clone();
             let old_font = self.config.custom_font_path.clone();
+            let old_language = self.config.language.clone();
+            let old_auto_start = self.config.auto_start;
 
             self.config = current_config;
             self.last_foreground_process = None;
             self.effective_dock_position = self.config.dock_position;
+
+            // 配置副作用统一在主进程热重载时执行：语言涉及全局 I18n 与托盘菜单，
+            // 开机自启涉及注册表；设置进程与 WebSocket 通道都只负责落盘
+            if old_language != self.config.language {
+                crate::core::i18n::init_i18n(&self.config.language);
+                if let Some(tray) = self.tray.as_mut() {
+                    tray.reload_texts(self.visible);
+                }
+            }
+            if old_auto_start != self.config.auto_start
+                && let Err(err) = crate::utils::autostart::set_autostart(self.config.auto_start)
+            {
+                log::warn!("开机自启设置失败: {err}");
+            }
             if old_style != self.config.island_style
                 || old_compat != self.config.liquid_glass_compat_capture
             {
@@ -1389,6 +1443,348 @@ impl App {
                 (self.win_x, self.win_y) = self.compute_window_position(mon_pos, mon_size);
                 window.set_outer_position(PhysicalPosition::new(self.win_x, self.win_y));
             }
+        }
+    }
+
+    /// 自动隐藏与悬停隐藏的状态机推进。
+    fn update_idle_and_hover_state(
+        &mut self,
+        pointer: &PointerContext,
+        media: &MediaInfo,
+        music_active: bool,
+    ) {
+        let PointerContext {
+            is_hovering_visible,
+            is_on_hidden_handle,
+            hover_to_hide_available,
+            cursor_in_hover_inner,
+            cursor_in_hover_outer,
+            block_auto_reveal,
+            ..
+        } = *pointer;
+        let is_paused_idle = music_active && !media.is_playing;
+        let is_idle = !is_hovering_visible
+            && !self.expanded
+            && !self.is_dragging
+            && (!music_active || is_paused_idle);
+        if !self.config.auto_hide {
+            self.auto_hidden = false;
+            self.idle_timer = Instant::now();
+        } else if media.is_playing
+            && self.auto_hidden
+            && !self.manually_hidden
+            && !block_auto_reveal
+        {
+            self.auto_hidden = false;
+            self.idle_timer = Instant::now();
+            self.spring_hide.velocity = -0.65;
+        } else if self.auto_hidden {
+            if !block_auto_reveal && (is_on_hidden_handle || is_hovering_visible) {
+                self.auto_hidden = false;
+                self.idle_timer = Instant::now();
+                self.spring_hide.velocity = -0.45;
+            }
+        } else if is_idle && !self.manually_hidden {
+            if self.idle_timer.elapsed().as_secs_f32() > self.config.auto_hide_delay {
+                self.auto_hidden = true;
+            }
+        } else if !self.manually_hidden && !is_idle {
+            self.idle_timer = Instant::now();
+        }
+
+        if hover_to_hide_available && !self.auto_hidden {
+            if !self.hover_hidden {
+                if cursor_in_hover_inner {
+                    self.hover_hidden = true;
+                    self.hover_to_hide_enter_at = None;
+                }
+            } else if !cursor_in_hover_outer {
+                match self.hover_to_hide_enter_at {
+                    None => self.hover_to_hide_enter_at = Some(Instant::now()),
+                    Some(t)
+                        if t.elapsed()
+                            >= Duration::from_secs_f64(self.config.hover_to_hide_delay as f64) =>
+                    {
+                        self.hover_hidden = false;
+                        self.idle_timer = Instant::now();
+                        self.spring_hide.velocity = -0.45;
+                        self.hover_to_hide_enter_at = None;
+                    }
+                    _ => {}
+                }
+            } else {
+                self.hover_to_hide_enter_at = None;
+            }
+        } else {
+            self.hover_hidden = false;
+            self.hover_to_hide_enter_at = None;
+        }
+    }
+
+    /// 进度条拖动、隐藏拖拽、展开/收起点击判定与隐藏弹簧推进。
+    fn update_pointer_interactions(
+        &mut self,
+        window: &Window,
+        pointer: &PointerContext,
+        media: &MediaInfo,
+        music_active: bool,
+        dt: f32,
+    ) {
+        let PointerContext {
+            rel_x,
+            rel_y,
+            py,
+            island_y,
+            offset_x,
+            dock_bottom,
+            hide_distance,
+            is_hovering_visible,
+            ..
+        } = *pointer;
+        if self.seeking_progress && (is_left_button_pressed() || self.touch_id.is_some()) {
+            let page_shift = self.spring_view.value * self.spring_w.value;
+            let click_x = rel_x as f32 - page_shift;
+            let bar_width = self.seeking_bar_right - self.seeking_bar_left;
+            let ratio = if bar_width > 0.0 {
+                ((click_x - self.seeking_bar_left) / bar_width).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let seek_ms = (ratio as f64 * self.seeking_duration_ms as f64) as u64;
+            self.seeking_preview_ms = seek_ms;
+            window.request_redraw();
+        } else if self.seeking_progress {
+            self.seeking_progress = false;
+            if self.seeking_duration_ms > 0 {
+                self.media.request_seek(self.seeking_preview_ms);
+                window.request_redraw();
+            }
+        }
+
+        let progress_hover_active = if self.seeking_progress {
+            true
+        } else if self.expanded && (self.spring_view.value as f64) < 0.5 {
+            if let Some((bar_left, bar_right, bar_top, bar_hit_h)) = get_progress_bar_rect(
+                offset_x as f32,
+                island_y as f32,
+                self.spring_w.value,
+                media,
+                music_active,
+                self.config.expanded_scale,
+                &self.config.expanded_cover_shape,
+            ) {
+                let page_shift = self.spring_view.value * self.spring_w.value;
+                let cx = rel_x as f32 - page_shift;
+                let cy = rel_y as f32;
+                let margin = 4.0 * self.config.expanded_scale;
+                cx >= bar_left - margin
+                    && cx <= bar_right + margin
+                    && cy >= bar_top - margin
+                    && cy <= bar_top + bar_hit_h + margin
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        set_progress_hover(progress_hover_active);
+        set_progress_dragging(self.seeking_progress);
+
+        if self.is_dragging {
+            let diff_y = if dock_bottom {
+                py - self.drag_start_py
+            } else {
+                self.drag_start_py - py
+            };
+            if diff_y.abs() > 3 {
+                self.drag_has_moved = true;
+            }
+            if hide_distance > 0.0 {
+                let mut new_val = self.drag_start_hide_val + (diff_y as f32 / hide_distance as f32);
+                new_val = new_val.clamp(0.0, 1.0);
+                self.spring_hide.value = new_val;
+                self.spring_hide.velocity = 0.0;
+                window.request_redraw();
+            }
+        } else {
+            let hide_target = if self.is_hidden() { 1.0 } else { 0.0 };
+            let (stiffness, damping) = if self.is_hidden() {
+                (0.12, 0.70)
+            } else {
+                (0.08, 0.78)
+            };
+            self.spring_hide
+                .update_dt(hide_target, stiffness, damping, dt);
+        }
+
+        if self.spring_hide.velocity.abs() > 0.001
+            || (self.spring_hide.value > 0.0 && self.spring_hide.value < 1.0)
+        {
+            window.request_redraw();
+        }
+
+        if self.expanded
+            && !is_hovering_visible
+            && (is_left_button_pressed() || self.touch_id.is_some())
+        {
+            self.expanded = false;
+            self.widget_view = false;
+            window.request_redraw();
+        }
+
+        if !self.expanded
+            && is_hovering_visible
+            && (is_left_button_pressed() || self.touch_id.is_some())
+        {
+            self.idle_timer = Instant::now();
+        }
+    }
+
+    /// 当前歌词行与过渡进度的推进。
+    fn update_lyrics_state(
+        &mut self,
+        window: &Window,
+        media: &MediaInfo,
+        music_active: bool,
+        dt: f32,
+    ) {
+        let is_paused = music_active && !media.is_playing;
+        let current_lyric_opt = if self.config.show_lyrics && !is_paused {
+            if self.config.lyrics_filter_scope.filters_desktop() {
+                self.current_filtered_lyric(media)
+            } else {
+                media.current_lyric((self.config.lyrics_delay * 1000.0) as i64)
+            }
+        } else {
+            None
+        };
+        let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
+        let lyric_line_idx = media
+            .lyrics
+            .as_ref()
+            .and_then(|lyrics| current_lyric_index(lyrics, media.effective_position_ms(delay_ms)));
+        // 显示文本就是该行自身的文本时才认为行下标有效：
+        // 歌词过滤会把上一行的文本当作当前显示内容，那种情况下不应按行下标触发切换
+        let line_idx_is_displayed = current_lyric_opt.as_deref().is_some_and(|text| {
+            lyric_line_idx
+                .and_then(|idx| media.lyrics.as_ref()?.get(idx))
+                .is_some_and(|line| line.text == text)
+        });
+        if let Some(lyric) = current_lyric_opt {
+            // 文本相同但行下标前进（重复歌词行）时同样要切换，否则逐字高亮不会重新开始
+            let line_advanced =
+                line_idx_is_displayed && lyric_line_idx != self.current_lyric_line_idx;
+            if lyric != self.current_lyric_text || line_advanced {
+                self.old_lyric_text = self.current_lyric_text.clone();
+                self.old_lyric_chars = self.rendered_lyric_chars.take();
+                self.current_lyric_text = lyric.clone();
+                self.current_lyric_line_idx = lyric_line_idx;
+                self.lyric_transition = 0.0;
+                self.lyric_scroll_offset = 0.0;
+                self.lyric_scroll_pause = 0.0;
+            }
+        } else if !is_paused && music_active {
+            let fallback = format!("{} - {}", media.title, media.artist);
+            if self.current_lyric_text != fallback {
+                if !self.current_lyric_text.is_empty() {
+                    self.old_lyric_text = self.current_lyric_text.clone();
+                    self.old_lyric_chars = self.rendered_lyric_chars.take();
+                }
+                self.current_lyric_text = fallback;
+                self.current_lyric_line_idx = None;
+                self.lyric_transition = 0.0;
+                self.lyric_scroll_offset = 0.0;
+                self.lyric_scroll_pause = 0.0;
+            }
+        } else if !is_paused && !self.current_lyric_text.is_empty() {
+            self.old_lyric_text = self.current_lyric_text.clone();
+            self.old_lyric_chars = self.rendered_lyric_chars.take();
+            self.current_lyric_text = String::new();
+            self.current_lyric_line_idx = None;
+            self.lyric_transition = 0.0;
+            self.lyric_scroll_offset = 0.0;
+            self.lyric_scroll_pause = 0.0;
+        }
+
+        if self.lyric_transition < 1.0 {
+            self.lyric_transition += 0.05 * dt;
+            if self.lyric_transition > 1.0 {
+                self.lyric_transition = 1.0;
+            }
+            window.request_redraw();
+        }
+    }
+
+    /// 目标尺寸计算、弹簧推进与各重绘源的触发。
+    fn update_springs_and_redraws(
+        &mut self,
+        window: &Window,
+        media: &MediaInfo,
+        music_active: bool,
+        dt: f32,
+    ) {
+        let is_paused = music_active && !media.is_playing;
+        let lyric_character_data = self.current_desktop_character_data(media);
+        // 音量提示显示期间冻结岛宽：以弹簧当前值作为目标，velocity 自然衰减归零，
+        // 提示结束（volume_hint_until 清空）后目标恢复歌词驱动，弹簧弹回
+        let target_w = if !self.expanded && self.volume_hint_until.is_some() {
+            self.spring_w.value
+        } else {
+            self.compute_lyric_target_width(
+                window,
+                music_active,
+                is_paused,
+                lyric_character_data.as_ref(),
+                dt,
+            )
+        };
+        let target_h = if self.expanded {
+            self.config.expanded_height * self.config.expanded_scale
+        } else {
+            self.config.base_height * self.config.non_expanded_scale
+        };
+        let target_r = if self.expanded {
+            32.0 * self.config.expanded_scale
+        } else {
+            (self.config.base_height * self.config.non_expanded_scale) / 2.0
+        };
+        let target_view = if self.widget_view { 1.0 } else { 0.0 };
+        self.spring_w.update_dt(target_w, 0.10, 0.68, dt);
+        self.spring_h.update_dt(target_h, 0.10, 0.68, dt);
+        self.spring_r.update_dt(target_r, 0.10, 0.68, dt);
+        self.spring_view.update_dt(target_view, 0.12, 0.68, dt);
+
+        // 液态玻璃-DXGI 隐藏态（自动/悬停/手动收起）保持连续重绘：此时其余重绘源
+        // 全部停止，背板更新只能依赖捕获唤醒驱动的零星重绘，把手玻璃会停留在收起
+        // 前的旧帧；连续重绘让 update() 按帧序号逐帧跟进捕获，实时折射不节流。
+        // WGC 变体维持原行为，隐藏态不做连续重绘
+        if self.expanded
+            || (music_active && media.is_playing)
+            || (self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI && self.is_hidden())
+            || self.spring_w.velocity.abs() > 0.001
+            || self.spring_h.velocity.abs() > 0.001
+            || self.spring_r.velocity.abs() > 0.001
+            || self.spring_view.velocity.abs() > 0.001
+        {
+            window.request_redraw();
+        }
+
+        // dynamic 样式的封面背景动画（旋转/漂移）基于绝对时间推进，暂停收起时
+        // 其余重绘源全部停止，画面会冻结；靠 1Hz 心跳维持动画可见地游移
+        if self.config.island_style == "dynamic"
+            && music_active
+            && !media.title.is_empty()
+            && !self.auto_hidden
+            && !self.manually_hidden
+            && self.dynamic_heartbeat_at.elapsed() >= Duration::from_secs(1)
+        {
+            self.dynamic_heartbeat_at = Instant::now();
+            window.request_redraw();
+        }
+        // 音量提示显示/淡出期间持续重绘，暂停或无音乐时帧循环停止，
+        // 不加重绘源提示会冻结在半透明
+        if self.volume_hint_until.is_some() {
+            window.request_redraw();
         }
     }
 
@@ -1898,6 +2294,7 @@ impl ApplicationHandler for App {
                                 liquid_glass_dispersion: self.config.liquid_glass_dispersion,
                                 liquid_glass_tint: self.config.liquid_glass_tint,
                                 liquid_glass_siri: self.config.liquid_glass_siri,
+                                liquid_glass_compat: self.config.liquid_glass_compat_capture,
                                 host_backdrop: self.host_backdrop.is_some(),
                                 lyrics_transition_animation: &self
                                     .config
@@ -1966,7 +2363,16 @@ impl ApplicationHandler for App {
             Some(w) => w,
             None => return,
         };
-        Self::enforce_topmost(&window, self.win_x, self.win_y, self.os_w, self.os_h);
+        // 置顶强制在动画期每帧执行，静止期降频，避免空闲时每帧 SetWindowPos
+        let animating = self.is_animating();
+        if animating
+            || self
+                .topmost_at
+                .is_none_or(|at| at.elapsed() >= TOPMOST_REFRESH_IDLE)
+        {
+            self.topmost_at = Some(Instant::now());
+            Self::enforce_topmost(&window, self.win_x, self.win_y, self.os_w, self.os_h);
+        }
         let frame_start = Instant::now();
         self.handle_tray_events(&window, event_loop);
         self.reload_config_if_changed(&window);
@@ -1976,7 +2382,8 @@ impl ApplicationHandler for App {
 
         if !self.visible {
             self.refresh_capture_border();
-            std::thread::sleep(Duration::from_millis(16));
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + HIDDEN_FRAME_BUDGET));
             return;
         }
         let (px, py) = if self.touch_id.is_some() {
@@ -2041,6 +2448,21 @@ impl ApplicationHandler for App {
             (false, false)
         };
         let block_auto_reveal = hover_to_hide_available && cursor_in_hover_inner;
+        let pointer = PointerContext {
+            rel_x,
+            rel_y,
+            py,
+            island_y,
+            offset_x,
+            dock_bottom,
+            hide_distance,
+            is_hovering_visible,
+            is_on_hidden_handle,
+            hover_to_hide_available,
+            cursor_in_hover_inner,
+            cursor_in_hover_outer,
+            block_auto_reveal,
+        };
 
         if self.frame_count.is_multiple_of(10) {
             self.is_fullscreen_suppressed = is_foreground_fullscreen();
@@ -2089,297 +2511,24 @@ impl ApplicationHandler for App {
             }
         }
 
-        let is_paused_idle = music_active && !media.is_playing;
-        let is_idle = !is_hovering_visible
-            && !self.expanded
-            && !self.is_dragging
-            && (!music_active || is_paused_idle);
-        if !self.config.auto_hide {
-            self.auto_hidden = false;
-            self.idle_timer = Instant::now();
-        } else if media.is_playing
-            && self.auto_hidden
-            && !self.manually_hidden
-            && !block_auto_reveal
-        {
-            self.auto_hidden = false;
-            self.idle_timer = Instant::now();
-            self.spring_hide.velocity = -0.65;
-        } else if self.auto_hidden {
-            if !block_auto_reveal && (is_on_hidden_handle || is_hovering_visible) {
-                self.auto_hidden = false;
-                self.idle_timer = Instant::now();
-                self.spring_hide.velocity = -0.45;
-            }
-        } else if is_idle && !self.manually_hidden {
-            if self.idle_timer.elapsed().as_secs_f32() > self.config.auto_hide_delay {
-                self.auto_hidden = true;
-            }
-        } else if !self.manually_hidden && !is_idle {
-            self.idle_timer = Instant::now();
-        }
+        self.update_idle_and_hover_state(&pointer, &media, music_active);
 
-        if hover_to_hide_available && !self.auto_hidden {
-            if !self.hover_hidden {
-                if cursor_in_hover_inner {
-                    self.hover_hidden = true;
-                    self.hover_to_hide_enter_at = None;
-                }
-            } else if !cursor_in_hover_outer {
-                match self.hover_to_hide_enter_at {
-                    None => self.hover_to_hide_enter_at = Some(Instant::now()),
-                    Some(t)
-                        if t.elapsed()
-                            >= Duration::from_secs_f64(self.config.hover_to_hide_delay as f64) =>
-                    {
-                        self.hover_hidden = false;
-                        self.idle_timer = Instant::now();
-                        self.spring_hide.velocity = -0.45;
-                        self.hover_to_hide_enter_at = None;
-                    }
-                    _ => {}
-                }
-            } else {
-                self.hover_to_hide_enter_at = None;
-            }
-        } else {
-            self.hover_hidden = false;
-            self.hover_to_hide_enter_at = None;
-        }
-
-        if self.seeking_progress && (is_left_button_pressed() || self.touch_id.is_some()) {
-            let page_shift = self.spring_view.value * self.spring_w.value;
-            let click_x = rel_x as f32 - page_shift;
-            let bar_width = self.seeking_bar_right - self.seeking_bar_left;
-            let ratio = if bar_width > 0.0 {
-                ((click_x - self.seeking_bar_left) / bar_width).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let seek_ms = (ratio as f64 * self.seeking_duration_ms as f64) as u64;
-            self.seeking_preview_ms = seek_ms;
-            window.request_redraw();
-        } else if self.seeking_progress {
-            self.seeking_progress = false;
-            if self.seeking_duration_ms > 0 {
-                self.media.request_seek(self.seeking_preview_ms);
-                window.request_redraw();
-            }
-        }
-
-        let progress_hover_active = if self.seeking_progress {
-            true
-        } else if self.expanded && (self.spring_view.value as f64) < 0.5 {
-            if let Some((bar_left, bar_right, bar_top, bar_hit_h)) = get_progress_bar_rect(
-                offset_x as f32,
-                island_y as f32,
-                self.spring_w.value,
-                &media,
-                music_active,
-                self.config.expanded_scale,
-                &self.config.expanded_cover_shape,
-            ) {
-                let page_shift = self.spring_view.value * self.spring_w.value;
-                let cx = rel_x as f32 - page_shift;
-                let cy = rel_y as f32;
-                let margin = 4.0 * self.config.expanded_scale;
-                cx >= bar_left - margin
-                    && cx <= bar_right + margin
-                    && cy >= bar_top - margin
-                    && cy <= bar_top + bar_hit_h + margin
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        set_progress_hover(progress_hover_active);
-        set_progress_dragging(self.seeking_progress);
-
-        if self.is_dragging {
-            let diff_y = if dock_bottom {
-                py - self.drag_start_py
-            } else {
-                self.drag_start_py - py
-            };
-            if diff_y.abs() > 3 {
-                self.drag_has_moved = true;
-            }
-            if hide_distance > 0.0 {
-                let mut new_val = self.drag_start_hide_val + (diff_y as f32 / hide_distance as f32);
-                new_val = new_val.clamp(0.0, 1.0);
-                self.spring_hide.value = new_val;
-                self.spring_hide.velocity = 0.0;
-                window.request_redraw();
-            }
-        } else {
-            let hide_target = if self.is_hidden() { 1.0 } else { 0.0 };
-            let (stiffness, damping) = if self.is_hidden() {
-                (0.12, 0.70)
-            } else {
-                (0.08, 0.78)
-            };
-            self.spring_hide
-                .update_dt(hide_target, stiffness, damping, dt);
-        }
-
-        if self.spring_hide.velocity.abs() > 0.001
-            || (self.spring_hide.value > 0.0 && self.spring_hide.value < 1.0)
-        {
-            window.request_redraw();
-        }
-
-        if self.expanded
-            && !is_hovering_visible
-            && (is_left_button_pressed() || self.touch_id.is_some())
-        {
-            self.expanded = false;
-            self.widget_view = false;
-            window.request_redraw();
-        }
-
-        if !self.expanded
-            && is_hovering_visible
-            && (is_left_button_pressed() || self.touch_id.is_some())
-        {
-            self.idle_timer = Instant::now();
-        }
+        self.update_pointer_interactions(&window, &pointer, &media, music_active, dt);
 
         self.frame_count += 1;
 
-        let is_paused = music_active && !media.is_playing;
-        let current_lyric_opt = if self.config.show_lyrics && !is_paused {
-            if self.config.lyrics_filter_scope.filters_desktop() {
-                self.current_filtered_lyric(&media)
-            } else {
-                media.current_lyric((self.config.lyrics_delay * 1000.0) as i64)
-            }
-        } else {
-            None
-        };
-        let delay_ms = (self.config.lyrics_delay * 1000.0) as i64;
-        let lyric_line_idx = media
-            .lyrics
-            .as_ref()
-            .and_then(|lyrics| current_lyric_index(lyrics, media.effective_position_ms(delay_ms)));
-        // 显示文本就是该行自身的文本时才认为行下标有效：
-        // 歌词过滤会把上一行的文本当作当前显示内容，那种情况下不应按行下标触发切换
-        let line_idx_is_displayed = current_lyric_opt.as_deref().is_some_and(|text| {
-            lyric_line_idx
-                .and_then(|idx| media.lyrics.as_ref()?.get(idx))
-                .is_some_and(|line| line.text == text)
-        });
-        if let Some(lyric) = current_lyric_opt {
-            // 文本相同但行下标前进（重复歌词行）时同样要切换，否则逐字高亮不会重新开始
-            let line_advanced =
-                line_idx_is_displayed && lyric_line_idx != self.current_lyric_line_idx;
-            if lyric != self.current_lyric_text || line_advanced {
-                self.old_lyric_text = self.current_lyric_text.clone();
-                self.old_lyric_chars = self.rendered_lyric_chars.take();
-                self.current_lyric_text = lyric.clone();
-                self.current_lyric_line_idx = lyric_line_idx;
-                self.lyric_transition = 0.0;
-                self.lyric_scroll_offset = 0.0;
-                self.lyric_scroll_pause = 0.0;
-            }
-        } else if !is_paused && music_active {
-            let fallback = format!("{} - {}", media.title, media.artist);
-            if self.current_lyric_text != fallback {
-                if !self.current_lyric_text.is_empty() {
-                    self.old_lyric_text = self.current_lyric_text.clone();
-                    self.old_lyric_chars = self.rendered_lyric_chars.take();
-                }
-                self.current_lyric_text = fallback;
-                self.current_lyric_line_idx = None;
-                self.lyric_transition = 0.0;
-                self.lyric_scroll_offset = 0.0;
-                self.lyric_scroll_pause = 0.0;
-            }
-        } else if !is_paused && !self.current_lyric_text.is_empty() {
-            self.old_lyric_text = self.current_lyric_text.clone();
-            self.old_lyric_chars = self.rendered_lyric_chars.take();
-            self.current_lyric_text = String::new();
-            self.current_lyric_line_idx = None;
-            self.lyric_transition = 0.0;
-            self.lyric_scroll_offset = 0.0;
-            self.lyric_scroll_pause = 0.0;
-        }
+        self.update_lyrics_state(&window, &media, music_active, dt);
 
-        if self.lyric_transition < 1.0 {
-            self.lyric_transition += 0.05 * dt;
-            if self.lyric_transition > 1.0 {
-                self.lyric_transition = 1.0;
-            }
-            window.request_redraw();
-        }
+        self.update_springs_and_redraws(&window, &media, music_active, dt);
 
-        let lyric_character_data = self.current_desktop_character_data(&media);
-        // 音量提示显示期间冻结岛宽：以弹簧当前值作为目标，velocity 自然衰减归零，
-        // 提示结束（volume_hint_until 清空）后目标恢复歌词驱动，弹簧弹回
-        let target_w = if !self.expanded && self.volume_hint_until.is_some() {
-            self.spring_w.value
-        } else {
-            self.compute_lyric_target_width(
-                &window,
-                music_active,
-                is_paused,
-                lyric_character_data.as_ref(),
-                dt,
-            )
-        };
-        let target_h = if self.expanded {
-            self.config.expanded_height * self.config.expanded_scale
-        } else {
-            self.config.base_height * self.config.non_expanded_scale
-        };
-        let target_r = if self.expanded {
-            32.0 * self.config.expanded_scale
-        } else {
-            (self.config.base_height * self.config.non_expanded_scale) / 2.0
-        };
-        let target_view = if self.widget_view { 1.0 } else { 0.0 };
-        self.spring_w.update_dt(target_w, 0.10, 0.68, dt);
-        self.spring_h.update_dt(target_h, 0.10, 0.68, dt);
-        self.spring_r.update_dt(target_r, 0.10, 0.68, dt);
-        self.spring_view.update_dt(target_view, 0.12, 0.68, dt);
-
-        // 液态玻璃-DXGI 隐藏态（自动/悬停/手动收起）保持连续重绘：此时其余重绘源
-        // 全部停止，背板更新只能依赖捕获唤醒驱动的零星重绘，把手玻璃会停留在收起
-        // 前的旧帧；连续重绘让 update() 按帧序号逐帧跟进捕获，实时折射不节流。
-        // WGC 变体维持原行为，隐藏态不做连续重绘
-        if self.expanded
-            || (music_active && media.is_playing)
-            || (self.config.island_style == ISLAND_STYLE_LIQUID_GLASS_DXGI && self.is_hidden())
-            || self.spring_w.velocity.abs() > 0.001
-            || self.spring_h.velocity.abs() > 0.001
-            || self.spring_r.velocity.abs() > 0.001
-            || self.spring_view.velocity.abs() > 0.001
-        {
-            window.request_redraw();
-        }
-
-        // dynamic 样式的封面背景动画（旋转/漂移）基于绝对时间推进，暂停收起时
-        // 其余重绘源全部停止，画面会冻结；靠 1Hz 心跳维持动画可见地游移
-        if self.config.island_style == "dynamic"
-            && music_active
-            && !media.title.is_empty()
-            && !self.auto_hidden
-            && !self.manually_hidden
-            && self.dynamic_heartbeat_at.elapsed() >= Duration::from_secs(1)
-        {
-            self.dynamic_heartbeat_at = Instant::now();
-            window.request_redraw();
-        }
-        // 音量提示显示/淡出期间持续重绘，暂停或无音乐时帧循环停止，
-        // 不加重绘源提示会冻结在半透明
-        if self.volume_hint_until.is_some() {
-            window.request_redraw();
-        }
         let elapsed = frame_start.elapsed();
-        let target_frame_time = Duration::from_micros(6944);
-        if elapsed < target_frame_time {
-            std::thread::sleep(target_frame_time - elapsed);
-        }
+        let budget = self.frame_budget();
+        let deadline = if elapsed < budget {
+            Instant::now() + (budget - elapsed)
+        } else {
+            Instant::now()
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
 
