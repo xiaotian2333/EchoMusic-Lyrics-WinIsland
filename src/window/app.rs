@@ -144,6 +144,10 @@ pub struct App {
     last_volume_wheel_at: Option<Instant>,
     pending_volume: Option<f32>,
     volume_hint_until: Option<Instant>,
+    /// 提示展示的音量值；滚轮与外部音量变化触发时各自写入
+    volume_hint_value: Option<f32>,
+    /// 上次观测到的媒体音量，用于检测外部音量变化；None 表示尚未观测到
+    last_hint_volume: Option<f32>,
     gpu_island: Option<crate::gpu::GpuIsland>,
     gpu_retry_at: Option<Instant>,
     backdrop_window: Option<Arc<Window>>,
@@ -223,6 +227,8 @@ impl Default for App {
             last_volume_wheel_at: None,
             pending_volume: None,
             volume_hint_until: None,
+            volume_hint_value: None,
+            last_hint_volume: None,
             gpu_island: None,
             gpu_retry_at: None,
             backdrop_window: None,
@@ -667,11 +673,32 @@ impl App {
         self.pending_volume = Some(next_volume);
         self.media.request_set_volume(next_volume);
         self.idle_timer = now;
-        // 仅非展开态滚轮调音量时提示；展开态与外部音量变化一律不提示
+        // 非展开态滚轮调音量时提示，外部音量变化由 check_external_volume_hint 提示
         if !self.expanded && self.config.volume_wheel_hint {
+            self.volume_hint_value = Some(next_volume);
             self.volume_hint_until = Some(now + VOLUME_HINT_DISPLAY);
         }
         true
+    }
+
+    /// 外部音量变化检测：media.volume 与上次观测不同（插件上报或滚轮命令落库）
+    /// 时触发音量提示；首次观测到音量（如插件刚连接上报初始值）不算用户调整
+    fn check_external_volume_hint(&mut self, media: &MediaInfo, now: Instant) {
+        let Some(volume) = media.volume else {
+            return;
+        };
+        if self.last_hint_volume == Some(volume) {
+            return;
+        }
+        let first_observation = self.last_hint_volume.is_none();
+        self.last_hint_volume = Some(volume);
+        if first_observation || self.expanded || !self.config.volume_wheel_hint {
+            return;
+        }
+        // 滚轮遗留的 pending 不再可信，清掉让滚轮续算回落到最新媒体音量
+        self.pending_volume = None;
+        self.volume_hint_value = Some(volume);
+        self.volume_hint_until = Some(now + VOLUME_HINT_DISPLAY);
     }
 
     fn measure_lyric_text_width(&self, text: &str) -> f32 {
@@ -2111,12 +2138,14 @@ impl ApplicationHandler for App {
                         let volume_hint_alpha = match self.volume_hint_until {
                             Some(_) if self.expanded => {
                                 self.volume_hint_until = None;
+                                self.volume_hint_value = None;
                                 0.0
                             }
                             Some(until) => {
                                 let remain = until.saturating_duration_since(Instant::now());
                                 if remain.is_zero() {
                                     self.volume_hint_until = None;
+                                    self.volume_hint_value = None;
                                     0.0
                                 } else if remain <= VOLUME_HINT_FADE {
                                     remain.as_secs_f32() / VOLUME_HINT_FADE.as_secs_f32()
@@ -2127,7 +2156,7 @@ impl ApplicationHandler for App {
                             None => 0.0,
                         };
                         let volume_hint_value =
-                            self.pending_volume.or(media_info.volume).unwrap_or(50.0);
+                            self.volume_hint_value.or(media_info.volume).unwrap_or(50.0);
                         if !self.config.audio_gate {
                             self.audio.set_gate_override(false);
                         } else {
@@ -2482,6 +2511,7 @@ impl ApplicationHandler for App {
 
         let mut music_active = false;
         let media = self.media.get_info();
+        self.check_external_volume_hint(&media, Instant::now());
         if !media.title.is_empty() {
             self.last_media_playing = media.is_playing;
             music_active = true;
