@@ -16,6 +16,7 @@ use crate::core::persistence;
 use crate::utils::font::FontManager;
 
 const LYRICS_WS_ADDR: &str = "127.0.0.1:17195";
+const DEFAULT_PLAYER_PROCESS_NAME: &str = "EchoMusic.exe";
 const BIND_RETRY_INITIAL_MS: u64 = 200;
 const BIND_RETRY_MAX_MS: u64 = 2_000;
 /// 并发客户端上限：插件只会建立 1 条连接，上限只为挡住异常/恶意本地进程
@@ -87,7 +88,9 @@ pub enum LyricsWsEvent {
     VolumeState {
         volume: f32,
     },
-    ShowMainWindow,
+    ShowMainWindow {
+        process_name: String,
+    },
     PlayModeState {
         mode: String,
     },
@@ -597,7 +600,15 @@ async fn handle_plugin_command(
             let _ = event_tx.send(LyricsWsEvent::VolumeState { volume });
         }
         "show_main_window" => {
-            let _ = event_tx.send(LyricsWsEvent::ShowMainWindow);
+            let process_name = payload
+                .get("data")
+                .and_then(|d| d.get("process_name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(DEFAULT_PLAYER_PROCESS_NAME)
+                .to_string();
+            let _ = event_tx.send(LyricsWsEvent::ShowMainWindow { process_name });
         }
         "set_play_mode" => {
             let mode = payload
@@ -712,6 +723,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn show_main_window_uses_requested_process_name_or_default() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, _) = broadcast::channel(1);
+        let mut ws_write = futures_util::sink::drain();
+
+        for (payload, expected) in [
+            (json!({ "action": "show_main_window" }), "EchoMusic.exe"),
+            (
+                json!({ "action": "show_main_window", "data": {} }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": "  " } }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": 1 } }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": "EchoMusic.exe" } }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": " OtherPlayer.exe " } }),
+                "OtherPlayer.exe",
+            ),
+        ] {
+            let message = json!({ "type": "command", "source": "plugin", "payload": payload });
+            handle_text_message(&message.to_string(), &event_tx, &command_tx, &mut ws_write)
+                .await
+                .unwrap();
+            let event = event_rx.try_recv().unwrap();
+            assert!(matches!(
+                event,
+                LyricsWsEvent::ShowMainWindow { process_name } if process_name == expected
+            ));
+        }
+    }
 
     #[test]
     fn normalize_volume_value_clamps_and_rounds() {
