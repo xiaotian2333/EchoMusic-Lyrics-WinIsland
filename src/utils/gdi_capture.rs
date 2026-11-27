@@ -50,8 +50,8 @@ pub fn capture_screen_bgra(request: ScreenCaptureRequest) -> Option<ScreenCaptur
             let _ = SetStretchBltMode(hdc_mem, STRETCH_BLT_MODE(HALFTONE.0));
         }
 
-        if request.src_w == request.dst_w && request.src_h == request.dst_h {
-            let _ = BitBlt(
+        let blit_ok = if request.src_w == request.dst_w && request.src_h == request.dst_h {
+            BitBlt(
                 hdc_mem,
                 0,
                 0,
@@ -61,9 +61,10 @@ pub fn capture_screen_bgra(request: ScreenCaptureRequest) -> Option<ScreenCaptur
                 request.src_x,
                 request.src_y,
                 SRCCOPY,
-            );
+            )
+            .is_ok()
         } else {
-            let _ = StretchBlt(
+            StretchBlt(
                 hdc_mem,
                 0,
                 0,
@@ -75,7 +76,19 @@ pub fn capture_screen_bgra(request: ScreenCaptureRequest) -> Option<ScreenCaptur
                 request.src_w,
                 request.src_h,
                 SRCCOPY,
-            );
+            )
+            .as_bool()
+        };
+
+        if !blit_ok {
+            // 位块传输失败时像素内容未定义，直接放弃本次捕获，避免把全黑画面当作背景
+            let err = windows::core::Error::from_win32();
+            log::warn!("GDI 屏幕捕获失败（BitBlt/StretchBlt）: {err}");
+            let _ = SelectObject(hdc_mem, old);
+            let _ = DeleteObject(hbm);
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(HWND::default(), hdc_screen);
+            return None;
         }
 
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -88,7 +101,7 @@ pub fn capture_screen_bgra(request: ScreenCaptureRequest) -> Option<ScreenCaptur
 
         let pixel_count = (request.dst_w * request.dst_h * 4) as usize;
         let mut pixels = vec![0u8; pixel_count];
-        let _ = GetDIBits(
+        let scanlines = GetDIBits(
             hdc_mem,
             hbm,
             0,
@@ -102,6 +115,11 @@ pub fn capture_screen_bgra(request: ScreenCaptureRequest) -> Option<ScreenCaptur
         let _ = DeleteObject(hbm);
         let _ = DeleteDC(hdc_mem);
         let _ = ReleaseDC(HWND::default(), hdc_screen);
+
+        if scanlines == 0 {
+            log::warn!("GDI 屏幕捕获失败（GetDIBits）");
+            return None;
+        }
 
         if request.force_opaque_alpha {
             for pixel in pixels.as_chunks_mut::<4>().0 {

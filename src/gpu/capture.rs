@@ -33,14 +33,14 @@ use windows62::{
             Direct3D11::{
                 D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-                D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
-                ID3D11DeviceContext4, ID3D11Fence, ID3D11Multithread, ID3D11Texture2D,
+                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
+                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5,
+                ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Multithread,
+                ID3D11Texture2D,
             },
             Dxgi::{
                 Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-                CreateDXGIFactory1, DXGI_ERROR_WAS_STILL_DRAWING, IDXGIAdapter, IDXGIDevice,
-                IDXGIFactory4,
+                CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory4,
             },
             Gdi::{
                 GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
@@ -66,6 +66,12 @@ const PROBE_ALIGN: u32 = 64;
 const PIXEL_RATE_LIMIT: u32 = 60;
 /// 捕获会话创建/复查失败后的重试间隔，避免未授权时每帧重建会话。
 const SESSION_RETRY: Duration = Duration::from_secs(5);
+/// 捕获失败告警的节流间隔：持续失败时最长每 2 秒一条，避免逐帧刷屏。
+const WARN_THROTTLE: Duration = Duration::from_secs(2);
+/// 含睡眠计时与单调计时推进量相差超过该阈值，判定系统刚经历睡眠。
+const SLEEP_DETECT_THRESHOLD: Duration = Duration::from_secs(5);
+/// 会话建立后首个帧的等待上限：超过即视为会话静默失效并重建。
+const SESSION_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// 无边框捕获授权的重发间隔：睡眠唤醒或显示器重连后系统会重新绘制
 /// 捕获边框，需要周期性重发隐藏请求。
 const BORDER_REFRESH: Duration = Duration::from_secs(1);
@@ -85,6 +91,8 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(super) struct Latest {
     pub(super) source: Option<FrameSource>,
     pub(super) sequence: u64,
+    /// 最近一次产出新帧序列的时间；用于识别捕获会话静默失效
+    pub(super) frame_at: Option<Instant>,
 }
 
 pub(super) struct Shared {
@@ -97,6 +105,8 @@ pub(super) struct Shared {
     /// WGC 变化探针专用的设备与上下文包装；DDA 后端不使用。
     d3d: AgileContext,
     probe: Mutex<Probe>,
+    /// WGC 帧池已关闭或帧回调报告设备级错误：下一次复查重建会话。
+    session_dead: AtomicBool,
 }
 
 /// 最新背板帧的来源：WGC 帧池帧、DDA interest 裁剪纹理或放大镜像素回调帧。
@@ -198,6 +208,10 @@ impl Session {
     fn refresh(&self) -> Result<(), String> {
         match self {
             Self::Wgc(session) => {
+                if session.shared.session_dead.load(Ordering::Acquire) {
+                    session.shared.session_dead.store(false, Ordering::Release);
+                    return Err("WGC 捕获会话失效".to_string());
+                }
                 if session.border_at.get().elapsed() >= BORDER_REFRESH {
                     session.border_at.set(Instant::now());
                     if borderless_allowed() && !hide_border(&session.session) {
@@ -237,6 +251,7 @@ struct WgcSession {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     token: i64,
+    shared: Arc<Shared>,
     rate_hz: Cell<u32>,
     borderless: Cell<bool>,
     border_at: Cell<Instant>,
@@ -270,6 +285,12 @@ pub(crate) struct BackdropCapture {
     self_excluded: Cell<bool>,
     /// 会话创建或复查失败后的冷却起点，避免持续重试。
     session_retry_at: Cell<Option<Instant>>,
+    /// 告警节流起点：持续失败时限制日志频率，成功后清空。
+    warn_at: Cell<Option<Instant>>,
+    /// 睡眠唤醒检测基准：(含睡眠计时, 单调计时)
+    clock_ref: Cell<(u64, Instant)>,
+    /// 当前捕获会话的建立时刻；用于识别「会话已建立但从未产出帧」的静默失效
+    session_started_at: Cell<Option<Instant>>,
 }
 
 impl BackdropCapture {
@@ -308,6 +329,7 @@ impl BackdropCapture {
                 device: AgileDevice(winrt_device),
                 d3d,
                 probe: Mutex::new(Probe::default()),
+                session_dead: AtomicBool::new(false),
             }),
             session: RefCell::new(None),
             import: RefCell::new(None),
@@ -319,6 +341,9 @@ impl BackdropCapture {
             upload: RefCell::new(None),
             self_excluded: Cell::new(false),
             session_retry_at: Cell::new(None),
+            warn_at: Cell::new(None),
+            clock_ref: Cell::new((wall_clock_ms(), Instant::now())),
+            session_started_at: Cell::new(None),
         };
         // 首次会话可能因等待无边框授权而失败，不能让渲染端整体不可用；
         // update 会按重试间隔继续建立会话。
@@ -328,14 +353,59 @@ impl BackdropCapture {
 
     /// 周期性复查捕获会话（无边框授权与边框重发）；返回需要重建的错误。
     pub(crate) fn refresh(&self) -> Option<String> {
+        // 睡眠唤醒后 WGC/DDA 会话可能静默失效（既无错误也无新帧），
+        // 背景会永久冻结在最后一帧；重建会话是唯一可靠的恢复手段
+        if self.slept_since_last_check() {
+            return Some("系统刚经历睡眠唤醒，重建捕获会话".to_string());
+        }
+        // 捕获端 D3D11 设备被 TDR/驱动更新移除后拷贝会永久失败，
+        // 这里与渲染端设备健康检查对齐，主动触发整体重建（同后端重建）
+        // SAFETY: 仅查询保留设备的移除状态，不访问其他资源。
+        if let Err(error) = unsafe { self.device.GetDeviceRemovedReason() } {
+            return Some(format!("捕获 D3D11 设备已移除: {error}"));
+        }
+        // 会话已建立但迟迟没有任何帧：说明帧池没有真正工作（如显示器模式切换后
+        // 会话空转），此时静态桌面同样不会有新帧，只能靠这个上限识别并重建
+        if let Some(started) = self.session_started_at.get()
+            && started.elapsed() >= SESSION_FIRST_FRAME_TIMEOUT
+        {
+            let has_frame = lock(&self.shared.latest).frame_at.is_some();
+            if !has_frame {
+                return Some("捕获会话建立后长时间没有帧到达".to_string());
+            }
+        }
         let session = self.session.borrow();
         session.as_ref().and_then(|session| session.refresh().err())
+    }
+
+    /// 睡眠唤醒检测：墙钟包含睡眠时长而 `Instant`（QPC）不含，
+    /// 两者推进量出现显著差异即说明系统刚经历过睡眠。
+    fn slept_since_last_check(&self) -> bool {
+        let (tick_ref, instant_ref) = self.clock_ref.get();
+        let tick_now = wall_clock_ms();
+        let instant_delta = instant_ref.elapsed().as_millis() as u64;
+        let tick_delta = tick_now.saturating_sub(tick_ref);
+        self.clock_ref.set((tick_now, Instant::now()));
+        tick_delta.saturating_sub(instant_delta) >= SLEEP_DETECT_THRESHOLD.as_millis() as u64
+    }
+
+    /// 捕获失败告警节流：同类失败最长每 [`WARN_THROTTLE`] 记录一条。
+    fn warn_throttled(&self, message: impl FnOnce() -> String) {
+        if self
+            .warn_at
+            .get()
+            .is_some_and(|at| at.elapsed() < WARN_THROTTLE)
+        {
+            return;
+        }
+        self.warn_at.set(Some(Instant::now()));
+        log::warn!("{}", message());
     }
 
     /// 处理一次背板更新请求：必要时重启会话，把最新帧拷贝进共享纹理。
     pub(crate) fn update(&self, request: BackdropCaptureRequest) -> Option<BackdropCaptureFrame> {
         if let Err(error) = self.ensure_session(request.max_rate_hz) {
-            log::warn!("背板捕获会话重启失败: {error}");
+            self.warn_throttled(|| format!("背板捕获会话重启失败: {error}"));
             return None;
         }
         // 像素回调子模式：放大镜源取 interest 与所在显示器的交集（屏幕外无内容）
@@ -446,28 +516,31 @@ impl BackdropCapture {
             let mut source_desc = D3D11_TEXTURE2D_DESC::default();
             // SAFETY: desc 为输出结构，由本次调用初始化。
             unsafe { source.GetDesc(&mut source_desc) };
-            log::warn!(
-                "背板捕获拷贝失败: {error}（local=({local_x},{local_y}) src_box=({},{},{},{}) content={}x{} 源纹理={}x{} 格式{:?} import={}x{} read_value={}）",
-                source_box.left,
-                source_box.top,
-                source_box.right,
-                source_box.bottom,
-                content.Width,
-                content.Height,
-                source_desc.Width,
-                source_desc.Height,
-                source_desc.Format,
-                import.size.0,
-                import.size.1,
-                request.read_value
-            );
+            self.warn_throttled(|| {
+                format!(
+                    "背板捕获拷贝失败: {error}（local=({local_x},{local_y}) src_box=({},{},{},{}) content={}x{} 源纹理={}x{} 格式{:?} import={}x{} read_value={}）",
+                    source_box.left,
+                    source_box.top,
+                    source_box.right,
+                    source_box.bottom,
+                    content.Width,
+                    content.Height,
+                    source_desc.Width,
+                    source_desc.Height,
+                    source_desc.Format,
+                    import.size.0,
+                    import.size.1,
+                    request.read_value
+                )
+            });
             return None;
         }
         // SAFETY: 仅查询保留设备的移除状态。
         if let Err(error) = unsafe { self.device.GetDeviceRemovedReason() } {
-            log::warn!("背板捕获设备已移除: {error}");
+            self.warn_throttled(|| format!("背板捕获设备已移除: {error}"));
             return None;
         }
+        self.warn_at.set(None);
         self.write_value.store(value, Ordering::Release);
         self.serial.set(self.serial.get() + 1);
         self.copied.set(Some(key));
@@ -482,28 +555,22 @@ impl BackdropCapture {
             .as_ref()
             .is_none_or(|(_, width, height)| *width < pixels.width || *height < pixels.height)
         {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: pixels.width.max(1),
-                Height: pixels.height.max(1),
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                ..Default::default()
-            };
-            let mut texture = None;
-            // SAFETY: 描述符已初始化，输出 Option 由本次调用初始化并拥有。
-            if let Err(error) =
-                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            {
-                log::warn!("放大镜像素上传纹理创建失败: {error}");
-                return None;
-            }
-            *self.upload.borrow_mut() = Some((texture?, desc.Width, desc.Height));
+            let texture = ensure_bgra_texture(
+                &self.device,
+                pixels.width.max(1),
+                pixels.height.max(1),
+                D3D11_USAGE_DEFAULT,
+                1,
+                false,
+            )
+            .map_err(|error| {
+                self.warn_throttled(|| format!("放大镜像素上传纹理创建失败: {error}"));
+            })
+            .ok()?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: desc 为输出结构，由本次调用初始化。
+            unsafe { texture.GetDesc(&mut desc) };
+            *self.upload.borrow_mut() = Some((texture, desc.Width, desc.Height));
         }
         let texture = self.upload.borrow().as_ref()?.0.clone();
         let region = D3D11_BOX {
@@ -574,7 +641,7 @@ impl BackdropCapture {
                 Some(())
             }
             Err(error) => {
-                log::warn!("背板共享资源导入失败: {error}");
+                self.warn_throttled(|| format!("背板共享资源导入失败: {error}"));
                 None
             }
         }
@@ -593,7 +660,7 @@ impl BackdropCapture {
                     return Ok(());
                 }
                 Err(error) => {
-                    log::warn!("放大镜背景不可用，回退整屏捕获: {error}");
+                    self.warn_throttled(|| format!("放大镜背景不可用，回退整屏捕获: {error}"));
                     self.magnifier_mode.set(false);
                     self.session.borrow_mut().take();
                     *lock(&self.shared.latest) = Latest::default();
@@ -638,6 +705,7 @@ impl BackdropCapture {
             }
         };
         self.session_retry_at.set(None);
+        self.session_started_at.set(Some(Instant::now()));
         *self.session.borrow_mut() = Some(session);
         Ok(())
     }
@@ -688,14 +756,7 @@ impl BackdropCapture {
 
 impl WgcSession {
     fn start(monitor: HMONITOR, shared: &Arc<Shared>, rate_hz: u32) -> Result<Self, String> {
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: monitor 来自 MonitorFromWindow，info 是尺寸正确的输出结构。
-        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            return Err("显示器信息不可用".to_string());
-        }
+        let bounds: RECT = monitor_rect(monitor).ok_or_else(|| "显示器信息不可用".to_string())?;
         let interop =
             windows62::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                 .map_err(|error| format!("捕获互操作接口不可用: {error}"))?;
@@ -705,10 +766,11 @@ impl WgcSession {
         let (pool, session, token, borderless) = Self::open(&item, shared, rate_hz)?;
         Ok(Self {
             monitor,
-            origin: (info.rcMonitor.left, info.rcMonitor.top),
+            origin: (bounds.left, bounds.top),
             pool,
             session,
             token,
+            shared: Arc::clone(shared),
             rate_hz: Cell::new(rate_hz),
             borderless: Cell::new(borderless),
             border_at: Cell::new(Instant::now()),
@@ -788,6 +850,7 @@ impl Shared {
             }
             latest.source = Some(FrameSource::Magnifier(Arc::new(frame)));
             latest.sequence += 1;
+            latest.frame_at = Some(Instant::now());
         }
         if !self.pending.swap(true, Ordering::AcqRel) {
             crate::gpu::wake();
@@ -832,28 +895,18 @@ impl Shared {
             .as_ref()
             .is_none_or(|(_, w, h)| *w < width || *h < height)
         {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: width.div_ceil(PROBE_ALIGN) * PROBE_ALIGN,
-                Height: height.div_ceil(PROBE_ALIGN) * PROBE_ALIGN,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                ..Default::default()
-            };
-            let mut texture = None;
-            // SAFETY: 描述符已初始化，输出 Option 由本次调用初始化并拥有。
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
-            probe.staging = Some((
-                texture.ok_or_else(windows62::core::Error::empty)?,
-                desc.Width,
-                desc.Height,
-            ));
+            let texture = ensure_bgra_texture(
+                device,
+                width.div_ceil(PROBE_ALIGN) * PROBE_ALIGN,
+                height.div_ceil(PROBE_ALIGN) * PROBE_ALIGN,
+                D3D11_USAGE_STAGING,
+                PROBE_ALIGN,
+                true,
+            )?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: desc 为输出结构，由本次调用初始化。
+            unsafe { texture.GetDesc(&mut desc) };
+            probe.staging = Some((texture, desc.Width, desc.Height));
         }
         let Some((staging, _, _)) = probe.staging.clone() else {
             return Err(windows62::core::Error::empty());
@@ -873,23 +926,15 @@ impl Shared {
         unsafe {
             context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, 0, Some(&source_box));
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            let mut attempts = 0;
-            loop {
-                match context.Map(
-                    &staging,
-                    0,
-                    D3D11_MAP_READ,
-                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
-                    Some(&mut mapped),
-                ) {
-                    Ok(()) => break,
-                    Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING && attempts < 50 => {
-                        attempts += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            // DO_NOT_WAIT 失败即放弃本次采样：捕获回调线程绝不能阻塞自旋，
+            // GPU 未完成拷贝时由下一次帧回调重新采样
+            context.Map(
+                &staging,
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            )?;
             let base = mapped.pData as *const u8;
             for y in (0..height as usize).step_by(PROBE_STEP) {
                 let row = base.add(y * mapped.RowPitch as usize).cast::<u32>();
@@ -908,7 +953,18 @@ impl Shared {
         let mut dirty: Option<Rect> = None;
         let mut whole = false;
         let mut unknown = false;
-        while let Ok(frame) = pool.TryGetNextFrame() {
+        loop {
+            let frame = match pool.TryGetNextFrame() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    // 设备移除/会话回收类错误视为会话失效，交由复查重建；
+                    // 其余错误（如暂无新帧）属正常路径，直接结束本次回调
+                    if is_session_lost(&error) {
+                        self.session_dead.store(true, Ordering::Release);
+                    }
+                    break;
+                }
+            };
             match frame.DirtyRegions().and_then(|regions| {
                 let mut rects = Vec::new();
                 for index in 0..regions.Size()? {
@@ -956,6 +1012,7 @@ impl Shared {
         {
             let mut latest = lock(&self.latest);
             latest.source = Some(FrameSource::Wgc(frame));
+            latest.frame_at = Some(Instant::now());
             if relevant {
                 latest.sequence += 1;
             }
@@ -1037,6 +1094,26 @@ fn create_device(adapter_luid: u64) -> Result<(ID3D11Device5, ID3D11DeviceContex
     ))
 }
 
+/// 墙钟毫秒数：包含睡眠时长（与单调计时不同），用于识别系统睡眠。
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 判断捕获错误是否表示会话/设备级失效（需要重建），而非暂无可取帧。
+fn is_session_lost(error: &windows62::core::Error) -> bool {
+    const DXGI_ERROR_DEVICE_REMOVED: i32 = 0x887A_0005u32 as i32;
+    const DXGI_ERROR_DEVICE_RESET: i32 = 0x887A_0007u32 as i32;
+    const RPC_E_DISCONNECTED: i32 = 0x8001_0108u32 as i32;
+    const RO_E_CLOSED: i32 = 0x8000_0013u32 as i32;
+    matches!(
+        error.code().0,
+        DXGI_ERROR_DEVICE_REMOVED | DXGI_ERROR_DEVICE_RESET | RPC_E_DISCONNECTED | RO_E_CLOSED
+    )
+}
+
 fn union(a: Rect, b: Rect) -> Rect {
     Rect {
         left: a.left.min(b.left),
@@ -1071,19 +1148,58 @@ fn window_rect(hwnd: HWND) -> Result<RECT, String> {
     Ok(rect)
 }
 
-/// 把屏幕矩形裁剪到悬浮窗所在显示器内；放大镜像素回调只产出屏幕内区域。
-fn monitor_clamped(hwnd: HWND, rect: Rect) -> Option<RECT> {
-    // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
-    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+/// 按需创建 BGRA 纹理：尺寸向上对齐到 `align`，`cpu_read` 时附加 READ 暂存访问。
+fn ensure_bgra_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    usage: D3D11_USAGE,
+    align: u32,
+    cpu_read: bool,
+) -> windows62::core::Result<ID3D11Texture2D> {
+    let align = align.max(1);
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width.div_ceil(align) * align,
+        Height: height.div_ceil(align) * align,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: usage,
+        CPUAccessFlags: if cpu_read {
+            D3D11_CPU_ACCESS_READ.0 as u32
+        } else {
+            0
+        },
+        ..Default::default()
+    };
+    let mut texture = None;
+    // SAFETY: 描述符已初始化，输出 Option 由本次调用初始化并拥有。
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    texture.ok_or_else(windows62::core::Error::empty)
+}
+
+/// 读取显示器边界矩形（桌面坐标）；查询失败时返回 None。
+pub(super) fn monitor_rect(monitor: HMONITOR) -> Option<RECT> {
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    // SAFETY: monitor 来自 MonitorFromWindow，info 是尺寸正确的输出结构。
+    // SAFETY: monitor 由系统调用返回，info 是尺寸正确的输出结构。
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         return None;
     }
-    let bounds = info.rcMonitor;
+    Some(info.rcMonitor)
+}
+
+/// 把屏幕矩形裁剪到悬浮窗所在显示器内；放大镜像素回调只产出屏幕内区域。
+fn monitor_clamped(hwnd: HWND, rect: Rect) -> Option<RECT> {
+    // SAFETY: hwnd 是存活的悬浮窗；该调用只读取其位置。
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let bounds = monitor_rect(monitor)?;
     let clamped = RECT {
         left: rect.left.max(bounds.left),
         top: rect.top.max(bounds.top),

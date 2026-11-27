@@ -1,6 +1,6 @@
 [package]
 name = "EchoMusic-Lyrics-WinIsland"
-version = "1.3.8"
+version = "1.3.9"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -79,3 +79,5 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+# 保留行号级调试信息供 PDB 归档：崩溃日志只有模块+偏移，需要符号才能定位
+debug = 1

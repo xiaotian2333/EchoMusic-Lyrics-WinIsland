@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use once_cell::sync::Lazy;
 use windows::Win32::Globalization::GetUserDefaultLocaleName;
@@ -65,20 +65,28 @@ pub fn init_i18n(config_lang: &str) {
     if target_lang == "auto" {
         target_lang = get_system_lang();
     }
-    I18N.write().unwrap().load(&target_lang);
+    I18N.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .load(&target_lang);
 }
 
 pub fn current_lang() -> String {
-    I18N.read().unwrap().current_lang.clone()
+    I18N.read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .current_lang
+        .clone()
 }
 
 pub fn tr(key: &str) -> String {
-    I18N.read().unwrap().get(key)
+    I18N.read().unwrap_or_else(PoisonError::into_inner).get(key)
 }
 
 /// 返回当前语言的全部翻译（设置页全量下发）
 pub fn all_translations() -> HashMap<String, String> {
-    I18N.read().unwrap().translations.clone()
+    I18N.read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .translations
+        .clone()
 }
 
 fn get_system_lang() -> String {

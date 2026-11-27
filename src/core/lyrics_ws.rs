@@ -1,21 +1,43 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::config::{APP_HOMEPAGE, is_valid_color};
+use crate::core::config::{APP_HOMEPAGE, AppConfig, is_valid_color};
 use crate::core::lyrics::{MusicData, parse_music_data_payload};
 use crate::core::persistence;
 use crate::utils::font::FontManager;
 
 const LYRICS_WS_ADDR: &str = "127.0.0.1:17195";
+const DEFAULT_PLAYER_PROCESS_NAME: &str = "EchoMusic.exe";
 const BIND_RETRY_INITIAL_MS: u64 = 200;
 const BIND_RETRY_MAX_MS: u64 = 2_000;
+/// 并发客户端上限：插件只会建立 1 条连接，上限只为挡住异常/恶意本地进程
+const MAX_CLIENTS: usize = 4;
+/// WebSocket 握手超时：未在时限内完成升级直接断开
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 单条消息上限：封面 base64（5MB 解码上限约 6.8MB 编码）+ 歌词的合理余量
+const MAX_MESSAGE_SIZE: usize = 12 * 1024 * 1024;
+/// 入站静默超时：插件每 10 秒心跳一次，连续 3 次未收到任何消息判定为半开连接
+const IDLE_DISCONNECT: Duration = Duration::from_secs(30);
+const WATCHDOG_TICK: Duration = Duration::from_secs(10);
+/// 远程配置写入禁改字段：字体路径需经本地文件选择器校验。
+const REMOTE_BLOCKED_CONFIG_FIELDS: &[&str] = &["custom_font_path"];
+
+static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
+fn ws_upgrade_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE))
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -66,7 +88,9 @@ pub enum LyricsWsEvent {
     VolumeState {
         volume: f32,
     },
-    ShowMainWindow,
+    ShowMainWindow {
+        process_name: String,
+    },
     PlayModeState {
         mode: String,
     },
@@ -161,15 +185,44 @@ async fn run_server(
                 let Ok((stream, addr)) = accepted else {
                     continue;
                 };
+                if ACTIVE_CLIENTS.load(Ordering::Relaxed) >= MAX_CLIENTS {
+                    log::warn!("歌词 WebSocket 连接数已达上限，拒绝 {}: {}", addr, MAX_CLIENTS);
+                    continue;
+                }
                 clear_stream_inherit(&stream);
                 let client_event_tx = event_tx.clone();
                 let command_rx = command_tx.subscribe();
                 let client_command_tx = command_tx.clone();
                 let client_cancel = cancel.clone();
+                ACTIVE_CLIENTS.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_client(stream, client_event_tx, client_command_tx, command_rx, client_cancel).await {
-                        log::warn!("歌词 WebSocket 客户端 {} 已断开: {}", addr, err);
+                    let result = tokio::time::timeout(
+                        HANDSHAKE_TIMEOUT,
+                        accept_async_with_config(stream, Some(ws_upgrade_config())),
+                    )
+                    .await;
+                    match result {
+                        Ok(Ok(ws_stream)) => {
+                            if let Err(err) = handle_client(
+                                ws_stream,
+                                client_event_tx,
+                                client_command_tx,
+                                command_rx,
+                                client_cancel,
+                            )
+                            .await
+                            {
+                                log::warn!("歌词 WebSocket 客户端 {} 已断开: {}", addr, err);
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            log::warn!("歌词 WebSocket 客户端 {} 握手失败: {}", addr, err);
+                        }
+                        Err(_) => {
+                            log::warn!("歌词 WebSocket 客户端 {} 握手超时", addr);
+                        }
                     }
+                    ACTIVE_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                 });
             }
         }
@@ -246,14 +299,16 @@ fn clear_stream_inherit(stream: &tokio::net::TcpStream) {
 fn clear_stream_inherit(_stream: &tokio::net::TcpStream) {}
 
 async fn handle_client(
-    stream: tokio::net::TcpStream,
+    ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     event_tx: mpsc::UnboundedSender<LyricsWsEvent>,
     command_tx: broadcast::Sender<LyricsWsCommand>,
     mut command_rx: broadcast::Receiver<LyricsWsCommand>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_stream = accept_async(stream).await?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
+    let mut last_activity = Instant::now();
+    let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let _ = event_tx.send(LyricsWsEvent::Connected);
     send_request_track_lyrics(&mut ws_write).await?;
@@ -263,6 +318,12 @@ async fn handle_client(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = watchdog.tick() => {
+                if last_activity.elapsed() > IDLE_DISCONNECT {
+                    log::warn!("歌词 WebSocket 客户端超过 {:?} 无任何消息，判定为半开连接并断开", IDLE_DISCONNECT);
+                    break;
+                }
+            }
             command = command_rx.recv() => {
                 match command {
                     Ok(LyricsWsCommand::RequestTrackLyrics) => {
@@ -322,6 +383,7 @@ async fn handle_client(
                     break;
                 };
                 let message = message?;
+                last_activity = Instant::now();
                 if message.is_close() {
                     break;
                 }
@@ -416,9 +478,7 @@ where
                         let _ = open::that(APP_HOMEPAGE);
                     }
                     Some("open_settings") => {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new(exe).arg("--settings").spawn();
-                        }
+                        crate::window::settings::open_settings_window();
                     }
                     Some("disabled") => {
                         let _ = event_tx.send(LyricsWsEvent::PluginDisabled);
@@ -540,7 +600,15 @@ async fn handle_plugin_command(
             let _ = event_tx.send(LyricsWsEvent::VolumeState { volume });
         }
         "show_main_window" => {
-            let _ = event_tx.send(LyricsWsEvent::ShowMainWindow);
+            let process_name = payload
+                .get("data")
+                .and_then(|d| d.get("process_name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(DEFAULT_PLAYER_PROCESS_NAME)
+                .to_string();
+            let _ = event_tx.send(LyricsWsEvent::ShowMainWindow { process_name });
         }
         "set_play_mode" => {
             let mode = payload
@@ -596,6 +664,10 @@ where
 }
 
 fn apply_config_field(path: &str, value: &Value) {
+    if REMOTE_BLOCKED_CONFIG_FIELDS.contains(&path) {
+        log::warn!("歌词 WebSocket 拒绝远程修改受保护配置字段: {path}");
+        return;
+    }
     if matches!(
         path,
         "lyrics_char_color_unplayed" | "lyrics_char_color_played"
@@ -603,15 +675,23 @@ fn apply_config_field(path: &str, value: &Value) {
     {
         return;
     }
-    let config = persistence::load_config();
-    if let Ok(mut val) = serde_json::to_value(&config)
-        && let Some(obj) = val.as_object_mut()
-    {
-        obj.insert(path.to_string(), value.clone());
-        if let Ok(new_config) = serde_json::from_value(val) {
-            persistence::save_config(&new_config);
+    persistence::with_config_lock(|| {
+        let config = persistence::load_config();
+        if let Ok(mut val) = serde_json::to_value(&config)
+            && let Some(obj) = val.as_object_mut()
+        {
+            if !obj.contains_key(path) {
+                log::warn!("歌词 WebSocket 拒绝未知配置字段: {path}");
+                return;
+            }
+            obj.insert(path.to_string(), value.clone());
+            if let Ok(new_config) = serde_json::from_value::<AppConfig>(val) {
+                persistence::save_config(&new_config.normalized());
+            } else {
+                log::warn!("歌词 WebSocket 配置字段写入类型不合法，已忽略: {path}");
+            }
         }
-    }
+    });
 }
 
 async fn send_command<S>(
@@ -643,6 +723,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn show_main_window_uses_requested_process_name_or_default() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, _) = broadcast::channel(1);
+        let mut ws_write = futures_util::sink::drain();
+
+        for (payload, expected) in [
+            (json!({ "action": "show_main_window" }), "EchoMusic.exe"),
+            (
+                json!({ "action": "show_main_window", "data": {} }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": "  " } }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": 1 } }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": "EchoMusic.exe" } }),
+                "EchoMusic.exe",
+            ),
+            (
+                json!({ "action": "show_main_window", "data": { "process_name": " OtherPlayer.exe " } }),
+                "OtherPlayer.exe",
+            ),
+        ] {
+            let message = json!({ "type": "command", "source": "plugin", "payload": payload });
+            handle_text_message(&message.to_string(), &event_tx, &command_tx, &mut ws_write)
+                .await
+                .unwrap();
+            let event = event_rx.try_recv().unwrap();
+            assert!(matches!(
+                event,
+                LyricsWsEvent::ShowMainWindow { process_name } if process_name == expected
+            ));
+        }
+    }
 
     #[test]
     fn normalize_volume_value_clamps_and_rounds() {

@@ -1,10 +1,28 @@
 import { initColorPicker, isAutoColor, normalizeHex, openColorPicker, repositionColorPicker } from "./color-picker";
+import type { AppConfig, ProcessDockRule, SettingsState } from "./types";
 
-const root = document.querySelector("#app");
+/* 配置字段以 Rust 侧 AppConfig 为契约，这里同时允许按字段名动态访问（表单按字段名驱动）。 */
+type Config = AppConfig & Record<string, any>;
+type NumberSpec = { min: number; max: number; step: number; precision: number };
+type SelectOption = { value: string; label: string };
+
+const SAVE_DEBOUNCE_MS = 300;
+
+const root = document.querySelector<HTMLDivElement>("#app");
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 
-let state = null;
-let config = null;
+const EMPTY_STATE: SettingsState = {
+  config: {} as AppConfig,
+  current_lang: "en",
+  translations: {},
+  monitors: [],
+  app: { version: "", author: "", homepage: "", icon_png: [], icon_dark_png: [] },
+  lyrics_filter_regex_valid: true,
+};
+
+let state: SettingsState = EMPTY_STATE;
+let config: Config = {} as Config;
+let stateLoaded = false;
 let activePage = "general";
 let activeGeneralTab = "appearance";
 let saving = false;
@@ -12,13 +30,15 @@ let saveId = 0;
 let statusText = "";
 let appIconUrl = "";
 let appIconDarkUrl = "";
-let customFontStyle = null;
+let customFontStyle: HTMLStyleElement | null = null;
 let customFontUrl = "";
 let customFontPath = "";
+let saveTimer: number | null = null;
+let pendingExternalState: SettingsState | null = null;
 
 const COLOR_FIELDS = ["lyrics_char_color_unplayed", "lyrics_char_color_played"];
 
-const numberSpecs = {
+const numberSpecs: Record<string, NumberSpec> = {
   non_expanded_scale: { min: 0.5, max: 5, step: 0.05, precision: 2 },
   expanded_scale: { min: 0.5, max: 5, step: 0.05, precision: 2 },
   base_width: { min: 40, max: Number.POSITIVE_INFINITY, step: 5, precision: 0 },
@@ -41,7 +61,7 @@ const numberSpecs = {
   glass_blur: { min: 0, max: 50, step: 1, precision: 0 },
 };
 
-function numberSpec(field) {
+function numberSpec(field: string): NumberSpec | null {
   const spec = numberSpecs[field];
   if (!spec) {
     return null;
@@ -49,23 +69,25 @@ function numberSpec(field) {
   if (field !== "lyrics_scroll_max_width") {
     return spec;
   }
-  const min = Math.max(spec.min, Number(config?.base_width ?? 0) + 35);
+  const min = Math.max(spec.min, Number(config.base_width ?? 0) + 35);
   return { ...spec, min, max: Math.max(spec.max, min) };
 }
 
-function invoke(command, args) {
-  const tauri = window["__TAURI__"];
+function invoke(command: string): Promise<any>;
+function invoke(command: string, args: Record<string, unknown>): Promise<any>;
+function invoke(command: string, args?: Record<string, unknown>): Promise<any> {
+  const tauri = window.__TAURI__;
   if (!tauri?.core?.invoke) {
-    return Promise.reject(new Error("Tauri API unavailable"));
+    return Promise.reject(new Error(tr("tauri_unavailable")));
   }
   return tauri.core.invoke(command, args);
 }
 
-function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function h(value) {
+function h(value: unknown): string {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -73,14 +95,14 @@ function h(value) {
     .replaceAll('"', "&quot;");
 }
 
-function blobUrlFromBytes(iconBytes) {
+function blobUrlFromBytes(iconBytes: unknown): string {
   if (!Array.isArray(iconBytes) || iconBytes.length === 0) {
     return "";
   }
   return URL.createObjectURL(new Blob([new Uint8Array(iconBytes)], { type: "image/png" }));
 }
 
-function bytesFromBase64(b64) {
+function bytesFromBase64(b64: string): Uint8Array {
   const binaryStr = atob(b64);
   const bytes = new Uint8Array(binaryStr.length);
   for (let i = 0; i < binaryStr.length; i++) {
@@ -89,24 +111,25 @@ function bytesFromBase64(b64) {
   return bytes;
 }
 
-function updateAppIconUrls() {
+function updateAppIconUrls(): void {
   if (!appIconUrl) {
-    appIconUrl = blobUrlFromBytes(state?.app?.icon_png);
+    appIconUrl = blobUrlFromBytes(state.app.icon_png);
   }
   if (!appIconDarkUrl) {
-    appIconDarkUrl = blobUrlFromBytes(state?.app?.icon_dark_png);
+    appIconDarkUrl = blobUrlFromBytes(state.app.icon_dark_png);
   }
 }
 
 const colorPickerHooks = {
-  tr,
-  getValue: (field) => config?.[field],
-  onCommit: (field, value) => setField(field, value),
+  tr: (key: string) => tr(key),
+  getValue: (field: string) => config[field],
+  onCommit: (field: string, value: unknown) => setField(field, value),
 };
 
-function applyState(nextState) {
+function applyState(nextState: SettingsState): void {
   state = nextState;
-  config = clone(state.config);
+  config = clone(nextState.config) as Config;
+  stateLoaded = true;
   updateAppIconUrls();
   applyTheme();
   // 面板 DOM 常驻，每次状态刷新都要按当前翻译与配置重建文案
@@ -115,36 +138,36 @@ function applyState(nextState) {
   void loadCustomFont();
 }
 
-function appLogo(className, iconUrl) {
+function appLogo(className: string, iconUrl: string): string {
   if (!iconUrl) {
     return `<div class="${h(className)}">EM</div>`;
   }
   return `<img class="${h(className)}" src="${h(iconUrl)}" alt="EchoMusic" />`;
 }
 
-function themedAppIconUrl() {
+function themedAppIconUrl(): string {
   return resolvedTheme() === "light" ? appIconDarkUrl : appIconUrl;
 }
 
-function tr(key) {
-  return state?.translations?.[key] ?? key;
+function tr(key: string): string {
+  return state.translations[key] ?? key;
 }
 
-function resolvedTheme() {
-  if (config?.settings_theme === "light") {
+function resolvedTheme(): string {
+  if (config.settings_theme === "light") {
     return "light";
   }
-  if (config?.settings_theme === "dark") {
+  if (config.settings_theme === "dark") {
     return "dark";
   }
   return systemTheme.matches ? "light" : "dark";
 }
 
-function applyTheme() {
+function applyTheme(): void {
   document.documentElement.dataset.theme = resolvedTheme();
 }
 
-function setStatus(text) {
+function setStatus(text: string): void {
   statusText = text;
   const node = document.querySelector(".status");
   if (node) {
@@ -152,14 +175,16 @@ function setStatus(text) {
   }
 }
 
-function clampNumber(field, value) {
+function clampNumber(field: string, value: number): number {
   const spec = numberSpec(field);
   if (!spec) {
-    return value;
+    return Number.isFinite(value) ? value : 0;
   }
+  // 非法输入（如粘贴非数字）回退到最小值，避免 NaN 进入配置导致后台反序列化失败
+  const safe = Number.isFinite(value) ? value : spec.min;
   const min = spec.min;
   const max = spec.max;
-  const rounded = Math.round(value / spec.step) * spec.step;
+  const rounded = Math.round(safe / spec.step) * spec.step;
   const clamped = Math.min(Math.max(rounded, min), max);
   if (spec.precision === 0) {
     return Math.round(clamped);
@@ -167,22 +192,33 @@ function clampNumber(field, value) {
   return Number(clamped.toFixed(spec.precision));
 }
 
-function formatNumber(field) {
+function formatNumber(field: string): string {
   const spec = numberSpec(field);
   const value = spec ? clampNumber(field, Number(config[field] ?? 0)) : Number(config[field] ?? 0);
   if (!spec || spec.precision === 0) {
-    return String(Math.round(value));
+    return String(Math.round(Number.isFinite(value) ? value : 0));
   }
-  return value.toFixed(spec.precision);
+  return (Number.isFinite(value) ? value : 0).toFixed(spec.precision);
 }
 
-async function saveConfig() {
+/** 保存前兜底清洗：任何非有限数值都回退到当前已生效值，保证序列化永远合法。 */
+function sanitizeConfig(next: Record<string, any>): void {
+  for (const field of Object.keys(numberSpecs)) {
+    const value = Number(next[field]);
+    if (!Number.isFinite(value)) {
+      next[field] = Number(config[field] ?? numberSpecs[field].min);
+    }
+  }
+}
+
+async function saveConfig(): Promise<void> {
   const currentSaveId = ++saveId;
   saving = true;
   setStatus("");
   const nextConfig = clone(config);
+  sanitizeConfig(nextConfig);
   try {
-    const nextState = await invoke("save_settings_config", { config: nextConfig });
+    const nextState = (await invoke("save_settings_config", { config: nextConfig })) as SettingsState;
     if (currentSaveId !== saveId) {
       return;
     }
@@ -192,13 +228,34 @@ async function saveConfig() {
   } finally {
     if (currentSaveId === saveId) {
       saving = false;
+      if (pendingExternalState) {
+        const pending = pendingExternalState;
+        pendingExternalState = null;
+        applyState(pending);
+      }
     }
   }
 }
 
-function setField(field, value) {
+/** 字段变更的保存防抖：连续调整时合并为一次落盘与重渲染。 */
+function scheduleSave(): void {
+  if (saveTimer !== null) {
+    window.clearTimeout(saveTimer);
+  }
+  saveTimer = window.setTimeout(() => {
+    saveTimer = null;
+    void saveConfig();
+  }, SAVE_DEBOUNCE_MS);
+}
+
+function setField(field: string, value: unknown): void {
   if (numberSpec(field)) {
-    value = clampNumber(field, Number(value));
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      // 非法数值不写入配置，也不触发保存，避免整份配置无法反序列化
+      return;
+    }
+    value = clampNumber(field, parsed);
   }
   if (field === "non_expanded_wheel_volume" && !config.spectrum_wheel_volume) {
     value = false;
@@ -214,30 +271,42 @@ function setField(field, value) {
     );
   }
   render();
-  void saveConfig();
+  scheduleSave();
 }
 
-async function refreshFromCommand(command) {
+async function refreshFromCommand(command: string): Promise<void> {
   setStatus("");
   try {
-    const nextState = await invoke(command);
+    const nextState = (await invoke(command)) as SettingsState;
     applyState(nextState);
   } catch (error) {
     setStatus(String(error));
   }
 }
 
-function navButton(page, label) {
+/** 主进程或其他写入方改了配置：本地正在保存时延后应用，避免覆盖用户输入。 */
+function onExternalState(nextState: SettingsState): void {
+  if (saving) {
+    pendingExternalState = nextState;
+    return;
+  }
+  if (JSON.stringify(nextState.config) === JSON.stringify(config)) {
+    return;
+  }
+  applyState(nextState);
+}
+
+function navButton(page: string, label: string): string {
   const active = activePage === page ? " active" : "";
   return `<button class="nav-button${active}" data-action="page" data-page="${h(page)}">${h(label)}</button>`;
 }
 
-function tabButton(tab, label) {
+function tabButton(tab: string, label: string): string {
   const active = activeGeneralTab === tab ? " active" : "";
   return `<button class="tab-button${active}" data-action="tab" data-tab="${h(tab)}">${h(label)}</button>`;
 }
 
-function section(title, rows) {
+function section(title: string, rows: string[]): string {
   return `
     <section class="section">
       <h2>${h(title)}</h2>
@@ -246,7 +315,7 @@ function section(title, rows) {
   `;
 }
 
-function switchRow(label, field, enabled = true, checkedValue = config[field]) {
+function switchRow(label: string, field: string, enabled = true, checkedValue: unknown = config[field]): string {
   const checked = checkedValue ? "checked" : "";
   const disabled = enabled ? "" : "disabled";
   const dim = enabled ? "" : " disabled";
@@ -259,10 +328,10 @@ function switchRow(label, field, enabled = true, checkedValue = config[field]) {
   `;
 }
 
-function selectRow(label, field, options, enabled = true) {
+function selectRow(label: string, field: string, options: SelectOption[], enabled = true): string {
   const disabled = enabled ? "" : "disabled";
   const dim = enabled ? "" : " disabled";
-  const value = field === "language" && config.language === "auto" ? state.current_lang : config[field];
+  const value = field === "language" && config.language === "auto" ? "auto" : config[field];
   const optionHtml = options
     .map((option) => {
       const selected = String(option.value) === String(value) ? "selected" : "";
@@ -277,8 +346,11 @@ function selectRow(label, field, options, enabled = true) {
   `;
 }
 
-function numberRow(label, field, enabled = true) {
+function numberRow(label: string, field: string, enabled = true): string {
   const spec = numberSpec(field);
+  if (!spec) {
+    return "";
+  }
   const disabled = enabled ? "" : "disabled";
   const dim = enabled ? "" : " disabled";
   return `
@@ -293,7 +365,7 @@ function numberRow(label, field, enabled = true) {
   `;
 }
 
-function textRow(label, field, placeholder, enabled = true, invalid = false) {
+function textRow(label: string, field: string, placeholder: string, enabled = true, invalid = false): string {
   const disabled = enabled ? "" : "disabled";
   const dim = enabled ? "" : " disabled";
   const bad = invalid ? " invalid" : "";
@@ -309,9 +381,9 @@ function textRow(label, field, placeholder, enabled = true, invalid = false) {
   `;
 }
 
-function colorRow(label, field, enabled = true) {
+function colorRow(label: string, field: string, enabled = true): string {
   const raw = String(config[field] ?? "auto");
-  // 非法值按 auto 展示，与后端 normalize_config 的回退保持一致
+  // 非法值按 auto 展示，与后端 normalized 的回退保持一致
   const hex = isAutoColor(raw) ? null : normalizeHex(raw);
   const disabled = enabled ? "" : "disabled";
   const dim = enabled ? "" : " disabled";
@@ -328,7 +400,7 @@ function colorRow(label, field, enabled = true) {
 }
 
 /** auto 状态下的起始颜色：借用另一个颜色项的当前值，避免每次都从同一个默认蓝开始 */
-function colorFieldSeed(field) {
+function colorFieldSeed(field: string): string | null {
   for (const other of COLOR_FIELDS) {
     if (other === field) {
       continue;
@@ -341,15 +413,15 @@ function colorFieldSeed(field) {
   return null;
 }
 
-function infoRow(text) {
+function infoRow(text: string): string {
   return `<div class="row info-row"><span>${h(text)}</span></div>`;
 }
 
-function monitorOptions() {
+function monitorOptions(): SelectOption[] {
   return state.monitors.map((label, index) => ({ value: String(index), label }));
 }
 
-function dockOptions() {
+function dockOptions(): SelectOption[] {
   return [
     { value: "top_center", label: tr("dock_position_top_center") },
     { value: "top_left", label: tr("dock_position_top_left") },
@@ -360,8 +432,8 @@ function dockOptions() {
   ];
 }
 
-function processRulesSection() {
-  const rules = config.process_dock_rules || [];
+function processRulesSection(): string {
+  const rules: ProcessDockRule[] = config.process_dock_rules || [];
   const rows = rules.map((rule, i) => {
     const opts = dockOptions()
       .map((o) => `<option value="${h(o.value)}"${o.value === rule.dock_position ? " selected" : ""}>${h(o.label)}</option>`)
@@ -369,7 +441,7 @@ function processRulesSection() {
     return `
       <div class="row process-rule-row">
         <div class="rule-inputs">
-          <input type="text" data-rule-process="${i}" value="${h(rule.process_name)}" placeholder="e.g. chrome.exe" />
+          <input type="text" data-rule-process="${i}" value="${h(rule.process_name)}" placeholder="${h(tr("process_name_placeholder"))}" />
           <select data-rule-position="${i}">${opts}</select>
         </div>
         <button class="icon-button remove-rule-btn" data-action="remove-rule" data-index="${i}">&times;</button>
@@ -384,7 +456,7 @@ function processRulesSection() {
   return section(tr("section_process_rules"), rows);
 }
 
-function generalAppearance() {
+function generalAppearance(): string {
   return [
     section(tr("section_appearance"), [
       numberRow(tr("non_expanded_scale"), "non_expanded_scale"),
@@ -403,7 +475,7 @@ function generalAppearance() {
   ].join("");
 }
 
-function liquidGlassRows() {
+function liquidGlassRows(): string[] {
   if (
     config.island_style !== "liquid_glass_wgc" &&
     config.island_style !== "liquid_glass_dxgi"
@@ -433,14 +505,14 @@ function liquidGlassRows() {
   return rows;
 }
 
-function glassRows() {
+function glassRows(): string[] {
   if (config.island_style !== "glass") {
     return [];
   }
   return [numberRow(tr("glass_blur"), "glass_blur")];
 }
 
-function generalEffects() {
+function generalEffects(): string {
   return [
     section(tr("section_effects"), [
       selectRow(tr("settings_theme"), "settings_theme", [
@@ -478,7 +550,7 @@ function generalEffects() {
   ].join("");
 }
 
-function generalBehavior() {
+function generalBehavior(): string {
   const rows = [
     switchRow(tr("start_boot"), "auto_start"),
     switchRow(tr("auto_hide"), "auto_hide"),
@@ -502,6 +574,7 @@ function generalBehavior() {
   );
   rows.push(
     selectRow(tr("language"), "language", [
+      { value: "auto", label: tr("language_auto") },
       { value: "en", label: "English" },
       { value: "zh", label: "中文" },
     ]),
@@ -519,7 +592,7 @@ function generalBehavior() {
   ].join("");
 }
 
-function fontPicker() {
+function fontPicker(): string {
   const hasFont = Boolean(config.custom_font_path);
   const label = hasFont ? tr("font_preview_custom") : tr("font_preview_default");
   const path = hasFont ? `<div class="path-text">${h(config.custom_font_path)}</div>` : "";
@@ -541,7 +614,7 @@ function fontPicker() {
   `;
 }
 
-function generalContent() {
+function generalContent(): string {
   if (activeGeneralTab === "effects") {
     return generalEffects();
   }
@@ -551,7 +624,7 @@ function generalContent() {
   return generalAppearance();
 }
 
-function musicContent() {
+function musicContent(): string {
   const lyricsOn = config.show_lyrics;
   const charColorEnabled = lyricsOn && config.lyrics_char_highlight;
   const regexEnabled = lyricsOn && config.lyrics_filter_scope !== "off";
@@ -608,12 +681,12 @@ function musicContent() {
   ].join("");
 }
 
-function aboutContent() {
+function aboutContent(): string {
   return `
     <section class="about-panel">
       ${appLogo("app-mark", themedAppIconUrl())}
       <h2>EchoMusic-Lyrics-WinIsland</h2>
-      <p>Version ${h(state.app.version)}</p>
+      <p>${h(tr("about_version").replace("{version}", state.app.version))}</p>
       <button class="primary-button wide" data-action="check-updates">${h(tr("check_updates_now"))}</button>
       <p>${h(tr("created_by"))} ${h(state.app.author)}</p>
       <button class="link-button" data-action="open-homepage">${h(tr("visit_homepage"))}</button>
@@ -621,7 +694,7 @@ function aboutContent() {
   `;
 }
 
-function pageTitle() {
+function pageTitle(): string {
   if (activePage === "music") {
     return tr("tab_music");
   }
@@ -631,7 +704,7 @@ function pageTitle() {
   return tr("tab_general");
 }
 
-function pageContent() {
+function pageContent(): string {
   if (activePage === "music") {
     return musicContent();
   }
@@ -648,8 +721,8 @@ function pageContent() {
   `;
 }
 
-function render() {
-  if (!root || !state || !config) {
+function render(): void {
+  if (!root || !stateLoaded) {
     return;
   }
   const scrollPos = document.querySelector(".content")?.scrollTop ?? 0;
@@ -691,44 +764,53 @@ function render() {
   });
 }
 
-function handleClick(event) {
-  const button = event.target.closest("[data-action]");
-  if (!button || !root.contains(button)) {
+function handleClick(event: MouseEvent): void {
+  const target = event.target as HTMLElement | null;
+  const button = target?.closest<HTMLElement>("[data-action]");
+  if (!button || !root?.contains(button)) {
     return;
   }
   const action = button.dataset.action;
   if (action === "page") {
-    activePage = button.dataset.page;
+    activePage = button.dataset.page ?? "general";
     render();
   } else if (action === "tab") {
-    activeGeneralTab = button.dataset.tab;
+    activeGeneralTab = button.dataset.tab ?? "appearance";
     render();
   } else if (action === "step") {
     const field = button.dataset.field;
+    if (!field) {
+      return;
+    }
     const delta = Number(button.dataset.delta);
+    if (!Number.isFinite(delta)) {
+      return;
+    }
     setField(field, Number(config[field] ?? 0) + delta);
   } else if (action === "select-font") {
     void refreshFromCommand("select_font_file");
   } else if (action === "reset-font") {
     void refreshFromCommand("reset_font");
   } else if (action === "reset-settings") {
-    void refreshFromCommand("reset_settings");
+    if (window.confirm(tr("reset_defaults_confirm"))) {
+      void refreshFromCommand("reset_settings");
+    }
   } else if (action === "check-updates") {
-    void invoke("check_updates_now").catch((error) => setStatus(String(error)));
+    void invoke("check_updates_now").catch((error: unknown) => setStatus(String(error)));
   } else if (action === "open-homepage") {
-    void invoke("open_homepage").catch((error) => setStatus(String(error)));
+    void invoke("open_homepage").catch((error: unknown) => setStatus(String(error)));
   } else if (action === "add-rule") {
     config.process_dock_rules = config.process_dock_rules || [];
     config.process_dock_rules.push({ process_name: "", dock_position: "top_center" });
     render();
-    void saveConfig();
+    scheduleSave();
   } else if (action === "remove-rule") {
     const index = Number(button.dataset.index);
     config.process_dock_rules = config.process_dock_rules || [];
     if (index >= 0 && index < config.process_dock_rules.length) {
       config.process_dock_rules.splice(index, 1);
       render();
-      void saveConfig();
+      scheduleSave();
     }
   } else if (action === "open-color-picker") {
     const field = button.dataset.colorField;
@@ -743,14 +825,17 @@ function handleClick(event) {
   }
 }
 
-function handleChange(event) {
-  const target = event.target;
-  const field = target?.dataset?.field;
+function handleChange(event: Event): void {
+  const target = event.target as HTMLInputElement | HTMLSelectElement | null;
+  if (!target) {
+    return;
+  }
+  const field = target.dataset.field;
 
   const ruleIdx = target.dataset.ruleProcess ?? target.dataset.rulePosition;
   if (ruleIdx !== undefined) {
     const idx = Number(ruleIdx);
-    const rules = config.process_dock_rules || [];
+    const rules: ProcessDockRule[] = config.process_dock_rules || [];
     if (idx >= 0 && idx < rules.length) {
       if (target.dataset.ruleProcess !== undefined) {
         rules[idx].process_name = target.value;
@@ -758,7 +843,7 @@ function handleChange(event) {
         rules[idx].dock_position = target.value;
       }
       render();
-      void saveConfig();
+      scheduleSave();
     }
     return;
   }
@@ -766,31 +851,33 @@ function handleChange(event) {
   if (!field) {
     return;
   }
-  if (target.type === "checkbox") {
+  if (target instanceof HTMLInputElement && target.type === "checkbox") {
     setField(field, target.checked);
   } else if (target.tagName === "SELECT") {
     const value = field === "monitor_index" ? Number(target.value) : target.value;
     setField(field, value);
-  } else if (target.type === "number") {
+  } else if (target instanceof HTMLInputElement && target.type === "number") {
     setField(field, Number(target.value));
-  } else if (target.type === "text") {
+  } else {
     setField(field, target.value);
   }
 }
 
-function handleKeydown(event) {
-  const target = event.target;
-  if (event.key === "Enter" && target?.dataset?.field) {
+function handleKeydown(event: KeyboardEvent): void {
+  const target = event.target as HTMLElement | null;
+  if (event.key === "Enter" && target?.dataset.field) {
     target.blur();
   }
 }
 
-async function loadBuiltinFont() {
+async function loadBuiltinFont(): Promise<void> {
   try {
-    const b64 = await invoke("get_builtin_font");
-    if (!b64) return;
+    const b64 = (await invoke("get_builtin_font")) as string | null;
+    if (!b64) {
+      return;
+    }
     const bytes = bytesFromBase64(b64);
-    const blob = new Blob([bytes], { type: "font/otf" });
+    const blob = new Blob([bytes as BlobPart], { type: "font/otf" });
     const url = URL.createObjectURL(blob);
     const style = document.createElement("style");
     style.textContent =
@@ -801,15 +888,15 @@ async function loadBuiltinFont() {
   }
 }
 
-function fontMimeFromPath(path) {
+function fontMimeFromPath(path: string): string {
   return path.toLowerCase().endsWith(".ttf") ? "font/ttf" : "font/otf";
 }
 
-function fontFormatFromPath(path) {
+function fontFormatFromPath(path: string): string {
   return path.toLowerCase().endsWith(".ttf") ? "truetype" : "opentype";
 }
 
-function clearCustomFont() {
+function clearCustomFont(): void {
   customFontStyle?.remove();
   customFontStyle = null;
   if (customFontUrl) {
@@ -819,8 +906,8 @@ function clearCustomFont() {
   customFontPath = "";
 }
 
-async function loadCustomFont() {
-  const path = config?.custom_font_path || "";
+async function loadCustomFont(): Promise<void> {
+  const path = config.custom_font_path || "";
   if (!path) {
     clearCustomFont();
     return;
@@ -829,8 +916,8 @@ async function loadCustomFont() {
     return;
   }
   try {
-    const b64 = await invoke("get_custom_font");
-    if (config?.custom_font_path !== path) {
+    const b64 = (await invoke("get_custom_font")) as string | null;
+    if (config.custom_font_path !== path) {
       return;
     }
     if (!b64) {
@@ -838,7 +925,7 @@ async function loadCustomFont() {
       return;
     }
     const bytes = bytesFromBase64(b64);
-    const url = URL.createObjectURL(new Blob([bytes], { type: fontMimeFromPath(path) }));
+    const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: fontMimeFromPath(path) }));
     const style = document.createElement("style");
     style.textContent =
       `@font-face { font-family: "AppCustomFont"; src: url("${url}") format("${fontFormatFromPath(path)}"); font-display: swap; }`;
@@ -848,21 +935,40 @@ async function loadCustomFont() {
     customFontPath = path;
     document.head.appendChild(style);
   } catch (e) {
-    if (config?.custom_font_path === path) {
+    if (config.custom_font_path === path) {
       clearCustomFont();
     }
     console.warn("加载自定义字体失败:", e);
   }
 }
 
-async function load() {
+/** 监听主进程推送的配置变更，保证设置页与真实运行状态一致。 */
+async function listenConfigChanges(): Promise<void> {
+  const listen = window.__TAURI__?.event?.listen;
+  if (!listen) {
+    return;
+  }
+  try {
+    await listen("config-changed", (event) => {
+      const payload = event.payload as SettingsState | undefined;
+      if (payload?.config) {
+        onExternalState(payload);
+      }
+    });
+  } catch (e) {
+    console.warn("Failed to listen config-changed:", e);
+  }
+}
+
+async function load(): Promise<void> {
   if (!root) {
     return;
   }
   root.innerHTML = `<div class="loading">EchoMusic-Lyrics-WinIsland</div>`;
-  loadBuiltinFont();
+  void listenConfigChanges();
+  void loadBuiltinFont();
   try {
-    applyState(await invoke("get_settings_state"));
+    applyState((await invoke("get_settings_state")) as SettingsState);
   } catch (error) {
     root.innerHTML = `<div class="loading error">${h(error)}</div>`;
   }
@@ -870,9 +976,11 @@ async function load() {
 
 /* ── 自定义右键菜单 ── */
 
-let contextTarget = null;
+type TextField = HTMLInputElement | HTMLTextAreaElement;
 
-function buildContextMenu() {
+let contextTarget: TextField | null = null;
+
+function buildContextMenu(): HTMLDivElement {
   const menu = document.createElement("div");
   menu.className = "context-menu";
   menu.dataset.role = "context-menu";
@@ -915,10 +1023,10 @@ function buildContextMenu() {
   return menu;
 }
 
-function showContextMenu(x, y, el) {
+function showContextMenu(x: number, y: number, el: TextField): void {
   hideContextMenu();
   contextTarget = el;
-  const menu = document.querySelector(".context-menu");
+  const menu = document.querySelector<HTMLDivElement>(".context-menu");
   if (!menu) return;
   const btns = menu.querySelectorAll("button");
   if (btns.length >= 2) {
@@ -930,9 +1038,9 @@ function showContextMenu(x, y, el) {
   menu.style.top = y + "px";
 }
 
-function hideContextMenu() {
+function hideContextMenu(): void {
   contextTarget = null;
-  const menu = document.querySelector(".context-menu");
+  const menu = document.querySelector<HTMLDivElement>(".context-menu");
   if (menu) {
     menu.style.display = "none";
   }
@@ -943,18 +1051,19 @@ function hideContextMenu() {
 document.body.appendChild(buildContextMenu());
 
 document.addEventListener("contextmenu", (e) => {
-  const target = e.target;
-  const isInput = target.tagName === "INPUT" || target.tagName === "TEXTAREA";
-  if (isInput && document.body.contains(root)) {
+  const target = e.target as HTMLElement | null;
+  const isInput = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
+  if (isInput && root && document.body.contains(root)) {
     e.preventDefault();
-    showContextMenu(e.clientX, e.clientY, target);
+    showContextMenu(e.clientX, e.clientY, target as TextField);
   } else if (!isInput) {
     e.preventDefault();
   }
 });
 
 document.addEventListener("click", (e) => {
-  if (!e.target.closest(".context-menu")) {
+  const target = e.target as HTMLElement | null;
+  if (!target?.closest(".context-menu")) {
     hideContextMenu();
   }
 });
@@ -977,7 +1086,7 @@ root?.addEventListener("click", handleClick);
 root?.addEventListener("change", handleChange);
 root?.addEventListener("keydown", handleKeydown);
 systemTheme.addEventListener("change", () => {
-  if (config?.settings_theme === "system") {
+  if (config.settings_theme === "system") {
     applyTheme();
     render();
   }

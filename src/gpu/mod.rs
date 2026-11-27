@@ -81,8 +81,14 @@ pub(crate) fn wake() {
     if WAKE_PENDING.swap(true, Ordering::AcqRel) {
         return;
     }
-    if let Some(proxy) = WAKE_PROXY.get() {
-        let _ = proxy.send_event(());
+    let Some(proxy) = WAKE_PROXY.get() else {
+        // 代理尚未注册：回滚挂起标记，保证注册后的第一次唤醒不会被吞
+        WAKE_PENDING.store(false, Ordering::Release);
+        return;
+    };
+    if proxy.send_event(()).is_err() {
+        // 事件循环已退出或代理失效：回滚标记以便后续重试
+        WAKE_PENDING.store(false, Ordering::Release);
     }
 }
 

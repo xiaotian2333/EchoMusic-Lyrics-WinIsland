@@ -2,7 +2,8 @@
 
 ## Language
 
-All code, comments, and commit messages are in **English** unless the project context explicitly requires otherwise.
+Code identifiers and commit messages are in **English**; inline comments and `// SAFETY:`
+rationales are written in **Chinese**, matching the existing sources.
 
 ## General rules
 

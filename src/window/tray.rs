@@ -17,6 +17,7 @@ pub struct TrayManager {
 enum TrayCommand {
     UpdateTheme(bool),
     UpdateVisibilityText(bool),
+    ReloadTexts(bool),
     Shutdown,
 }
 
@@ -64,6 +65,10 @@ impl TrayManager {
         let _ = self
             .command_tx
             .send(TrayCommand::UpdateVisibilityText(visible));
+    }
+
+    pub fn reload_texts(&self, visible: bool) {
+        let _ = self.command_tx.send(TrayCommand::ReloadTexts(visible));
     }
 
     pub fn try_recv_action(&self) -> Option<TrayAction> {
@@ -124,6 +129,13 @@ impl TrayThreadState {
         }
     }
 
+    fn reload_texts(&self, visible: bool) {
+        self.update_item_text(visible);
+        self.settings_item.set_text(tr("tray_settings"));
+        self.restart_item.set_text(tr("tray_restart"));
+        self.quit_item.set_text(tr("tray_exit"));
+    }
+
     fn action_from_id(&self, id: tray_icon::menu::MenuId) -> Option<TrayAction> {
         if id == self.toggle_item.id() {
             Some(TrayAction::ToggleVisibility)
@@ -182,6 +194,7 @@ fn handle_tray_commands(
         match command_rx.try_recv() {
             Ok(TrayCommand::UpdateTheme(is_light)) => state.update_theme(is_light),
             Ok(TrayCommand::UpdateVisibilityText(visible)) => state.update_item_text(visible),
+            Ok(TrayCommand::ReloadTexts(visible)) => state.reload_texts(visible),
             Ok(TrayCommand::Shutdown) => return TrayThreadControl::Shutdown,
             Err(TryRecvError::Empty) => return TrayThreadControl::Continue,
             Err(TryRecvError::Disconnected) => return TrayThreadControl::Shutdown,

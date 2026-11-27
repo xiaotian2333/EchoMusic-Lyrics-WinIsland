@@ -41,7 +41,24 @@ const CACHE_LIMIT: usize = 50;
 
 thread_local! {
     static SPECTRUM_CACHE: RefCell<HashMap<String, Option<Image>>> = RefCell::new(HashMap::new());
-    static VIZ_HEIGHTS: RefCell<[f32; 6]> = const { RefCell::new([3.0; 6]) };
+    /// 两套高度状态：迷你态与展开态各自独立，避免展开过渡期两个实例同时推进
+    static VIZ_HEIGHTS: RefCell<[[f32; 6]; 2]> = const { RefCell::new([[3.0; 6], [3.0; 6]]) };
+}
+
+/// 频谱高度状态的归属槽位。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VizSlot {
+    Mini,
+    Expanded,
+}
+
+impl VizSlot {
+    fn index(self) -> usize {
+        match self {
+            Self::Mini => 0,
+            Self::Expanded => 1,
+        }
+    }
 }
 
 /// 频谱条的填充来源。
@@ -64,6 +81,9 @@ pub struct DrawVisualizerParams<'a> {
     pub w_scale: f32,
     pub h_scale: f32,
     pub smooth_factors: (f32, f32),
+    /// 帧时间倍数（以 60FPS 为 1.0），把按帧调参的平滑因子换算为时间无关
+    pub dt: f32,
+    pub slot: VizSlot,
 }
 
 /// 当前曲目的频谱填充；有封面时用封面主色网格，否则用默认配色。
@@ -99,15 +119,21 @@ pub fn draw_visualizer(params: DrawVisualizerParams<'_>) {
         w_scale,
         h_scale,
         smooth_factors,
+        dt,
+        slot,
     } = params;
 
     let (rise, fall) = smooth_factors;
+    // 平滑因子按帧调参（60FPS 基准），按 dt 做指数归一化保证不同刷新率手感一致
+    let dt = dt.max(0.01);
+    let rise = 1.0 - (1.0 - rise).powf(dt);
+    let fall = 1.0 - (1.0 - fall).powf(dt);
     let bar_count = 6;
     let bar_w = 3.0 * w_scale;
     let spacing = 2.0 * w_scale;
     let max_h = 28.0 * h_scale;
     VIZ_HEIGHTS.with(|h_cell| {
-        let mut heights = h_cell.borrow_mut();
+        let mut heights = h_cell.borrow_mut()[slot.index()];
         for i in 0..bar_count {
             let target = if is_playing {
                 (spectrum[i] * max_h).max(3.0 * h_scale)
@@ -463,7 +489,7 @@ fn srgb(color: Lab) -> Color {
 mod tests {
     use super::{
         DrawVisualizerParams, GRID_COLUMNS, GRID_ROWS, Lab, SPECTRUM_IMAGE_SIZE, SpectrumFill,
-        default_spectrum_fill, dominant_color, draw_visualizer, lightness_floor, oklab,
+        VizSlot, default_spectrum_fill, dominant_color, draw_visualizer, lightness_floor, oklab,
         spectrum_image, srgb,
     };
     use skia_safe::{
@@ -620,6 +646,8 @@ mod tests {
                 w_scale: 1.0,
                 h_scale: 1.0,
                 smooth_factors: (0.6, 0.08),
+                dt: 1.0,
+                slot: VizSlot::Mini,
             });
             let pixels = read_all(&surface.image_snapshot(), 64);
             assert!(

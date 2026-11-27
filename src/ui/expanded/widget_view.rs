@@ -188,14 +188,7 @@ pub fn draw_widget_page(
         return false;
     }
 
-    let raw_pos = if media.is_playing {
-        media
-            .position_ms
-            .saturating_add(media.last_update.elapsed().as_millis() as u64)
-    } else {
-        media.position_ms
-    };
-    let current_pos = (raw_pos as i64 + (lyrics_delay * 1000.0) as i64).max(0) as u64;
+    let current_pos = media.effective_position_ms((lyrics_delay * 1000.0) as i64);
 
     let Some(current_idx) = current_lyric_index(lyrics, current_pos) else {
         return false;
@@ -335,7 +328,7 @@ pub fn draw_widget_page(
             && !is_old_current
             && let Some(chars) = lyrics[raw_idx].characters.as_ref()
         {
-            let current_pos = (raw_pos as i64 + (lyrics_delay * 1000.0) as i64).max(0) as u64;
+            let current_pos = media.effective_position_ms((lyrics_delay * 1000.0) as i64);
             let char_idx = current_character_index(chars, current_pos);
             if let Some(char_idx) = char_idx {
                 let char_widths = chars

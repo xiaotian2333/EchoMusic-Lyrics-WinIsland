@@ -4,9 +4,10 @@ use once_cell::sync::Lazy;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::UI::WindowsAndMessaging::{
     IDOK, IDYES, MB_ICONINFORMATION, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
 };
@@ -87,6 +88,7 @@ enum UpdateCheckError {
 }
 
 pub fn start_update_checker() {
+    start_update_request_watcher();
     tokio::spawn(async move {
         let mut last_check = tokio::time::Instant::now();
 
@@ -126,6 +128,40 @@ pub fn check_for_updates_now() {
 
 pub fn take_exit_requested() -> bool {
     UPDATE_EXIT_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+fn update_request_path() -> Option<PathBuf> {
+    crate::core::persistence::get_config_path()
+        .parent()
+        .map(|dir| dir.join("update_request"))
+}
+
+/// 设置进程跨进程请求主进程执行一次手动更新检查。
+/// 主进程是唯一负责下载、替换与重启编排的一方，设置进程只投递信号文件。
+pub fn request_update_now() {
+    let Some(path) = update_request_path() else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_default();
+    let _ = fs::write(&path, stamp);
+}
+
+/// 主进程侧信号文件轮询：设置进程投递 update_request 后由这里消费。
+fn start_update_request_watcher() {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let Some(path) = update_request_path() else {
+                continue;
+            };
+            if fs::remove_file(&path).is_ok() {
+                check_for_updates_now();
+            }
+        }
+    });
 }
 
 async fn do_manual_check() {
@@ -370,13 +406,19 @@ async fn perform_update(candidate: UpdateCandidate) {
     let script = format!(
         "Start-Sleep -Seconds 1; \
          while (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 100 }}; \
-         Move-Item -Path '{}' -Destination '{}' -Force; \
+         for ($i = 0; $i -lt 150; $i++) {{ \
+           try {{ Move-Item -Path '{}' -Destination '{}' -Force -ErrorAction Stop; break }} \
+           catch {{ Start-Sleep -Milliseconds 100 }} \
+         }}; \
          Start-Process -FilePath '{}'",
         pid,
         ps_escape(&new_exe_str),
         ps_escape(&current_exe_str),
         ps_escape(&current_exe_str)
     );
+
+    // 主进程是替换目标：先请求设置窗口退出，避免同 exe 进程占用文件导致 Move 失败
+    crate::window::settings::close_settings_window();
 
     let _ = Command::new("powershell")
         .args(["-WindowStyle", "Hidden", "-Command", &script])

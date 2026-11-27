@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
+// 仅内嵌字体启用时使用；仓库不含 font.otf（见 build.rs），CI 上该 cfg 未设置
+#[cfg(has_builtin_font)]
 use once_cell::sync::Lazy;
 use skia_safe::{
     Canvas, Font, FontMgr, FontStyle, FourByteTag, Paint, Typeface,
@@ -38,6 +40,9 @@ thread_local! {
     static TEXT_CACHE: RefCell<TextCacheMap> = RefCell::new(HashMap::new());
     static CUSTOM_TYPEFACE: RefCell<Option<(String, Typeface)>> = const { RefCell::new(None) };
     static WEIGHT_CLONE_CACHE: RefCell<HashMap<(u32, i32), Typeface>> = RefCell::new(HashMap::new());
+    /// 自定义字体路径快照：渲染热路径禁止读盘解析配置，
+    /// 快照由 refresh_custom_font 作为唯一失效钩子维护（None 表示尚未初始化）
+    static CUSTOM_FONT_PATH_SNAPSHOT: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
 }
 
 #[cfg(has_builtin_font)]
@@ -92,32 +97,38 @@ pub fn can_load_font_file(path: &str) -> bool {
     load_typeface_from_path(path).is_some()
 }
 
+fn current_custom_font_path() -> Option<String> {
+    CUSTOM_FONT_PATH_SNAPSHOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(load_config().custom_font_path.clone());
+        }
+        slot.as_ref().and_then(|path| path.clone())
+    })
+}
+
 pub fn get_custom_font_data() -> Option<Vec<u8>> {
-    let path = load_config().custom_font_path?;
+    let path = current_custom_font_path()?;
     let data = std::fs::read(path).ok()?;
     load_typeface_from_data(&data)?;
     Some(data)
 }
 
 fn get_custom_typeface() -> Option<Typeface> {
-    let config = load_config();
-    if let Some(path) = config.custom_font_path {
-        CUSTOM_TYPEFACE.with(|cache| {
-            let mut cache_mut = cache.borrow_mut();
-            if let Some((ref cached_path, ref tf)) = *cache_mut
-                && cached_path == &path
-            {
-                return Some(tf.clone());
-            }
-            if let Some(tf) = load_typeface_from_path(&path) {
-                *cache_mut = Some((path, tf.clone()));
-                return Some(tf);
-            }
-            None
-        })
-    } else {
+    let path = current_custom_font_path()?;
+    CUSTOM_TYPEFACE.with(|cache| {
+        let mut cache_mut = cache.borrow_mut();
+        if let Some((ref cached_path, ref tf)) = *cache_mut
+            && cached_path == &path
+        {
+            return Some(tf.clone());
+        }
+        if let Some(tf) = load_typeface_from_path(&path) {
+            *cache_mut = Some((path, tf.clone()));
+            return Some(tf);
+        }
         None
-    }
+    })
 }
 
 /// 获取编译时内嵌的字体原始字节数据。
@@ -363,6 +374,11 @@ impl FontManager {
     }
 
     pub fn refresh_custom_font(&self) {
+        // 路径快照以本函数为唯一失效钩子：先重新读一次配置刷新快照，
+        // 再清空所有字体缓存
+        CUSTOM_FONT_PATH_SNAPSHOT.with(|slot| {
+            *slot.borrow_mut() = Some(load_config().custom_font_path.clone());
+        });
         CUSTOM_TYPEFACE.with(|cache| {
             *cache.borrow_mut() = None;
         });

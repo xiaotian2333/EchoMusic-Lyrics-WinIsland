@@ -323,6 +323,14 @@ input:focus {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* 键盘导航焦点：鼠标点击不触发，仅在 Tab 聚焦时显示 */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .switch-row {
   grid-template-columns: minmax(150px, 1fr) 42px;
 }
@@ -783,7 +791,7 @@ input:focus {
   white-space: nowrap;
 }
 
-@media (max-width: 620px) {
+@media (max-width: 760px) {
   .settings-shell {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);

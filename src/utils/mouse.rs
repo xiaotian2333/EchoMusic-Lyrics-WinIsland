@@ -18,6 +18,11 @@ pub fn get_global_cursor_pos() -> (i32, i32) {
     (point.x, point.y)
 }
 
+/// 点是否落在以 (cx, cy) 为圆心、`radius` 为半径的圆内。
+pub fn is_point_in_circle(px: f64, py: f64, cx: f64, cy: f64, radius: f64) -> bool {
+    (px - cx).powi(2) + (py - cy).powi(2) <= radius.powi(2)
+}
+
 pub fn is_point_in_rect(px: f64, py: f64, rx: f64, ry: f64, rw: f64, rh: f64) -> bool {
     px >= rx && px <= rx + rw && py >= ry && py <= ry + rh
 }

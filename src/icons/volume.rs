@@ -1,4 +1,4 @@
-use skia_safe::{Canvas, Color, Paint, Path};
+use skia_safe::{Canvas, Color, Paint};
 
 // 音量图标 4 档 path（移植自上游 WinIsland），按音量三等分选择档位
 const MUTED_PATH: &str = "M9.571,0.000 L9.893,0.036 L10.232,0.196 L10.500,0.500 L10.643,1.018 L10.643,10.196 L4.643,4.214 L8.696,0.393 L9.196,0.071 Z M-1.161,0.232 L-0.857,0.268 L-0.661,0.375 L14.714,15.732 L14.839,15.929 L14.893,16.250 L14.839,16.482 L14.661,16.732 L14.321,16.893 L14.018,16.875 L13.768,16.750 L-1.643,1.357 L-1.786,0.964 L-1.732,0.643 L-1.482,0.339 Z M0.393,4.875 L10.589,15.036 L10.518,15.268 L10.321,15.518 L9.964,15.714 L9.429,15.750 L9.107,15.661 L8.786,15.482 L4.554,11.518 L1.571,11.500 L0.893,11.321 L0.411,10.946 L0.107,10.375 L0.000,9.696 L0.018,5.857 L0.179,5.214 Z";
@@ -31,7 +31,7 @@ pub fn draw_volume_icon(
     paint.set_color(Color::from_argb(alpha, color.r(), color.g(), color.b()));
     paint.set_style(skia_safe::paint::Style::Fill);
 
-    if let Some(path) = Path::from_svg(path_data) {
+    if let Some(path) = super::cached_svg_path(path_data) {
         canvas.save();
         canvas.translate((cx, cy));
         let s = size / 25.75;

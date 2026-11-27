@@ -4,20 +4,17 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde::Serialize;
+use tauri::Emitter;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
 use windows::core::w;
 
-use crate::core::config::{
-    APP_AUTHOR, APP_HOMEPAGE, APP_VERSION, AppConfig, ISLAND_STYLE_LIQUID_GLASS_DXGI,
-    ISLAND_STYLE_LIQUID_GLASS_WGC, is_valid_color, normalize_island_style,
-};
-use crate::core::i18n::{all_translations, current_lang, init_i18n};
-use crate::core::persistence::{load_config, save_config};
-use crate::utils::autostart::set_autostart;
+use crate::core::config::{APP_AUTHOR, APP_HOMEPAGE, APP_VERSION, AppConfig};
+use crate::core::i18n::{all_translations, current_lang, init_i18n, tr};
+use crate::core::persistence::{load_config, save_config, with_config_lock};
 use crate::utils::font::{FontManager, can_load_font_file};
 
-const SETTINGS_TITLE: &str = "EchoMusic-Lyrics-WinIsland Settings";
+pub(crate) const SETTINGS_TITLE: &str = "EchoMusic-Lyrics-WinIsland Settings";
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../resources/icon.png");
 const APP_ICON_DARK_PNG: &[u8] = include_bytes!("../../../resources/icon-dark.png");
 
@@ -46,53 +43,71 @@ fn get_settings_state() -> Result<SettingsState, String> {
 }
 
 #[tauri::command]
-fn save_settings_config(mut config: AppConfig) -> Result<SettingsState, String> {
-    let old_config = load_config();
-    normalize_config(&mut config);
-    apply_config_side_effects(&old_config, &config);
-    save_config(&config);
-    Ok(build_state(config))
+fn save_settings_config(config: AppConfig) -> Result<SettingsState, String> {
+    let state = with_config_lock(|| {
+        let old_config = load_config();
+        let config = config.normalized();
+        apply_config_side_effects(&old_config, &config);
+        save_config(&config);
+        config
+    });
+    Ok(build_state(state))
 }
 
 #[tauri::command]
 fn reset_settings() -> Result<SettingsState, String> {
-    let config = AppConfig::default();
+    let config = with_config_lock(|| {
+        let config = AppConfig::default().normalized();
+        save_config(&config);
+        config
+    });
     init_i18n(&config.language);
     FontManager::global().refresh_custom_font();
-    save_config(&config);
     Ok(build_state(config))
 }
 
 #[tauri::command]
-fn select_font_file() -> Result<SettingsState, String> {
-    let mut config = load_config();
-    if let Some(path) = rfd::FileDialog::new()
+async fn select_font_file() -> Result<SettingsState, String> {
+    let picked = rfd::AsyncFileDialog::new()
         .add_filter("Fonts", &["ttf", "otf"])
         .pick_file()
-    {
-        let path = path.to_string_lossy().into_owned();
-        if !can_load_font_file(&path) {
-            return Err("无法加载所选字体文件".to_string());
-        }
-        config.custom_font_path = Some(path);
-        FontManager::global().refresh_custom_font();
-        save_config(&config);
+        .await;
+    let Some(picked) = picked else {
+        return Ok(build_state(load_config()));
+    };
+    let path = picked.path().to_string_lossy().into_owned();
+    if !can_load_font_file(&path) {
+        return Err(tr("font_load_failed"));
     }
+    let config = with_config_lock(|| {
+        let mut config = load_config();
+        config.custom_font_path = Some(path);
+        let config = config.normalized();
+        save_config(&config);
+        config
+    });
+    FontManager::global().refresh_custom_font();
     Ok(build_state(config))
 }
 
 #[tauri::command]
 fn reset_font() -> Result<SettingsState, String> {
-    let mut config = load_config();
-    config.custom_font_path = None;
+    let config = with_config_lock(|| {
+        let mut config = load_config();
+        config.custom_font_path = None;
+        let config = config.normalized();
+        save_config(&config);
+        config
+    });
     FontManager::global().refresh_custom_font();
-    save_config(&config);
     Ok(build_state(config))
 }
 
 #[tauri::command]
 fn check_updates_now() -> Result<(), String> {
-    crate::utils::updater::check_for_updates_now();
+    // 更新检查与安装统一由主进程编排：设置进程只投递请求信号，
+    // 避免设置进程自身成为替换目标的占用者
+    crate::utils::updater::request_update_now();
     Ok(())
 }
 
@@ -118,7 +133,9 @@ pub fn run_settings(config: AppConfig) {
 
     tauri::Builder::default()
         .setup(|app| {
-            watch_main_instance(app.handle().clone());
+            let handle = app.handle().clone();
+            watch_main_instance(handle.clone());
+            watch_config_changes(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -140,6 +157,17 @@ pub fn bring_settings_to_front() {
     crate::utils::win32::bring_window_to_front(SETTINGS_TITLE);
 }
 
+pub(crate) fn close_settings_window() {
+    crate::utils::win32::close_window(SETTINGS_TITLE);
+}
+
+/// 以独立进程打开设置窗口（设置窗口与主进程各自持有互斥体，互不阻塞）。
+pub(crate) fn open_settings_window() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).arg("--settings").spawn();
+    }
+}
+
 fn build_state(config: AppConfig) -> SettingsState {
     SettingsState {
         lyrics_filter_regex_valid: regex::Regex::new(&config.lyrics_filter_regex).is_ok(),
@@ -157,92 +185,41 @@ fn build_state(config: AppConfig) -> SettingsState {
     }
 }
 
-fn normalize_config(config: &mut AppConfig) {
-    normalize_island_style(&mut config.island_style);
-    config.non_expanded_scale = round_to(config.non_expanded_scale, 0.01).clamp(0.5, 5.0);
-    config.expanded_scale = round_to(config.expanded_scale, 0.01).clamp(0.5, 5.0);
-    config.base_width = config.base_width.max(40.0);
-    config.base_height = config.base_height.max(15.0);
-    config.expanded_width = config.expanded_width.max(200.0);
-    config.expanded_height = config.expanded_height.max(100.0);
-    config.liquid_glass_blur = config.liquid_glass_blur.clamp(0.0, 30.0);
-    config.liquid_glass_refraction = config.liquid_glass_refraction.clamp(0.0, 400.0);
-    config.liquid_glass_dispersion = config.liquid_glass_dispersion.clamp(0.0, 100.0);
-    config.liquid_glass_tint = config.liquid_glass_tint.clamp(0.0, 200.0);
-    config.glass_blur = config.glass_blur.clamp(0.0, 50.0);
-    if !matches!(
-        config.lyrics_transition_animation.as_str(),
-        "blur" | "slide" | "fade"
-    ) {
-        config.lyrics_transition_animation = AppConfig::default().lyrics_transition_animation;
-    }
-    config.font_size = config.font_size.clamp(0.0, 30.0);
-    config.auto_hide_delay = config.auto_hide_delay.clamp(1.0, 60.0);
-    config.hover_to_hide_distance = config.hover_to_hide_distance.clamp(50.0, 300.0);
-    config.hover_to_hide_delay = round_to(config.hover_to_hide_delay, 0.1).clamp(0.2, 3.0);
-    config.update_check_interval = config.update_check_interval.clamp(1.0, 24.0);
-    config.lyrics_delay = round_to_f64(config.lyrics_delay, 0.1).clamp(-10.0, 10.0);
-    if !config.spectrum_wheel_volume {
-        config.non_expanded_wheel_volume = false;
-    }
-    let lyrics_scroll_min_width = (config.base_width + 35.0).max(100.0);
-    config.lyrics_scroll_max_width = config.lyrics_scroll_max_width.clamp(
-        lyrics_scroll_min_width,
-        500.0_f32.max(lyrics_scroll_min_width),
-    );
-
-    if !matches!(config.language.as_str(), "auto" | "en" | "zh") {
-        config.language = AppConfig::default().language;
-    }
-    if !matches!(config.settings_theme.as_str(), "system" | "light" | "dark") {
-        config.settings_theme = AppConfig::default().settings_theme;
-    }
-    if !matches!(
-        config.island_style.as_str(),
-        "default"
-            | "glass"
-            | "mica"
-            | "dynamic"
-            | ISLAND_STYLE_LIQUID_GLASS_WGC
-            | ISLAND_STYLE_LIQUID_GLASS_DXGI
-    ) {
-        config.island_style = AppConfig::default().island_style;
-    }
-    if !matches!(config.mini_cover_shape.as_str(), "square" | "circle") {
-        config.mini_cover_shape = AppConfig::default().mini_cover_shape;
-    }
-    if !matches!(config.expanded_cover_shape.as_str(), "square" | "circle") {
-        config.expanded_cover_shape = AppConfig::default().expanded_cover_shape;
-    }
-
-    if !is_valid_color(&config.lyrics_char_color_unplayed) {
-        config.lyrics_char_color_unplayed = AppConfig::default().lyrics_char_color_unplayed;
-    }
-    if !is_valid_color(&config.lyrics_char_color_played) {
-        config.lyrics_char_color_played = AppConfig::default().lyrics_char_color_played;
-    }
-}
-
-fn round_to(value: f32, step: f32) -> f32 {
-    (value / step).round() * step
-}
-
-fn round_to_f64(value: f64, step: f64) -> f64 {
-    (value / step).round() * step
-}
-
 fn apply_config_side_effects(old_config: &AppConfig, config: &AppConfig) {
     if old_config.language != config.language {
         init_i18n(&config.language);
     }
-    if old_config.auto_start != config.auto_start
-        && let Err(err) = set_autostart(config.auto_start)
-    {
-        log::warn!("EchoMusic-Lyrics-WinIsland: failed to update autostart: {err}");
-    }
     if old_config.custom_font_path != config.custom_font_path {
         FontManager::global().refresh_custom_font();
     }
+    // 开机自启的注册表副作用统一由主进程配置热重载执行，设置进程只负责落盘
+}
+
+fn watch_config_changes(app_handle: tauri::AppHandle) {
+    thread::spawn(move || {
+        let mut initialized = false;
+        let mut last_mtime = None;
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            if !main_instance_exists() {
+                break;
+            }
+            // 先比较文件修改时间，未变化时跳过整份状态构建（图标数据与显示器枚举开销不小）
+            let mtime = std::fs::metadata(crate::core::persistence::get_config_path())
+                .and_then(|meta| meta.modified())
+                .ok();
+            if initialized && mtime == last_mtime {
+                continue;
+            }
+            last_mtime = mtime;
+            if !initialized {
+                initialized = true;
+                continue;
+            }
+            // 主进程或 WebSocket 通道改动了配置，推送全量状态让设置页保持同步
+            let _ = app_handle.emit("config-changed", &build_state(load_config()));
+        }
+    });
 }
 
 fn watch_main_instance(app_handle: tauri::AppHandle) {
@@ -319,7 +296,9 @@ fn get_monitor_list() -> Vec<String> {
                 } else {
                     name.clone()
                 };
-                label = format!("Display {active_count}: {label}");
+                label = tr("monitor_label")
+                    .replace("{index}", &active_count.to_string())
+                    .replace("{name}", &label);
                 monitors.push(label);
             }
 
@@ -328,7 +307,7 @@ fn get_monitor_list() -> Vec<String> {
     }
 
     if monitors.is_empty() {
-        monitors.push("Primary".to_string());
+        monitors.push(tr("monitor_primary"));
     }
 
     monitors

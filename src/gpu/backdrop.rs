@@ -544,11 +544,13 @@ impl LuminanceSampler {
     /// 映射回读缓冲，按步进取样计算 BT.601 平均亮度后解除映射。
     fn resolve(&mut self) {
         let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: 围栏已确认拷贝完成；空 RANGE 表示只读映射。
-        if let Err(error) = unsafe {
-            self.readback
-                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut data))
-        } {
+        // READBACK 纹理的 Map 必须传显式有效范围（空 range 属规范 UB）
+        let read_range = D3D12_RANGE {
+            Begin: 0,
+            End: (self.row_pitch as usize * self.height as usize),
+        };
+        // SAFETY: 围栏已确认拷贝完成；范围覆盖整个回读缓冲。
+        if let Err(error) = unsafe { self.readback.Map(0, Some(&read_range), Some(&mut data)) } {
             log::warn!("亮度回读缓冲映射失败，采样停用: {error}");
             self.broken = true;
             return;
@@ -565,8 +567,7 @@ impl LuminanceSampler {
                         .extend_from_slice(std::slice::from_raw_parts(pixel, 4));
                 }
             }
-            self.readback
-                .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            self.readback.Unmap(0, Some(&read_range));
         }
         self.luminance = Some(average_luminance_bgra(&self.scratch));
     }

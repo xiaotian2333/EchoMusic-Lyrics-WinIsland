@@ -112,6 +112,12 @@ jobs:
       run: |
         choco install ninja
 
+    - name: Lint
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    - name: Test
+      run: cargo test --workspace
+
     - name: Build Release
       run: cargo build --release --verbose --target ${{ env.BUILD_TARGET }}
 
@@ -121,6 +127,17 @@ jobs:
         $source = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland.exe"
         $target = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}.exe"
         Copy-Item $source $target -Force
+
+    - name: Package debug symbols
+      shell: pwsh
+      run: |
+        $pdb = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland.pdb"
+        $zip = "target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}-symbols.zip"
+        if (Test-Path $pdb) {
+          Compress-Archive -Path $pdb -DestinationPath $zip -Force
+        } else {
+          Write-Host "PDB not found, skip symbol package"
+        }
 
     - name: Generate release notes
       shell: pwsh
@@ -159,5 +176,6 @@ jobs:
         body_path: release_notes.md
         files: |
           target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}.exe
+          target/${{ env.BUILD_TARGET }}/release/EchoMusic-Lyrics-WinIsland-${{ env.BUILD_ARCH }}-symbols.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

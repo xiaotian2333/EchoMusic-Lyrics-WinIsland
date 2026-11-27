@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "EchoMusic-Lyrics-WinIsland",
-  "version": "1.0.0",
   "identifier": "io.github.xiaotian2333.echomusic-lyrics-winisland",
   "build": {
     "frontendDist": "settings-ui/dist"
@@ -22,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {

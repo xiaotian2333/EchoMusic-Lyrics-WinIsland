@@ -286,8 +286,8 @@ fn handle_ws_event(
             state.play_mode = mode;
             let _ = info_tx.send(state.clone());
         }
-        LyricsWsEvent::ShowMainWindow => {
-            show_echomusic_main_window();
+        LyricsWsEvent::ShowMainWindow { process_name } => {
+            show_player_main_window(&process_name);
         }
         LyricsWsEvent::PluginDisabled => {
             // 已在 ws_media_loop 中处理，不会到达此处
@@ -295,10 +295,10 @@ fn handle_ws_event(
     }
 }
 
-fn show_echomusic_main_window() {
-    let hwnds = crate::utils::process::find_visible_windows_by_process_name("EchoMusic.exe");
+fn show_player_main_window(process_name: &str) {
+    let hwnds = crate::utils::process::find_visible_windows_by_process_name(process_name);
     if hwnds.is_empty() {
-        log::debug!("未找到可抬起的 EchoMusic.exe 可见窗口");
+        log::debug!("未找到可抬起的 {process_name:?} 可见窗口");
         return;
     }
     for hwnd in hwnds {

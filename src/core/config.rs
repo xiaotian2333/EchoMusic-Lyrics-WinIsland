@@ -451,6 +451,118 @@ pub fn is_valid_color(s: &str) -> bool {
     hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+fn finite_or_f64(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
+}
+
+fn round_to(value: f32, step: f32) -> f32 {
+    (value / step).round() * step
+}
+
+fn round_to_f64(value: f64, step: f64) -> f64 {
+    (value / step).round() * step
+}
+
+impl AppConfig {
+    /// 配置归一化的唯一实现：磁盘加载、设置进程保存与 WebSocket 远程写入
+    /// 都必须经过这里，保证越界值在任何写入路径上都被钳制到合法区间。
+    pub fn normalized(mut self) -> Self {
+        let default = AppConfig::default();
+        self.non_expanded_scale = round_to(
+            finite_or(self.non_expanded_scale, default.non_expanded_scale),
+            0.01,
+        )
+        .clamp(0.5, 5.0);
+        self.expanded_scale =
+            round_to(finite_or(self.expanded_scale, default.expanded_scale), 0.01).clamp(0.5, 5.0);
+        self.base_width = finite_or(self.base_width, default.base_width).max(40.0);
+        self.base_height = finite_or(self.base_height, default.base_height).max(15.0);
+        self.expanded_width = finite_or(self.expanded_width, default.expanded_width).max(200.0);
+        self.expanded_height = finite_or(self.expanded_height, default.expanded_height).max(100.0);
+        self.liquid_glass_blur =
+            finite_or(self.liquid_glass_blur, default.liquid_glass_blur).clamp(0.0, 30.0);
+        self.liquid_glass_refraction = finite_or(
+            self.liquid_glass_refraction,
+            default.liquid_glass_refraction,
+        )
+        .clamp(0.0, 400.0);
+        self.liquid_glass_dispersion = finite_or(
+            self.liquid_glass_dispersion,
+            default.liquid_glass_dispersion,
+        )
+        .clamp(0.0, 100.0);
+        self.liquid_glass_tint =
+            finite_or(self.liquid_glass_tint, default.liquid_glass_tint).clamp(0.0, 200.0);
+        self.glass_blur = finite_or(self.glass_blur, default.glass_blur).clamp(0.0, 50.0);
+        self.font_size = finite_or(self.font_size, default.font_size).clamp(0.0, 30.0);
+        self.auto_hide_delay =
+            finite_or(self.auto_hide_delay, default.auto_hide_delay).clamp(1.0, 60.0);
+        self.hover_to_hide_distance =
+            finite_or(self.hover_to_hide_distance, default.hover_to_hide_distance)
+                .clamp(50.0, 300.0);
+        self.hover_to_hide_delay = round_to(
+            finite_or(self.hover_to_hide_delay, default.hover_to_hide_delay),
+            0.1,
+        )
+        .clamp(0.2, 3.0);
+        self.update_check_interval =
+            finite_or(self.update_check_interval, default.update_check_interval).clamp(1.0, 24.0);
+        self.lyrics_delay =
+            round_to_f64(finite_or_f64(self.lyrics_delay, default.lyrics_delay), 0.1)
+                .clamp(-10.0, 10.0);
+
+        normalize_island_style(&mut self.island_style);
+        if !matches!(
+            self.lyrics_transition_animation.as_str(),
+            "blur" | "slide" | "fade"
+        ) {
+            self.lyrics_transition_animation = default.lyrics_transition_animation;
+        }
+        let lyrics_scroll_min_width = (self.base_width + 35.0).max(100.0);
+        self.lyrics_scroll_max_width = self.lyrics_scroll_max_width.clamp(
+            lyrics_scroll_min_width,
+            500.0_f32.max(lyrics_scroll_min_width),
+        );
+        if !matches!(self.language.as_str(), "auto" | "en" | "zh") {
+            self.language = default.language;
+        }
+        if !matches!(self.settings_theme.as_str(), "system" | "light" | "dark") {
+            self.settings_theme = default.settings_theme;
+        }
+        if !matches!(
+            self.island_style.as_str(),
+            "default"
+                | "glass"
+                | "mica"
+                | "dynamic"
+                | ISLAND_STYLE_LIQUID_GLASS_WGC
+                | ISLAND_STYLE_LIQUID_GLASS_DXGI
+        ) {
+            self.island_style = default.island_style;
+        }
+        if !matches!(self.mini_cover_shape.as_str(), "square" | "circle") {
+            self.mini_cover_shape = default.mini_cover_shape;
+        }
+        if !matches!(self.expanded_cover_shape.as_str(), "square" | "circle") {
+            self.expanded_cover_shape = default.expanded_cover_shape;
+        }
+        if !self.spectrum_wheel_volume {
+            self.non_expanded_wheel_volume = false;
+        }
+        if !is_valid_color(&self.lyrics_char_color_unplayed) {
+            self.lyrics_char_color_unplayed = default.lyrics_char_color_unplayed;
+        }
+        if !is_valid_color(&self.lyrics_char_color_played) {
+            self.lyrics_char_color_played = default.lyrics_char_color_played;
+        }
+        self
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
