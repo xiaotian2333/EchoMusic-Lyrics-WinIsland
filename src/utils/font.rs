@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
+// 仅内嵌字体启用时使用；仓库不含 font.otf（见 build.rs），CI 上该 cfg 未设置
+#[cfg(has_builtin_font)]
 use once_cell::sync::Lazy;
 use skia_safe::{
     Canvas, Font, FontMgr, FontStyle, FourByteTag, Paint, Typeface,
