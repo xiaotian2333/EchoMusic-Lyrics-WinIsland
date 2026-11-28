@@ -117,10 +117,15 @@ pub struct DrawVolumeHintParams<'a> {
     pub scale: f32,
     /// 提示整体透明度（显示期 1.0，淡出期递减）
     pub alpha: f32,
-    /// 当前音量值 0-100
+    /// 当前音量值 0-音量上限（协议绝对上限 300）
     pub volume: f32,
+    /// 音量上限：外部软件未上报时默认 100，超出 100 的部分以橙色覆盖提示
+    pub volume_max: f32,
     pub color: Color,
 }
+
+/// 音量超出 100 部分的覆盖提示色（iOS 橙），深色岛背景上与常规文字色区分明显
+const VOLUME_OVER_LIMIT_COLOR: Color = Color::from_rgb(0xFF, 0x9F, 0x0A);
 
 /// 非展开态滚轮调音量时的音量提示：图标 + 标签 + 胶囊音量条，
 /// 几何与上游 WinIsland 一致；显示期间替代 mini 原内容。
@@ -134,6 +139,7 @@ pub fn draw_volume_hint(params: DrawVolumeHintParams<'_>) {
         scale,
         alpha,
         volume,
+        volume_max,
         color,
     } = params;
     let alpha_u8 = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
@@ -197,7 +203,7 @@ pub fn draw_volume_hint(params: DrawVolumeHintParams<'_>) {
     );
 
     if volume > 0.0 {
-        let fill_w = (track_w * (volume / 100.0)).max(track_h);
+        let fill_w = (track_w * (volume.min(100.0) / 100.0)).max(track_h);
         let mut fill_paint = Paint::default();
         fill_paint.set_anti_alias(true);
         fill_paint.set_color(Color::from_argb(alpha_u8, color.r(), color.g(), color.b()));
@@ -209,6 +215,29 @@ pub fn draw_volume_hint(params: DrawVolumeHintParams<'_>) {
             ),
             &fill_paint,
         );
+
+        // 音量超过常规区（100）时，超出部分按增益区间（100→上限）从右端往左
+        // 以橙色覆盖渲染，到达上限时覆盖整条轨道
+        if volume > 100.0 && volume_max > 100.0 {
+            let boost_ratio = ((volume - 100.0) / (volume_max - 100.0)).min(1.0);
+            let boost_w = (track_w * boost_ratio).max(track_h);
+            let mut boost_paint = Paint::default();
+            boost_paint.set_anti_alias(true);
+            boost_paint.set_color(Color::from_argb(
+                alpha_u8,
+                VOLUME_OVER_LIMIT_COLOR.r(),
+                VOLUME_OVER_LIMIT_COLOR.g(),
+                VOLUME_OVER_LIMIT_COLOR.b(),
+            ));
+            canvas.draw_rrect(
+                RRect::new_rect_xy(
+                    Rect::from_xywh(track_right - boost_w, track_y, boost_w, track_h),
+                    track_h / 2.0,
+                    track_h / 2.0,
+                ),
+                &boost_paint,
+            );
+        }
     }
 }
 
@@ -1053,6 +1082,7 @@ pub fn draw_island_canvas(
             scale: non_expanded_scale,
             alpha: volume_hint_alpha,
             volume: volume_hint_value,
+            volume_max: media.volume_max,
             color: text_color,
         });
     } else if mini_alpha_f > 0.01 && current_w > 45.0 * non_expanded_scale && music_active {

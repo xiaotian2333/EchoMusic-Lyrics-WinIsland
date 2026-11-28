@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::lyrics::{LyricLine, current_lyric_index};
+use crate::core::lyrics_ws::VOLUME_MAX_DEFAULT;
 
 /// 播放位置外推的最大时长：超过此阈值说明时间基准已失效（如睡眠唤醒后
 /// `Instant` 继续计时），不再外推，冻结在最后一次上报位置等待下次状态同步。
@@ -22,6 +23,8 @@ pub struct MediaInfo {
     pub lyrics: Option<Arc<Vec<LyricLine>>>,
     pub duration_ms: u64,
     pub volume: Option<f32>,
+    /// 音量上限：外部软件未上报时默认 100，协议绝对上限 300
+    pub volume_max: f32,
     pub play_mode: String,
 }
 
@@ -41,6 +44,7 @@ impl Default for MediaInfo {
             lyrics: None,
             duration_ms: 0,
             volume: None,
+            volume_max: VOLUME_MAX_DEFAULT,
             play_mode: String::from("list"),
         }
     }

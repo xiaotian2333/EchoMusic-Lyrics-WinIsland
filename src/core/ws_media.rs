@@ -103,7 +103,8 @@ impl WsMediaListener {
     }
 
     pub fn request_set_volume(&self, volume: f32) {
-        if let Some(volume) = normalize_volume_value(volume as f64) {
+        let volume_max = self.info_rx.borrow().volume_max;
+        if let Some(volume) = normalize_volume_value(volume as f64, volume_max) {
             let _ = self.playback_tx.send(PlaybackCommand::SetVolume(volume));
         }
     }
@@ -177,7 +178,7 @@ async fn ws_media_loop(
                         }
                     }
                     PlaybackCommand::SetVolume(volume) => {
-                        lyrics_ws_handle.set_volume(volume);
+                        lyrics_ws_handle.set_volume(volume, state.volume_max);
                         state.volume = Some(volume);
                         let _ = info_tx.send(state.clone());
                     }
@@ -278,8 +279,9 @@ fn handle_ws_event(
                 let _ = info_tx.send(state.clone());
             }
         }
-        LyricsWsEvent::VolumeState { volume } => {
+        LyricsWsEvent::VolumeState { volume, volume_max } => {
             state.volume = Some(volume);
+            state.volume_max = volume_max;
             let _ = info_tx.send(state.clone());
         }
         LyricsWsEvent::PlayModeState { mode } => {

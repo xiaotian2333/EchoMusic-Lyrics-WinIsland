@@ -665,9 +665,11 @@ impl App {
         } else {
             self.pending_volume.or(media.volume).unwrap_or(50.0)
         };
-        let step = volume_wheel_step(elapsed);
-        let next_volume =
-            normalize_volume_value((base_volume + step * units) as f64).unwrap_or(base_volume);
+        let volume_max = media.volume_max;
+        // 滚轮步进随上限等比缩放，遍历全程的滚动次数与 0-100 时保持一致
+        let step = volume_wheel_step(elapsed) * (volume_max / 100.0);
+        let next_volume = normalize_volume_value((base_volume + step * units) as f64, volume_max)
+            .unwrap_or(base_volume);
 
         self.last_volume_wheel_at = Some(now);
         self.pending_volume = Some(next_volume);

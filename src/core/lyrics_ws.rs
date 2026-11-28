@@ -17,6 +17,10 @@ use crate::utils::font::FontManager;
 
 const LYRICS_WS_ADDR: &str = "127.0.0.1:17195";
 const DEFAULT_PLAYER_PROCESS_NAME: &str = "EchoMusic.exe";
+/// 音量调整协议绝对上限：外部上报的音量与音量上限均不得越过该值
+pub(crate) const VOLUME_PROTOCOL_MAX: f32 = 300.0;
+/// 外部软件未主动上报音量上限时的默认上限
+pub(crate) const VOLUME_MAX_DEFAULT: f32 = 100.0;
 const BIND_RETRY_INITIAL_MS: u64 = 200;
 const BIND_RETRY_MAX_MS: u64 = 2_000;
 /// 并发客户端上限：插件只会建立 1 条连接，上限只为挡住异常/恶意本地进程
@@ -87,6 +91,8 @@ pub enum LyricsWsEvent {
     },
     VolumeState {
         volume: f32,
+        /// 本连接会话内生效的音量上限（外部软件上报，未上报为默认值）
+        volume_max: f32,
     },
     ShowMainWindow {
         process_name: String,
@@ -130,8 +136,8 @@ impl LyricsWsHandle {
         });
     }
 
-    pub fn set_volume(&self, volume: f32) {
-        if let Some(volume) = normalize_volume_value(volume as f64) {
+    pub fn set_volume(&self, volume: f32, volume_max: f32) {
+        if let Some(volume) = normalize_volume_value(volume as f64, volume_max) {
             let _ = self.command_tx.send(LyricsWsCommand::SetVolume(volume));
         }
     }
@@ -307,6 +313,9 @@ async fn handle_client(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let mut last_activity = Instant::now();
+    // 会话级音量上限：由外部软件通过 set_volume 的 volume_max 字段主动上报，
+    // 未上报时保持默认值；断开重连后随新会话重置
+    let mut plugin_volume_max = VOLUME_MAX_DEFAULT;
     let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -388,7 +397,14 @@ async fn handle_client(
                     break;
                 }
                 if message.is_text() {
-                    handle_text_message(message.to_text()?, &event_tx, &command_tx, &mut ws_write).await?;
+                    handle_text_message(
+                        message.to_text()?,
+                        &event_tx,
+                        &command_tx,
+                        &mut ws_write,
+                        &mut plugin_volume_max,
+                    )
+                    .await?;
                 }
             }
         }
@@ -402,6 +418,7 @@ async fn handle_text_message<S>(
     event_tx: &mpsc::UnboundedSender<LyricsWsEvent>,
     command_tx: &broadcast::Sender<LyricsWsCommand>,
     ws_write: &mut S,
+    volume_max: &mut f32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: Sink<Message> + Unpin,
@@ -484,7 +501,7 @@ where
                         let _ = event_tx.send(LyricsWsEvent::PluginDisabled);
                     }
                     _ => {
-                        handle_plugin_command(payload, event_tx).await?;
+                        handle_plugin_command(payload, event_tx, volume_max).await?;
                     }
                 }
             }
@@ -504,6 +521,7 @@ where
 async fn handle_plugin_command(
     payload: &Value,
     event_tx: &mpsc::UnboundedSender<LyricsWsEvent>,
+    volume_max: &mut f32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let action = match payload.get("action").and_then(|v| v.as_str()) {
         Some(a) => a,
@@ -589,15 +607,29 @@ async fn handle_plugin_command(
             });
         }
         "set_volume" => {
-            let Some(volume) = payload
-                .get("data")
-                .and_then(|d| d.get("volume"))
+            let Some(data) = payload.get("data") else {
+                return Ok(());
+            };
+            // 外部软件可在 set_volume 中主动携带 volume_max 报告本端音量上限，
+            // 未携带或非法时保持会话当前值（默认 100）
+            if let Some(max) = data
+                .get("volume_max")
                 .and_then(|v| v.as_f64())
-                .and_then(normalize_volume_value)
+                .and_then(normalize_volume_max)
+            {
+                *volume_max = max;
+            }
+            let Some(volume) = data
+                .get("volume")
+                .and_then(|v| v.as_f64())
+                .and_then(|v| normalize_volume_value(v, *volume_max))
             else {
                 return Ok(());
             };
-            let _ = event_tx.send(LyricsWsEvent::VolumeState { volume });
+            let _ = event_tx.send(LyricsWsEvent::VolumeState {
+                volume,
+                volume_max: *volume_max,
+            });
         }
         "show_main_window" => {
             let process_name = payload
@@ -625,12 +657,24 @@ async fn handle_plugin_command(
     Ok(())
 }
 
-pub(crate) fn normalize_volume_value(volume: f64) -> Option<f32> {
+pub(crate) fn normalize_volume_value(volume: f64, max: f32) -> Option<f32> {
     if !volume.is_finite() {
         return None;
     }
-    let rounded = (volume.clamp(0.0, 100.0) * 1000.0).round() / 1000.0;
+    let max = max.clamp(VOLUME_MAX_DEFAULT, VOLUME_PROTOCOL_MAX);
+    let rounded = (volume.clamp(0.0, f64::from(max)) * 1000.0).round() / 1000.0;
     Some(rounded as f32)
+}
+
+/// 外部软件上报的音量上限归一化：钳到 [100, 300]；非法值返回 None（调用方保持会话现状）
+fn normalize_volume_max(value: f64) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    Some(value.clamp(
+        f64::from(VOLUME_MAX_DEFAULT),
+        f64::from(VOLUME_PROTOCOL_MAX),
+    ) as f32)
 }
 
 async fn send_request_track_lyrics<S>(
@@ -729,6 +773,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (command_tx, _) = broadcast::channel(1);
         let mut ws_write = futures_util::sink::drain();
+        let mut volume_max = VOLUME_MAX_DEFAULT;
 
         for (payload, expected) in [
             (json!({ "action": "show_main_window" }), "EchoMusic.exe"),
@@ -754,9 +799,15 @@ mod tests {
             ),
         ] {
             let message = json!({ "type": "command", "source": "plugin", "payload": payload });
-            handle_text_message(&message.to_string(), &event_tx, &command_tx, &mut ws_write)
-                .await
-                .unwrap();
+            handle_text_message(
+                &message.to_string(),
+                &event_tx,
+                &command_tx,
+                &mut ws_write,
+                &mut volume_max,
+            )
+            .await
+            .unwrap();
             let event = event_rx.try_recv().unwrap();
             assert!(matches!(
                 event,
@@ -767,15 +818,102 @@ mod tests {
 
     #[test]
     fn normalize_volume_value_clamps_and_rounds() {
-        assert_eq!(normalize_volume_value(-0.2), Some(0.0));
-        assert_eq!(normalize_volume_value(120.0), Some(100.0));
-        assert_eq!(normalize_volume_value(80.1234), Some(80.123));
-        assert_eq!(normalize_volume_value(80.1235), Some(80.124));
+        assert_eq!(normalize_volume_value(-0.2, 100.0), Some(0.0));
+        assert_eq!(normalize_volume_value(120.0, 100.0), Some(100.0));
+        assert_eq!(normalize_volume_value(80.1234, 100.0), Some(80.123));
+        assert_eq!(normalize_volume_value(80.1235, 100.0), Some(80.124));
+    }
+
+    #[test]
+    fn normalize_volume_value_respects_reported_max() {
+        assert_eq!(normalize_volume_value(120.0, 300.0), Some(120.0));
+        assert_eq!(normalize_volume_value(350.0, 300.0), Some(300.0));
+        assert_eq!(normalize_volume_value(150.0, 150.0), Some(150.0));
+        // 上限参数越界时自钳到 [100, 300]，不影响音量归一化
+        assert_eq!(normalize_volume_value(120.0, 50.0), Some(100.0));
     }
 
     #[test]
     fn normalize_volume_value_rejects_invalid_number() {
-        assert_eq!(normalize_volume_value(f64::NAN), None);
-        assert_eq!(normalize_volume_value(f64::INFINITY), None);
+        assert_eq!(normalize_volume_value(f64::NAN, 100.0), None);
+        assert_eq!(normalize_volume_value(f64::INFINITY, 300.0), None);
+    }
+
+    #[test]
+    fn normalize_volume_max_clamps_to_protocol_range() {
+        assert_eq!(normalize_volume_max(150.0), Some(150.0));
+        assert_eq!(normalize_volume_max(50.0), Some(100.0));
+        assert_eq!(normalize_volume_max(500.0), Some(300.0));
+        assert_eq!(normalize_volume_max(f64::NAN), None);
+        assert_eq!(normalize_volume_max(f64::INFINITY), None);
+    }
+
+    #[tokio::test]
+    async fn set_volume_applies_reported_max_and_keeps_session_value() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, _) = broadcast::channel(1);
+        let mut ws_write = futures_util::sink::drain();
+        let mut volume_max = VOLUME_MAX_DEFAULT;
+
+        // 上报 volume_max：更新会话上限，音量按新上限放行
+        let message = json!({
+            "type": "command",
+            "source": "plugin",
+            "payload": { "action": "set_volume", "data": { "volume": 150, "volume_max": 150 } }
+        });
+        handle_text_message(
+            &message.to_string(),
+            &event_tx,
+            &command_tx,
+            &mut ws_write,
+            &mut volume_max,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            LyricsWsEvent::VolumeState { volume, volume_max } if volume == 150.0 && volume_max == 150.0
+        ));
+
+        // 非法 volume_max 忽略，会话上限保持 150
+        let message = json!({
+            "type": "command",
+            "source": "plugin",
+            "payload": { "action": "set_volume", "data": { "volume": 120, "volume_max": "abc" } }
+        });
+        handle_text_message(
+            &message.to_string(),
+            &event_tx,
+            &command_tx,
+            &mut ws_write,
+            &mut volume_max,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            LyricsWsEvent::VolumeState { volume, volume_max } if volume == 120.0 && volume_max == 150.0
+        ));
+
+        // 未上报过 volume_max 的新会话：默认 100，超 100 部分被钳掉
+        let mut fresh_max = VOLUME_MAX_DEFAULT;
+        let message = json!({
+            "type": "command",
+            "source": "plugin",
+            "payload": { "action": "set_volume", "data": { "volume": 150 } }
+        });
+        handle_text_message(
+            &message.to_string(),
+            &event_tx,
+            &command_tx,
+            &mut ws_write,
+            &mut fresh_max,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            LyricsWsEvent::VolumeState { volume, volume_max } if volume == 100.0 && volume_max == 100.0
+        ));
     }
 }
